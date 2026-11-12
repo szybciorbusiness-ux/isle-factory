@@ -17,6 +17,8 @@ export const WLAYOUT = {
   pack: [-0.205, 0.175, 0],     // bottom of the carried stack (on the rack shelf)
   centerY: 0.3, headTopY: 0.74,
   shadow: [0.42, 0.38],
+  eye: { p: [0.128, 0.148, 0.052], r: 0.019, s: [0.7, 1.15, 0.85] },   // must match head() below (blink lids)
+  lid: '#f6cba3',
 };
 
 const SKIN = '#f6cba3', CHEEK = '#f4a08c', NOSE = '#efaf8a', BOOT = '#5b3f2a', WOOD = '#b27b47', WOOD_D = '#8a5a32';

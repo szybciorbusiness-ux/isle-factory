@@ -1,12 +1,13 @@
 // Worker view controller: one invisible Object3D rig per camp worker, animated from camp state + events.
 // Walk cycle tied to distance (planted-ish feet, waddle, arm counter-swing), tool swings synced to camp:swing
-// (wind-up, strike at hitIn, follow-through, a little lunge), a carried stack on the back rack that items fly
-// onto and off of, a hungry thought bubble, a happy munch, and a hop out of the hut door when hired.
+// (lumberjack: an overhead chop; hunter: a flat side-swipe bonk), the tool shouldered while walking, a carried
+// stack on the back rack that items fly onto and off of (deliveries toss into the station's intake), blinks and
+// eyelid expressions, a hungry thought bubble, a happy munch, and a hop out of the hut door when hired.
 import * as THREE from 'three';
 import { ease, clamp, lerp, damp, dampAngle, angleDelta, arc, Spring } from '../../util/anim.js';
 import { WORKERS, STATIONS, CAMP } from '../../sim/camp-data.js';
 import { WLAYOUT } from './worker-models.js';
-import { rng, hashStr } from './kit.js';
+import { rng, hashStr, Blink, lidMatrix } from './kit.js';
 
 const TAU = Math.PI * 2;
 const frac = v => v - Math.floor(v);
@@ -23,6 +24,32 @@ const WIND = 2.75, STRIKE = 1.2, RECOVER = 0.3, PRE = 0.3, TWIST = 0.42;
 const TOOL_GRIP = 0.5;       // tool angle relative to the arm (head leans forward of the arm line)
 const ITEM_SCALE = 0.56;     // carried items, world scale
 const BUBBLE_UP = 0.3;       // above the head top (world)
+const DROP_FLIGHT = 0.2;     // rack -> station intake toss (the camp view lands its intake wobble ~0.18 s after station:drop)
+
+// Hunter's side-swipe poses. Index names: right arm abduction (RX), horizontal sweep (RY), pitch (RZ); club grip
+// angle (TZ); torso twist (TWS), lean, roll; lunge; left arm pitch (AL) and abduction (ALX); head nod.
+const RX = 0, RY = 1, RZ = 2, TZ = 3, TWS = 4, P_LEAN = 5, P_ROLL = 6, P_LUNGE = 7, AL = 8, ALX = 9, NOD = 10, NPOSE = 11;
+const SWIPE = {
+  //                   RX     RY     RZ          TZ          TWS    LEAN   ROLL   LUNGE  AL     ALX   NOD
+  rest:   new Float32Array([-0.12, 0,     TOOL_REST, TOOL_GRIP, 0,     0,     0,     0,     ARM_REST, 0, 0]),
+  wind:   new Float32Array([-0.3,  -1.55, 1.3,       0.75,      -0.36, 0.05,  0.06,  -0.02, 1.0,  0.1,  0.06]),
+  cock:   new Float32Array([-0.36, -1.95, 1.32,      0.9,       -0.47, 0.08,  0.09,  -0.03, 1.15, 0.12, 0.08]),
+  hit:    new Float32Array([-0.2,  0.12,  1.4,       0.35,      0.3,   -0.14, -0.11, 0.2,   -0.3, 0.45, -0.12]),
+  follow: new Float32Array([-0.16, 0.9,   1.18,      0.25,      0.45,  -0.1,  -0.13, 0.14,  -0.45, 0.55, -0.08]),
+};
+const SWIPE_FOLLOW = 0.09, SWIPE_RECOVER = 0.3;
+const mixPose = (out, a, b, k) => { for (let i = 0; i < NPOSE; i++) out[i] = a[i] + (b[i] - a[i]) * k; return out; };
+const dampPose = (p, t, rate, dt) => { const k = 1 - Math.exp(-rate * dt); for (let i = 0; i < NPOSE; i++) p[i] += (t[i] - p[i]) * k; return p; };
+const _pose = new Float32Array(NPOSE);
+const _lm = new THREE.Matrix4();
+
+// Shoulder carry while walking: the tool arm comes up, the shaft rests on the shoulder, the head rides behind
+// it (the axe flips so its blade points up). rz/tz are the arm pitch and the tool's grip angle, twist spins the
+// tool about its own shaft.
+const CARRY = {
+  axe:  { rx: -0.1, ry: 0.04, rz: 2.05, tz: 2.45, twist: Math.PI },
+  club: { rx: -0.1, ry: 0.04, rz: 2.05, tz: 2.4, twist: 0 },
+};
 
 export class WorkerView {
   // sys: { root, ctx, sizeK, fx(), camera, camp, playerPos(), groundAt(), itemHeight(), stationPoint(id, out) }
@@ -41,6 +68,7 @@ export class WorkerView {
     this.arms = [-1, 1].map(s => { const a = O(); a.position.set(L.shoulder[0], L.shoulder[1], s * L.shoulder[2]); this.squashN.add(a); return a; });
     this.feet = [-1, 1].map(s => { const f = O(); f.position.set(L.foot[0], L.foot[1], s * L.foot[2]); this.root.add(f); return f; });
     this.tool = O(); this.tool.position.set(0, -L.armLen, 0); this.tool.rotation.z = TOOL_GRIP; this.arms[1].add(this.tool);
+    this.tool.rotation.order = 'ZYX';   // twist about the shaft first (y), then the grip angle (z)
     this.snack = O(); this.snack.position.set(0.01, -L.armLen - 0.01, 0.0); this.arms[0].add(this.snack);
     this.pack = O(); this.pack.position.set(...L.pack); this.squashN.add(this.pack);
     this.slots = [];
@@ -64,6 +92,11 @@ export class WorkerView {
     this.headYaw = new Spring(0, { stiffness: 140, damping: 14 });
     this.armL = new Spring(ARM_REST, { stiffness: 260, damping: 17 });
     this.armR = TOOL_REST;
+    this.rx = -0.12; this.ry = 0; this.toolZ = TOOL_GRIP; this.armLX = 0;
+    this.pose = SWIPE.rest.slice();   // hunter side-swipe pose (see SWIPE)
+    this.carryW = 0;                  // 0 tool in hand .. 1 tool on the shoulder (walking)
+    this.blink = new Blink(this.rnd, { every: [2.2, 5] }); this.lidC = 0;
+    this.lidTint = new THREE.Color(L.lid || '#ffffff');
     this.packTilt = new Spring(0, { stiffness: 160, damping: 8 });
     this.packRoll = new Spring(0, { stiffness: 160, damping: 8 });
     this.hopY = 0; this.hopV = 0;
@@ -103,7 +136,7 @@ export class WorkerView {
   }
   speedMul() { return this.w.hungry ? 0.5 : 1; }
   swing(e) {
-    this.sw = { t: 0, H: Math.max(0.06, Number(e.hitIn) || CAMP.hitDelay), a0: this.armR, tw0: this.twist || 0, hit: false };
+    this.sw = { t: 0, H: Math.max(0.06, Number(e.hitIn) || CAMP.hitDelay), a0: this.armR, tw0: this.twist || 0, hit: false, p0: this.pose.slice() };
     this.nextSwing = this.def.workTime / this.speedMul();
     if (e.target) {
       this.lastTarget = { x: e.target.x, z: e.target.z };
@@ -138,8 +171,13 @@ export class WorkerView {
     const fx = this.sys.fx();
     if (!fx?.flyItem) return;
     const from = top ? this.slotWorld(this.stack.length, new THREE.Vector3()) : this.stackTop(new THREE.Vector3());
+    // toss it into the station's intake (rack / basket / hopper, views.campview.intakePoint): a quick throw that
+    // lands as the camp view wobbles the intake
     const to = this.sys.stationPoint(station?.id, new THREE.Vector3());
-    if (to) fx.flyItem(item || top?.item, from, to, { height: 0.4, popHeight: 0.12 });
+    if (!to) return;
+    to.x += (this.rnd() - 0.5) * 0.08; to.z += (this.rnd() - 0.5) * 0.08;
+    const d = Math.hypot(to.x - from.x, to.z - from.z);
+    fx.flyItem(item || top?.item, from, to, { mode: 'throw', dur: DROP_FLIGHT, height: 0.22 + Math.min(d, 3) * 0.06, scale: 0.62 / this.sys.fxScale(), jitter: 0.02 });
   }
   onHungry() { this.squash.velocity -= 1.5; this.headPitch.velocity -= 1.6; }
   onAte() {
@@ -212,8 +250,36 @@ export class WorkerView {
 
     // ---- swing (tool arm) ----
     let armR = TOOL_REST - c * 0.28 * m, armLT = ARM_REST + c * ARM_SWING * m, leanSw = 0, lunge = 0, headNod = 0, twist = 0;
+    let rollSw = 0, armLX = 0;
     if (this.nextSwing !== Infinity) this.nextSwing -= dt;
-    if (this.sw) {
+    if (this.toolKey === 'club') {
+      // hunter: a flat side-swipe bonk. Cock the club out to the right with the torso turned away, whip it across
+      // the front at the hit, follow through to the left, then let it hang again. (The lumberjack chops overhead.)
+      const P = this.pose;
+      if (this.sw) {
+        const S = this.sw; S.t += dt;
+        const t = S.t, H = S.H, tw = Math.max(0.05, H * 0.5);
+        if (t < tw) mixPose(P, S.p0, SWIPE.cock, ease.quadOut(t / tw));
+        else if (t < H) mixPose(P, SWIPE.cock, SWIPE.hit, ease.cubicIn((t - tw) / (H - tw)));
+        else {
+          if (!S.hit) { S.hit = true; this.squash.velocity -= 2.4; this.headPitch.velocity -= 3; this.blink.close(0.16); }
+          const u = t - H;
+          if (u < SWIPE_FOLLOW) mixPose(P, SWIPE.hit, SWIPE.follow, ease.quadOut(u / SWIPE_FOLLOW));
+          else {
+            const v = clamp((u - SWIPE_FOLLOW) / SWIPE_RECOVER);
+            mixPose(P, SWIPE.follow, this.swipeWait(_pose), ease.cubicInOut(v));
+            if (v >= 1) this.sw = null;
+          }
+        }
+      } else {
+        // between swings: drift toward the wind-up (pre-swing) or the hanging rest with the walk's arm swing
+        const T = this.swipeWait(_pose);
+        T[RZ] -= c * 0.28 * m; T[AL] += c * ARM_SWING * m;
+        dampPose(P, T, w.state === 'work' && this.nextSwing < PRE ? 18 : 14, dt);
+      }
+      armR = P[RZ]; armLT = P[AL]; armLX = P[ALX]; leanSw = P[P_LEAN]; rollSw = P[P_ROLL]; lunge = P[P_LUNGE]; headNod = P[NOD]; twist = P[TWS];
+      this.rx = P[RX]; this.ry = P[RY]; this.toolZ = P[TZ];
+    } else if (this.sw) {
       const S = this.sw; S.t += dt;
       const t = S.t, H = S.H, tw = Math.max(0.05, H * 0.5);
       if (t < tw) { const k = ease.quadOut(t / tw); armR = lerp(S.a0, WIND, k); leanSw = 0.16 * k; lunge = -0.02 * k; twist = lerp(S.tw0, -TWIST, k); }
@@ -238,15 +304,19 @@ export class WorkerView {
     this.armR = armR;
     this.lunge = lunge;
     this.twist = twist;
+    if (this.toolKey !== 'club') { this.rx = -0.12; this.ry = 0; this.toolZ = TOOL_GRIP; }
+    this.armLX = damp(this.armLX, armLX, 16, dt);
 
     // ---- state poses ----
-    let headPitchT = headNod + (hungry ? -0.22 : 0), headYawT = clamp(-this.turn * 0.12, -0.5, 0.5);
+    // the head keeps its eyes on the target while the torso twists through a swing
+    let headPitchT = headNod + (hungry ? -0.22 : 0), headYawT = clamp(-this.turn * 0.12, -0.5, 0.5) - twist * 0.75;
     let leanT = -(this.spd * LEAN_SPEED) - (carryN ? LEAN_CARRY * Math.min(1, carryN / 3) * m : 0) - (hungry ? 0.05 : 0) + leanSw;
     leanT += clamp(-this.accF * 0.012, -0.12, 0.12);
     if (w.state === 'eat' && !this.munch) {
       // waiting by the pile: excited little bounces, arms up
       bob += Math.abs(Math.sin(this.time * 9)) * 0.035;
-      armLT = lerp(armLT, 1.1, 0.8); if (!this.sw) this.armR = damp(this.armR, 1.0, 10, dt);
+      armLT = lerp(armLT, 1.1, 0.8);
+      if (!this.sw) { this.armR = damp(this.armR, 1.0, 10, dt); if (this.toolKey === 'club') this.pose[RZ] = this.armR; }
       headPitchT += 0.12;
     } else if (w.state === 'drop') {
       armLT = lerp(armLT, 0.95, 0.85);
@@ -287,6 +357,17 @@ export class WorkerView {
     this.cheer = damp(this.cheer, 0, 3.5, dt);
     if (this.cheer > 0.02) { armLT = lerp(armLT, 2.9, this.cheer); this.armR = lerp(this.armR, 2.6, this.cheer * 0.6); }
 
+    // ---- tool on the shoulder while walking (not mid-swing, not while celebrating or waiting for food) ----
+    const carryWant = moving && !this.sw && w.state !== 'work' && w.state !== 'eat' && !this.spawn && this.cheer < 0.1 ? 1 : 0;
+    this.carryW = damp(this.carryW, carryWant, carryWant > this.carryW ? 7 : 12, dt);
+
+    // ---- eyes: blinks, plus tired when hungry, happy shut while munching or cheering, wide while waiting ----
+    let lidWant = hungry ? 0.38 : 0;
+    if (this.munch && !this.munch.wait) lidWant = moving ? 0.7 : 0.88;
+    if (this.cheer > 0.3) lidWant = Math.max(lidWant, 0.85);
+    if (w.state === 'eat' && !this.munch) lidWant = 0;
+    this.lidC = this.blink.update(dt, lidWant);
+
     // ---- hire hop ----
     let offX = 0, offZ = 0, lifeY = 0, lifeS = 1;
     if (this.spawn) {
@@ -307,7 +388,7 @@ export class WorkerView {
     this.squash.target = 1 + Math.sin(this.time * (hungry ? 1.6 : 2.4)) * 0.014 * (1 - m);
     this.squash.update(dt);
     this.lean.target = clamp(leanT, -0.45, 0.3); this.lean.update(dt);
-    this.roll.target = -s2 * ROLL * m + clamp(-this.turn * this.spd * 0.03, -0.2, 0.2); this.roll.update(dt);
+    this.roll.target = -s2 * ROLL * m + clamp(-this.turn * this.spd * 0.03, -0.2, 0.2) + rollSw; this.roll.update(dt);
     this.headPitch.target = headPitchT - bob * 2; this.headPitch.update(dt);
     this.headYaw.target = headYawT; this.headYaw.update(dt);
     this.armL.target = armLT; this.armL.update(dt);
@@ -329,8 +410,12 @@ export class WorkerView {
     const sq = clamp(this.squash.value, 0.5, 1.5);
     this.squashN.scale.set(1 / Math.sqrt(sq), sq, 1 / Math.sqrt(sq));
     this.head.rotation.set(0, this.headYaw.value, this.headPitch.value);
-    this.arms[0].rotation.set(0.1 + (this.munch && !this.munch.wait ? 0.25 : 0), 0, this.armL.value);
-    this.arms[1].rotation.set(-0.12, 0, this.armR);
+    this.arms[0].rotation.set(0.1 + this.armLX + (this.munch && !this.munch.wait ? 0.25 : 0), 0, this.armL.value);
+    // tool arm: the work / swing pose, blended toward the shoulder carry (with a little bounce per step)
+    const cw = smooth01(this.carryW), C = CARRY[this.toolKey];
+    const cb = Math.sin(TAU * this.phase * 2) * 0.06 * m;
+    this.arms[1].rotation.set(lerp(this.rx, C.rx, cw), lerp(this.ry, C.ry, cw), lerp(this.armR, C.rz + cb, cw));
+    this.tool.rotation.set(0, C.twist * cw, lerp(this.toolZ, C.tz, cw));
     this.pack.rotation.set(this.packRoll.value, 0, this.packTilt.value);
     this.snack.scale.setScalar(Math.max(1e-4, this.snackS));
 
@@ -359,6 +444,11 @@ export class WorkerView {
     // bubble
     this.updateBubble(dt, hungry);
     r.updateMatrixWorld(true);
+  }
+  // hunter: the pose to hold between swipes: hanging rest, drifting into the wind-up before the next swing
+  swipeWait(out) {
+    const k = this.w.state === 'work' && this.nextSwing < PRE ? smooth01(1 - this.nextSwing / PRE) : 0;
+    return mixPose(out, SWIPE.rest, SWIPE.wind, k);
   }
   preTwist() {
     if (this.w.state !== 'work' || this.nextSwing >= PRE) return 0;
@@ -401,6 +491,7 @@ export class WorkerView {
     for (const [key, node] of this.parts) pools[key]?.push(node.matrixWorld, this.flash, null);
     if (this.snackS > 0.01) pools.snack?.push(this.snack.matrixWorld, 0, null);
     if (this.bubble.visible) pools.bubble?.push(this.bubble.matrixWorld, 0, null);
+    if (this.lidC > 0.04 && pools.lid) for (const side of [-1, 1]) pools.lid.push(lidMatrix(_lm, this.head.matrixWorld, WLAYOUT.eye, side, this.lidC), this.flash, this.lidTint);
     for (let i = 0; i < this.stack.length; i++) itemPool(this.stack[i].item)?.push(this.slots[i].matrixWorld);
   }
   shadow(out) {

@@ -269,7 +269,29 @@ export function createCamp(sim, { playerPos = null, seed = 11 } = {}) {
     }
     return null;
   }
+  // Intent: the guide's own target starts exchanging at once; any other pad / zone / pile waits until the player
+  // has stood (nearly) still on it for DWELL seconds, so walking across a pad never pays it by accident.
+  const DWELL = 0.32, STILL = 1.1;
+  const dwell = { key: null, t: 0 };
+  const motionState = { last: null, speed: 0 };
+  function isGoalTarget(kind, id) {
+    const g = camp.goal;
+    if (!g) return false;
+    if (kind === 'pad') return g.padId === id;
+    if (kind === 'zone') return g.kind === 'drop' && g.stationId === id;
+    return (g.kind === 'pickup' || g.kind === 'wait') && g.stationId === id;
+  }
+  function intends(kind, id, dt) {
+    const key = kind + ':' + id;
+    if (dwell.key !== key) { dwell.key = key; dwell.t = 0; }
+    dwell.t += dt;
+    if (isGoalTarget(kind, id)) return dwell.t >= 0.05;
+    return dwell.t >= DWELL && motionState.speed < STILL;
+  }
   function updatePlayerTransfers(dt, p) {
+    if (motionState.last) { const v = Math.hypot(p.x - motionState.last.x, p.z - motionState.last.z) / Math.max(dt, 1e-4); motionState.speed += (v - motionState.speed) * Math.min(1, dt * 12); }
+    motionState.last = { x: p.x, z: p.z };
+    let inside = false;
     // loose items: walk over them
     for (const l of [...camp.loose]) {
       if (Math.hypot(l.x - p.x, l.z - p.z) < 0.6 && camp.free() > 0) {
@@ -284,6 +306,8 @@ export function createCamp(sim, { playerPos = null, seed = 11 } = {}) {
     for (const pad of camp.pads) {
       if (!inRect(pad.zone, p.x, p.z)) continue;
       if (!camp.stack.some(it => (pad.paid[it] ?? Infinity) < pad.cost[it])) continue;
+      inside = true;
+      if (!intends('pad', pad.id, dt)) return null;
       transferTick(`pad:${pad.id}`, dt, () => {
         const item = takeFromStack(it => (pad.paid[it] ?? Infinity) < pad.cost[it]);
         if (!item) return false;
@@ -297,6 +321,8 @@ export function createCamp(sim, { playerPos = null, seed = 11 } = {}) {
     for (const s of camp.stations.values()) {
       if (!s.def.zone || !inRect(s.def.zone, p.x, p.z)) continue;
       if (!camp.stack.some(it => accepts(s, it))) continue;
+      inside = true;
+      if (!intends('zone', s.id, dt)) return null;
       transferTick(`zone:${s.id}`, dt, () => {
         const item = takeFromStack(it => accepts(s, it));
         if (!item) return false;
@@ -308,6 +334,8 @@ export function createCamp(sim, { playerPos = null, seed = 11 } = {}) {
     for (const s of camp.stations.values()) {
       if (!s.pile || !inRect([s.pile.tile[0], s.pile.tile[1], 1, 1], p.x, p.z, 0.1)) continue;
       if (!s.pile.count || camp.free() <= 0 || stillNeeded(s.pile.item) <= 0) continue;
+      inside = true;
+      if (!intends('pile', s.id, dt)) return null;
       transferTick(`pile:${s.id}`, dt, () => {
         if (!s.pile.count || camp.free() <= 0 || stillNeeded(s.pile.item) <= 0) return false;
         s.pile.count--;
@@ -319,6 +347,7 @@ export function createCamp(sim, { playerPos = null, seed = 11 } = {}) {
       return 'pile';
     }
     xfer.key = null;
+    if (!inside) { dwell.key = null; dwell.t = 0; }
     return null;
   }
 
@@ -389,7 +418,7 @@ export function createCamp(sim, { playerPos = null, seed = 11 } = {}) {
   camp.stillNeeded = stillNeeded;
   function useful(item) {
     if (camp.pads.some(p => (p.cost[item] || 0) - (p.paid[item] || 0) > 0)) return true;
-    for (const s of camp.stations.values()) if (s.def.accepts?.includes(item)) return true;
+    for (const s of camp.stations.values()) if (accepts(s, item)) return true;   // only while it can take more
     return false;
   }
   camp.useful = useful;
@@ -706,10 +735,13 @@ export function createCamp(sim, { playerPos = null, seed = 11 } = {}) {
   }
 
   // ---------- main update ----------
+  let goalTimer = 0;
+  camp.goal = null;
   camp.update = dt => {
     camp.time += dt;
     for (let i = later.length - 1; i >= 0; i--) if (later[i].t <= camp.time) { const { fn } = later[i]; later.splice(i, 1); fn(); }
     const p = getPlayer();
+    if ((goalTimer -= dt) <= 0) { goalTimer = 0.25; camp.goal = camp.nextGoal(); }
     const zone = updatePlayerTransfers(dt, p);
     updatePlayerGather(dt, p, zone);
     updateStations(dt);
@@ -747,50 +779,109 @@ export function createCamp(sim, { playerPos = null, seed = 11 } = {}) {
     return found ? { entityId: found.id, x: found.x, z: found.z } : null;
   }
   camp.mainPad = () => PADS.map(d => camp.pads.find(p => p.id === d.id)).find(Boolean) || null;
+  // Guidance v2 (playtest + critics): FILL, THEN DELIVER. The player gathers until they hold enough to finish the
+  // pad (or the pack is full), drops raw in batches, takes piles once they hold what's needed, and pays once.
+  // It counts what is already in the pipeline (station input, line, pile) so it never over-gathers. If the main
+  // pad can't progress right now, it falls back to the next pad (in PADS order) that can, so the arrow never dies.
   camp.nextGoal = () => {
     const p = getPlayer();
-    const carried = id => camp.stack.filter(i => i === id).length;
-    const pad = camp.mainPad();
-    const need = pad ? Object.fromEntries(Object.entries(pad.cost).map(([k, n]) => [k, n - pad.paid[k]]).filter(([, n]) => n > 0)) : {};
+    const counts = {};
+    for (const i of camp.stack) counts[i] = (counts[i] || 0) + 1;
+    const carried = id => counts[id] || 0;
+    const free = camp.free();
     const at = (o, extra) => ({ ...extra, x: o.x, z: o.z });
-    // 1) carrying something the main pad needs -> pay it; else any other visible pad that wants it (nearest)
-    if (pad && Object.keys(need).some(k => carried(k) > 0)) {
-      const c = rectCenter(pad.zone);
-      return at(c, { kind: 'pay', padId: pad.id, item: Object.keys(need).find(k => carried(k) > 0) });
+    const needOf = pad => Object.fromEntries(Object.entries(pad.cost).map(([k, n]) => [k, n - pad.paid[k]]).filter(([, n]) => n > 0));
+    const memo = new Map();
+    const reach = kind => { if (!memo.has(kind)) memo.set(kind, nearestReachable(kind, p)); return memo.get(kind); };
+    const producerOf = item => camp.stations.get(PRODUCED_BY[item]) || null;
+    const recipeIn = st => (st?.def.recipe ? Object.entries(st.def.recipe.in)[0] : null); // [raw, perOutput]
+    const rawOf = item => { const r = recipeIn(producerOf(item)); return r ? r[0] : (RAW_SOURCE[item] ? item : null); };
+    const making = st => !!st && (st.busy || st.line?.items.length > 0 || Object.values(st.input).some(n => n > 0) || (st.def.auto && !st.held));
+    // outputs already on their way for `item`: on the pile, on the line, in the machine, and queued as input
+    const pipeline = item => {
+      const st = producerOf(item);
+      if (!st) return 0;
+      const r = recipeIn(st);
+      const queued = r ? Math.floor((st.input[r[0]] || 0) / r[1]) : 0;
+      return (st.pile?.count || 0) + (st.line?.items.length || 0) + (st.busy ? 1 : 0) + queued;
+    };
+    const obtainable = item => {
+      const st = producerOf(item);
+      if (st && (st.pile?.count > 0 || making(st))) return true;
+      const raw = rawOf(item);
+      return !!(raw && RAW_SOURCE[raw] && (carried(raw) > 0 || reach(RAW_SOURCE[raw])));
+    };
+    function planFor(pad) {
+      const need = needOf(pad);
+      const items = Object.keys(need);
+      const have = items.reduce((a, k) => a + Math.min(carried(k), need[k]), 0);
+      const total = items.reduce((a, k) => a + need[k], 0);
+      const missing = items.filter(k => carried(k) < need[k]);
+      // full of raw that a station can still take, and holding only a sliver of the cost: unload the raw first
+      if (free <= 0 && have < Math.min(total, camp.capacity * 0.5)) {
+        for (const it of new Set(camp.stack)) { if (need[it]) continue; const s = stationFor(it); if (s && accepts(s, it)) return at(rectCenter(s.def.zone), { kind: 'drop', stationId: s.id, item: it }); }
+      }
+      if (have > 0 && (have >= total || free <= 0 || missing.every(k => !obtainable(k)))) {
+        return at(rectCenter(pad.zone), { kind: 'pay', padId: pad.id, item: items.find(k => carried(k) > 0) });
+      }
+      for (const item of missing) {
+        const want = need[item] - carried(item);
+        const st = producerOf(item);
+        const r = recipeIn(st);
+        const raw = rawOf(item);
+        if (st && r) {
+          const stillToMake = Math.max(0, want - pipeline(item));
+          const rawWanted = stillToMake * r[1];
+          // drop the raw we're carrying once we hold enough of it (or can't carry / find more)
+          if (carried(raw) > 0 && accepts(st, raw) && (carried(raw) >= rawWanted || free <= 0 || !reach(RAW_SOURCE[raw]))) {
+            return at(rectCenter(st.def.zone), { kind: 'drop', stationId: st.id, item: raw });
+          }
+          // still more to make: go get raw
+          if (rawWanted > carried(raw) && free > 0 && RAW_SOURCE[raw]) {
+            const t = reach(RAW_SOURCE[raw]);
+            if (t) return { kind: RAW_SOURCE[raw] === 'animal' ? 'hunt' : 'gather', item: raw, ...t };
+          }
+          // everything is in the pipeline: take the pile once it covers us (or it's all there), else wait by it
+          if (st.pile && free > 0) {
+            const tile = { x: st.pile.tile[0], z: st.pile.tile[1] };
+            if (st.pile.count >= Math.min(want, free) || (st.pile.count > 0 && !making(st))) return at(tile, { kind: 'pickup', stationId: st.id, item });
+            if (making(st)) return at(tile, { kind: 'wait', stationId: st.id, item });
+          }
+          continue;
+        }
+        if (st?.def.auto && st.pile && free > 0) { // quarry: auto output to a pile
+          const tile = { x: st.pile.tile[0], z: st.pile.tile[1] };
+          if (st.pile.count >= Math.min(want, free)) return at(tile, { kind: 'pickup', stationId: st.id, item });
+          // stone can also be gathered by hand from rocks while the quarry works
+          if (RAW_SOURCE[item]) { const t = reach(RAW_SOURCE[item]); if (t) return { kind: 'gather', item, ...t }; }
+          if (st.pile.count > 0) return at(tile, { kind: 'pickup', stationId: st.id, item });
+          return at(tile, { kind: 'wait', stationId: st.id, item });
+        }
+        if (RAW_SOURCE[item] && free > 0) { // gathered directly (wood, stone, meat)
+          const t = reach(RAW_SOURCE[item]);
+          if (t) return { kind: RAW_SOURCE[item] === 'animal' ? 'hunt' : 'gather', item, ...t };
+        }
+      }
+      return null;
     }
-    {
+    const order = PADS.map(d => camp.pads.find(q => q.id === d.id)).filter(Boolean);
+    // pack nearly full of things only a non-main pad wants: pay there first (nearest)
+    if (free <= 2 && order.length) {
+      const mainNeed = needOf(order[0]);
       let best = null, bd = Infinity;
-      for (const q of camp.pads) {
-        const item = Object.keys(q.cost).find(k => q.paid[k] < q.cost[k] && carried(k) > 0);
-        if (!item || need[item] > 0) continue;
+      for (const q of order) {
+        const item = Object.keys(q.cost).find(k => q.paid[k] < q.cost[k] && carried(k) > 0 && !(mainNeed[k] > 0));
+        if (!item) continue;
         const c = rectCenter(q.zone), d = Math.hypot(c.x - p.x, c.z - p.z);
         if (d < bd) { bd = d; best = at(c, { kind: 'pay', padId: q.id, item }); }
       }
-      // only detour for it when the stack is getting full, or the main pad can't use what we hold
-      if (best && (camp.free() <= 2 || !Object.keys(need).some(k => camp.useful(k)))) return best;
+      if (best) return best;
     }
-    // 2) carrying a raw input a built station converts (and nothing on the pad wants it) -> drop it
-    for (const item of new Set(camp.stack)) {
-      const s = stationFor(item);
-      if (s && accepts(s, item) && !(need[item] > 0)) return at(rectCenter(s.def.zone), { kind: 'drop', stationId: s.id, item });
-    }
-    if (!pad) return null;
-    // 3) get what the main pad needs: from a pile if one has it, else from its producer's input, else gather raw
-    for (const item of Object.keys(need)) {
-      if (camp.free() <= 0) break;
-      for (const s of camp.stations.values()) if (s.pile?.item === item && s.pile.count > 0) return { kind: 'pickup', stationId: s.id, item, x: s.pile.tile[0], z: s.pile.tile[1] };
-      const producer = camp.stations.get(PRODUCED_BY[item]);
-      if (producer && (producer.busy || producer.line?.items.length || Object.values(producer.input).some(n => n > 0) || producer.def.auto)) {
-        // it's being made: wait near the pile unless we can feed it more
-        const rawIn = producer.def.recipe && Object.keys(producer.def.recipe.in)[0];
-        if (rawIn && RAW_SOURCE[rawIn] && camp.free() > 0) { const t = nearestReachable(RAW_SOURCE[rawIn], p); if (t) return { kind: RAW_SOURCE[rawIn] === 'animal' ? 'hunt' : 'gather', item: rawIn, ...t }; }
-        if (producer.pile) return { kind: 'wait', stationId: producer.id, item, x: producer.pile.tile[0], z: producer.pile.tile[1] };
-      }
-      const raw = producer?.def.recipe ? Object.keys(producer.def.recipe.in)[0] : item;
-      const src = RAW_SOURCE[raw];
-      if (src && camp.free() > 0) { const t = nearestReachable(src, p); if (t) return { kind: src === 'animal' ? 'hunt' : 'gather', item: raw, ...t }; }
-    }
-    // full stack of the wrong things: drop at any station that takes them
+    for (const pad of order) { const g = planFor(pad); if (g) return g; }
+    // nothing progressable: unload raw at a station that takes it, pay anything we can, else wait at a busy station
+    for (const item of new Set(camp.stack)) { const s = stationFor(item); if (s && accepts(s, item)) return at(rectCenter(s.def.zone), { kind: 'drop', stationId: s.id, item }); }
+    for (const q of order) { const item = Object.keys(q.cost).find(k => q.paid[k] < q.cost[k] && carried(k) > 0); if (item) return at(rectCenter(q.zone), { kind: 'pay', padId: q.id, item }); }
+    for (const s of camp.stations.values()) if (s.pile && making(s)) return { kind: 'wait', stationId: s.id, item: s.pile.item, x: s.pile.tile[0], z: s.pile.tile[1] };
     return null;
   };
 

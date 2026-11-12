@@ -2,6 +2,9 @@
 // steering the robot through ctx.input.move exactly like the touch joystick does, following camp.nextGoal().
 // It captures a frame shortly after every beat (pad done, level up, bridge, worker, firsts) plus one per minute,
 // and writes a timeline. Critics review the frames for UI, feel and understanding.
+// Beats that land together share one frame ("done hearth:2 + camp level 2"). timeline.json also records, per frame,
+// the guide goal and the stack, plus summary.noGoal (time with no guide target) and summary.gaps (longest gaps
+// between beats).
 //   node tools/playtest.mjs [minutes=20] [--out shots/playtest] [--landscape] [--every 60]
 import { chromium } from 'playwright-core';
 import { mkdirSync, writeFileSync, rmSync } from 'node:fs';
@@ -55,11 +58,15 @@ await page.evaluate(() => {
       : (x, z) => x === tx && z === tz;
     path = camp.bfs(sx, sz, isGoal); pi = 1;
   }
+  // stretches where camp.nextGoal() gives nothing (no guide arrow on screen: the player has no "go here")
+  const noGoal = { total: 0, stretches: [], cur: null };
   window.__bot = {
-    beats,
+    beats, noGoal,
     get goal() { return goal; },
     tick(dt) {
       if ((think -= dt) <= 0) { think = 0.4; plan(); }
+      if (!goal && !camp.complete) { noGoal.total += dt; if (!noGoal.cur) noGoal.stretches.push(noGoal.cur = { from: camp.time, to: camp.time }); noGoal.cur.to = camp.time; }
+      else noGoal.cur = null;
       const p = pos();
       let tx = null, tz = null, near = 0.12;
       if (path && pi < path.length) {
@@ -87,10 +94,14 @@ let captured = 0, nextPeriodic = 0, seenBeats = 0;
 const timeline = [];
 async function capture(label) {
   await page.evaluate(() => window.__game.render());
-  const t = await page.evaluate(() => window.__game.camp.time);
+  // what the guide is pointing at and what the robot carries, so reviewers can read each frame
+  const { t, goal, stack } = await page.evaluate(() => {
+    const c = window.__game.camp, gl = window.__bot.goal;
+    return { t: c.time, goal: gl ? [gl.kind, gl.item, gl.padId || gl.stationId].filter(Boolean).join(' ') : 'none', stack: `${c.stack.length}/${c.capacity}` };
+  });
   const name = `${String(captured++).padStart(3, '0')}_${fmt(t)}_${label.replace(/[^a-z0-9]+/gi, '-').slice(0, 40)}.png`;
   await page.screenshot({ path: resolve(outDir, name) });
-  timeline.push({ t: +t.toFixed(1), label, file: name });
+  timeline.push({ t: +t.toFixed(1), label, goal, stack, file: name });
 }
 await capture('start');
 const CHUNK = 15; // ticks per round trip
@@ -102,16 +113,31 @@ for (let t = 0; t < total; t += dt * CHUNK) {
     seenBeats = state.beats;
     // let the moment play out a little, then capture
     await page.evaluate(([n, d]) => { for (let i = 0; i < n; i++) { window.__bot.tick(d); window.__game.tick(1, d); } }, [24, dt]);
-    for (const b of newBeats.filter(b => b.important).slice(0, 2)) await capture(b.label);
+    // beats that land together (pad done + camp level, hire + worker) show the same moment: one frame for the batch
+    const labels = newBeats.filter(b => b.important).map(b => b.label);
+    if (labels.length) await capture(labels.join(' + '));
   }
   if (state.t >= nextPeriodic) { await capture(`minute ${Math.round(state.t / 60)}`); nextPeriodic += every; }
 }
 const summary = await page.evaluate(() => {
   const c = window.__game.camp;
-  return { level: c.level, capacity: c.capacity, workers: c.workers.size, bridges: [...c.bridges], pads: c.pads.map(p => p.id), beats: window.__bot.beats.map(b => `${Math.floor(b.t / 60)}:${String(Math.floor(b.t % 60)).padStart(2, '0')} ${b.label}`), errors: window.__game.errors };
+  const mmss = t => `${Math.floor(t / 60)}:${String(Math.floor(t % 60)).padStart(2, '0')}`;
+  const imp = window.__bot.beats.filter(b => b.important);
+  // longest stretches between progress beats (where the first 20 minutes can sag)
+  const gaps = imp.slice(1).map((b, i) => ({ from: mmss(imp[i].t), to: mmss(b.t), s: Math.round(b.t - imp[i].t), after: imp[i].label, next: b.label }))
+    .sort((a, b) => b.s - a.s).slice(0, 5);
+  const ng = window.__bot.noGoal;
+  return {
+    level: c.level, capacity: c.capacity, workers: c.workers.size, bridges: [...c.bridges], pads: c.pads.map(p => p.id),
+    beats: window.__bot.beats.map(b => `${mmss(b.t)} ${b.label}`),
+    noGoal: { seconds: Math.round(ng.total), stretches: ng.stretches.filter(s => s.to - s.from >= 3).map(s => `${mmss(s.from)}-${mmss(s.to)}`) },
+    gaps, errors: window.__game.errors,
+  };
 });
 writeFileSync(resolve(outDir, 'timeline.json'), JSON.stringify({ minutes, viewport: vp, timeline, summary, logs: [...new Set(logs)].slice(0, 30) }, null, 2));
 console.log(summary.beats.join('\n'));
 console.log(`\nlevel ${summary.level}, workers ${summary.workers}, bridges ${summary.bridges.join(',') || '-'}; ${captured} frames -> ${outDir}`);
+console.log(`no guide goal for ${summary.noGoal.seconds}s${summary.noGoal.stretches.length ? ` (3 s+: ${summary.noGoal.stretches.join(', ')})` : ''}`);
+console.log('longest gaps between beats: ' + summary.gaps.map(g => `${g.s}s ${g.from}-${g.to} (${g.after} -> ${g.next})`).join('; '));
 if (logs.length) console.log('--- logs ---\n' + [...new Set(logs)].slice(0, 15).join('\n'));
 await browser.close();

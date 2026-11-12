@@ -99,13 +99,32 @@ function leafGradient(h, out) {
   return out.copy(LEAF.high).lerp(LEAF.top, (h - 0.86) / 0.14);
 }
 
-export function buildTree(variant, seed = 11) {
+// lod 'mobile' (phones, ~370 tris instead of ~700): bigger leaf teeth, a 6-sided trunk, and only the faces the
+// high camera can see (the hidden caps inside the crown and the undersides of the upper lips are dropped; the
+// bottom lip keeps its underside so a felled crown never shows its inside). It also appends a ~100-tri SHADOW
+// PROXY (the crown's rounded cone + trunk, closed) after the visible triangles: userData.mainRange and
+// shadowRange are vertex ranges for geometry.drawRange, so the same instanced mesh draws the detailed crown in
+// the main pass and only the cheap proxy into the shadow map (props.js swaps the range in onBeforeShadow).
+export const TREE_MOBILE_TRIS = 390;   // visible triangles per phone tree (the shadow proxy comes on top)
+export function buildTree(variant, seed = 11, { lod = 'full' } = {}) {
+  if (lod !== 'mobile') return buildTreeAt(variant, seed, lod, 0.22);
+  // phones: the finest leaf-tooth spacing that stays within the triangle budget
+  let g = null;
+  for (let sp = 0.28; sp < 0.5; sp += 0.015) {
+    g?.dispose();
+    g = buildTreeAt(variant, seed, lod, sp);
+    if (g.userData.mainRange[1] / 3 <= TREE_MOBILE_TRIS) break;
+  }
+  return g;
+}
+function buildTreeAt(variant, seed, lod, toothSpacing) {
   const L = TREE_LAYOUTS[variant % TREE_LAYOUTS.length];
   const rng = mulberry32(seed * 131 + variant * 977 + 5);
   const b = new Builder();
+  const lite = lod === 'mobile';
 
   // ---- trunk: tapered hexagonal post + root flares (flat faceted bark, warm red-brown like the reference) ----
-  const seg = 7, rb = 0.16, rt = 0.095, th = L.trunkTop;
+  const seg = lite ? 6 : 7, rb = 0.16, rt = 0.095, th = L.trunkTop;
   const barkShade = (cen, n, out) => {
     out.copy(BARK.mid).lerp(BARK.dark, THREE.MathUtils.clamp(0.45 - cen.y * 1.2, 0, 1));
     if (n.y > 0.4) out.lerp(BARK.light, 0.35);
@@ -177,8 +196,8 @@ export function buildTree(variant, seed = 11) {
     const uTop = last ? 1 : lips[i + 1];
     band = { uLip, uTop };
     const rLip = R * shape(uLip);
-    // leaf teeth: about one per 0.25 of rim length, at least 7 (bold leaf clumps, like the reference)
-    const n = Math.max(8, Math.round((Math.PI * 2 * rLip) / 0.22));
+    // leaf teeth: about one per 0.22 of rim length (0.28 on phones), at least 8 / 6 (bold leaf clumps)
+    const n = Math.max(lite ? 6 : 8, Math.round((Math.PI * 2 * rLip) / toothSpacing));
     const N = n * 2, phase = rng() * Math.PI * 2;
     const droop = 0.06 + rLip * 0.08;
     const [cx, cz] = centre(uLip);
@@ -202,23 +221,61 @@ export function buildTree(variant, seed = 11) {
       if (last) b.tri(tip, mid[j], mid[k], flatShade, vert);
       else b.quad(mid[k], topR[k], topR[j], mid[j], flatShade, vert);
     }
-    if (!last) { // cap hidden inside the next band (keeps the shadow solid)
+    if (!last && !lite) { // cap hidden inside the next band (keeps the shadow solid; phones use the proxy)
       const c = [centre(uTop)[0], y0 + (uTop + 0.03) * H, centre(uTop)[1]];
       for (let k = 0; k < N; k++) b.tri(c, topR[(k + 1) % N], topR[k], flatShade, vert);
     }
-    // underside of each lip, so nothing is see-through from low angles
-    const under = [cx, y0 + uLip * H + 0.07, cz];
-    for (let k = 0; k < N; k++) b.tri(under, rim[k], rim[(k + 1) % N], flatShade, vert);
+    // underside of each lip, so nothing is see-through from low angles (phones: the bottom lip only; the
+    // upper ones are tucked over the band below and never face the camera)
+    if (!lite || i === 0) {
+      const under = [cx, y0 + uLip * H + 0.07, cz];
+      for (let k = 0; k < N; k++) b.tri(under, rim[k], rim[(k + 1) % N], flatShade, vert);
+    }
+  }
+  const mainCount = b.pos.length / 3;
+
+  // ---- phones: shadow proxy (closed: back faces cover the whole silhouette in the depth pass) ----
+  if (lite) {
+    const M = 12, ph = rng() * Math.PI * 2;
+    const solid = (cen, n, out) => out.setRGB(0.3, 0.5, 0.3);
+    const droop = 0.06 + R * L.b0 * 0.08;
+    // bottom lip (teeth: alternate radii, drooping), widest ring, two shoulders, tip
+    const lip = Array.from({ length: M }, (_, k) => {
+      const a = ph + (k / M) * Math.PI * 2, [cx, cz] = centre(0);
+      const r = radiusAt(a, 0) * (k % 2 ? 0.95 : 1.12);
+      return [cx + Math.cos(a) * r, y0 - (k % 2 ? 0.0 : droop), cz + Math.sin(a) * r];
+    });
+    const rings = [lip, ring(L.w, 1.04, M, ph), ring(0.5, 1.0, M, ph), ring(0.78, 1.0, M, ph)];
+    const tip = [centre(1)[0], y1, centre(1)[1]];
+    for (let r = 0; r < rings.length - 1; r++) {
+      const A = rings[r], B = rings[r + 1];
+      for (let k = 0; k < M; k++) { const j = (k + 1) % M; b.quad(A[k], B[k], B[j], A[j], solid); }
+    }
+    const top = rings[rings.length - 1];
+    for (let k = 0; k < M; k++) b.tri(tip, top[(k + 1) % M], top[k], solid);
+    const bc = [centre(0)[0], y0 + 0.02, centre(0)[1]];
+    for (let k = 0; k < M; k++) b.tri(bc, lip[k], lip[(k + 1) % M], solid);
+    // trunk: a 4-sided post from the ground into the crown
+    for (let i = 0; i < 4; i++) {
+      const a0 = (i / 4) * Math.PI * 2 + 0.4, a1 = ((i + 1) / 4) * Math.PI * 2 + 0.4;
+      b.quad(pAt(a0, rb * 0.85, -0.02), pAt(a0, rt, y0 + 0.1), pAt(a1, rt, y0 + 0.1), pAt(a1, rb * 0.85, -0.02), solid);
+    }
   }
 
   const g = b.build();
+  const total = b.pos.length / 3;
   const prof = [];
   for (let u = 0; u <= 1.0001; u += 0.1) prof.push([y0 + u * H, R * shape(u)]);
   g.userData = {
     height: y1, crownY: y0 + H * 0.4, crownR: R, crownBase: y0 - 0.08, trunkR: rb,
     // crown radius along the height [y, r] (for contact when a felled tree leans on something)
     profile: prof,
+    lod,
+    // vertex ranges (non-indexed): what the main pass draws, and what the shadow pass draws
+    mainRange: [0, mainCount],
+    shadowRange: lite ? [mainCount, total - mainCount] : [0, mainCount],
   };
+  if (lite) g.setDrawRange(0, mainCount);
   return g;
 }
 

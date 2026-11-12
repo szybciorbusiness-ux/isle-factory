@@ -4,6 +4,11 @@
 // stump pop), deposit:mined (nugget jiggle). Hover highlight via setHover(id). See DESIGN.md "props".
 //
 // Per-instance shader data lives in one vec3 attribute `aFx` = (leaf shiver, highlight glow, wind sway).
+//
+// Performance: every batch draws only the props whose bounds (prop + the shadow it throws) touch the view
+// frustum (cull(), re-run by post.js right before rendering); phones put only props inside the sun's shadow
+// frustum into the shadow map. Phone trees are ~370 tris with a ~100-tri shadow proxy (props/geo.js lod
+// 'mobile', swapped in through the draw range in onBeforeShadow). views.props.drawStats reports the counts.
 import * as THREE from 'three';
 import { buildTree, buildRock, buildStump, buildNugget } from './props/geo.js';
 import { Spring, Wobble, ease, clamp, lerp, arc } from '../util/anim.js';
@@ -51,6 +56,8 @@ export function create(ctx) {
   const P = config.PALETTE;
   const DIRS = config.DIRS;
   const WATER_Y = config.WATER_Y ?? -0.32;
+  // phone tier: lighter trees, shadows only from props near the camera target
+  const MOBILE = ctx.quality?.tier === 'mobile' || (!ctx.quality?.tier && !!ctx.mobile);
   let live = false; // events before the first frame (scenario setup) apply instantly, without animation
 
   // ---------------- materials ----------------
@@ -152,7 +159,13 @@ export function create(ctx) {
   propMat.customProgramCacheKey = () => 'props-solid-glow-v8';
   const nuggetMat = new THREE.MeshLambertMaterial({ vertexColors: true, flatShading: true });
 
+  let cullDirty = true;   // a prop was added / removed / started an animation that ignores culling
+
   // ---------------- instanced batches ----------------
+  // Slots [0, n) hold live props. Every frame cull() reorders them (swaps only when the sets change) so the
+  // ones on screen come first and, among those, the shadow casters first: the main pass draws `vis`
+  // instances, the shadow pass `shad` (onBeforeShadow swaps the count, and for phone trees the geometry's
+  // draw range to the cheap shadow proxy).
   class Batch {
     constructor(geo, mat, cap, { cast = true, receive = false, depth = null } = {}) {
       this.geo = geo;
@@ -167,22 +180,30 @@ export function create(ctx) {
       this.fx.setUsage(THREE.DynamicDrawUsage);
       geo.setAttribute('aFx', this.fx);
       this.recs = [];
+      this.n = 0; this.vis = 0; this.shad = 0;
       this.dirty = false;
+      const main = geo.userData.mainRange, shadow = geo.userData.shadowRange;
+      const swapRange = main && shadow && (main[0] !== shadow[0] || main[1] !== shadow[1]);
+      m.onBeforeShadow = () => { m.count = this.shad; if (swapRange) geo.drawRange.start = shadow[0], geo.drawRange.count = shadow[1]; };
+      m.onAfterShadow = () => { m.count = this.vis; if (swapRange) geo.drawRange.start = main[0], geo.drawRange.count = main[1]; };
       scene.add(m);
     }
     add(rec, matrix) {
-      if (this.mesh.count >= this.mesh.instanceMatrix.count) return false;
-      rec.slot = this.mesh.count++;
+      if (this.n >= this.mesh.instanceMatrix.count) return false;
+      rec.slot = this.n++;
       rec.batch = this;
+      rec.cv = true; rec.cs = true; // drawn until the next cull says otherwise
       this.recs[rec.slot] = rec;
       this.mesh.setMatrixAt(rec.slot, matrix);
       this.mesh.setColorAt(rec.slot, rec.tint);
       this.setFx(rec);
+      this.counts(this.n, this.n);
+      cullDirty = true;
       return true;
     }
     remove(rec) {
       if (rec.batch !== this) return;
-      const last = this.mesh.count - 1, i = rec.slot;
+      const last = this.n - 1, i = rec.slot;
       if (i !== last) {
         const moved = this.recs[last];
         this.mesh.getMatrixAt(last, _m); this.mesh.setMatrixAt(i, _m);
@@ -191,15 +212,45 @@ export function create(ctx) {
         this.setFx(moved);
       }
       this.recs.length = last;
-      this.mesh.count = last;
+      this.n = last;
       rec.batch = null; rec.slot = -1;
+      this.counts(Math.min(this.vis, last), Math.min(this.shad, last));
       this.dirty = true;
+      cullDirty = true;
+    }
+    // swap two slots (matrix, colour, fx, record)
+    swap(i, j) {
+      const A = this.mesh.instanceMatrix.array, C = this.mesh.instanceColor.array, F = this.fx.array;
+      for (let k = 0; k < 16; k++) { const t = A[i * 16 + k]; A[i * 16 + k] = A[j * 16 + k]; A[j * 16 + k] = t; }
+      for (let k = 0; k < 3; k++) {
+        let t = C[i * 3 + k]; C[i * 3 + k] = C[j * 3 + k]; C[j * 3 + k] = t;
+        t = F[i * 3 + k]; F[i * 3 + k] = F[j * 3 + k]; F[j * 3 + k] = t;
+      }
+      const ri = this.recs[i], rj = this.recs[j];
+      this.recs[i] = rj; rj.slot = i;
+      this.recs[j] = ri; ri.slot = j;
+      this.dirty = true;
+    }
+    // partition by the flags cull() set on each record: [shadow casters | other visible | hidden]
+    partition() {
+      const R = this.recs, n = this.n;
+      let v = 0;
+      for (let i = 0; i < n; i++) if (R[i].cv) { if (i !== v) this.swap(i, v); v++; }
+      let s = 0;
+      for (let i = 0; i < v; i++) if (R[i].cs) { if (i !== s) this.swap(i, s); s++; }
+      this.counts(v, s);
+    }
+    counts(v, s) {
+      this.vis = v; this.shad = s;
+      this.mesh.count = v;
+      // only on a change, so tools that hide meshes for a measurement (debug/profile.js) aren't overridden
+      const show = v > 0;
+      if (show !== this.shown) { this.shown = show; this.mesh.visible = show; }
     }
     write(rec, matrix) { this.mesh.setMatrixAt(rec.slot, matrix); this.dirty = true; }
     setFx(rec) { this.fx.setXYZ(rec.slot, rec.shiver, rec.glow, rec.sway); this.dirty = true; }
     flush() {
       if (!this.dirty) return;
-      this.mesh.visible = this.mesh.count > 0;
       this.mesh.instanceMatrix.needsUpdate = true;
       this.mesh.instanceColor.needsUpdate = true;
       this.fx.needsUpdate = true;
@@ -210,7 +261,8 @@ export function create(ctx) {
   const resources = [...sim.entities.values()].filter(e => e.resource);
   const nTrees = resources.filter(e => e.kind === 'tree').length;
   const count = (kind, v) => resources.filter(e => e.kind === kind && (e.variant % (kind === 'tree' ? TREE_VARIANTS : ROCK_VARIANTS)) === v).length;
-  const treeGeos = Array.from({ length: TREE_VARIANTS }, (_, v) => buildTree(v));
+  // phones: ~370-tri trees with a ~100-tri shadow proxy (props/geo.js lod 'mobile')
+  const treeGeos = Array.from({ length: TREE_VARIANTS }, (_, v) => buildTree(v, 11, { lod: MOBILE ? 'mobile' : 'full' }));
   const rockGeos = Array.from({ length: ROCK_VARIANTS }, (_, v) => buildRock(v));
   const stumpGeo = buildStump();
   const treeBatches = treeGeos.map((g, v) => new Batch(g, leafMat, count('tree', v) + 2, { depth: leafDepth }));
@@ -250,6 +302,10 @@ export function create(ctx) {
     };
     rec.handle.userData = { entityId: e.id, kind: e.kind };
     rec.handle.matrixAutoUpdate = false;
+    // culling bounds (unscaled): one sphere around the prop AND the shadow it throws toward the lower right
+    const ud = (e.kind === 'tree' ? treeGeos[e.variant % TREE_VARIANTS] : e.kind === 'rock' ? rockGeos[e.variant % ROCK_VARIANTS] : stumpGeo).userData;
+    rec.bH = ud.height || 0.5;
+    rec.bR = (e.kind === 'tree' ? ud.crownR : ud.radius || 0.32) + 0.25;
     return rec;
   }
 
@@ -580,6 +636,7 @@ export function create(ctx) {
   function onRemoved({ entity, regrow }) {
     const rec = entity ? recs.get(entity.id) : null;
     if (!rec || rec.dead) return;
+    cullDirty = true;
     bakeGrow(rec);
     rec.dead = true;
     rec.hovTarget = 0;
@@ -592,6 +649,7 @@ export function create(ctx) {
   }
 
   function onDepleted({ entity, fromDir, replacedBy }) {
+    cullDirty = true;
     const rec = recs.get(entity.id);
     const [dx, dz] = dirOf(fromDir);
     if (!rec) { if (replacedBy) addResource(replacedBy); return; }
@@ -941,6 +999,64 @@ export function create(ctx) {
     return tile.jiggling || !tile.vis.settled;
   }
 
+  // ---------------- view culling ----------------
+  // Every batch draws only the props whose bounds (prop + its shadow, see makeRec) touch the view frustum; on
+  // phones only those within the shadow reach of the camera target also go into the shadow map. Animated
+  // falls / vanishes / sinks always draw. Runs in update() and again right before rendering (post.js calls
+  // prepareRender after the camera has moved this frame), so nothing at the frame edge lags a frame.
+  const _frus = new THREE.Frustum(), _pv = new THREE.Matrix4(), _sph = new THREE.Sphere();
+  const _lfrus = new THREE.Frustum(), _lpv = new THREE.Matrix4();
+  let cullOn = true;
+  const _pvPrev = new Float64Array(16), _lpvPrev = new Float64Array(16);
+  function cull() {
+    const cam = ctx.camera;
+    if (!cam?.projectionMatrix) return;
+    cam.updateMatrixWorld();
+    _pv.multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse);
+    // phones: the sun's shadow frustum as it will render this frame (lighting placed the sun in its update)
+    const sun = MOBILE ? views.lighting?.sun : null;
+    const lightTest = !!sun?.shadow?.camera;
+    if (lightTest) {
+      sun.shadow.updateMatrices(sun);
+      const lc = sun.shadow.camera;
+      _lpv.multiplyMatrices(lc.projectionMatrix, lc.matrixWorldInverse);
+    }
+    // nothing moved and no prop was added / removed / started falling: the partition still holds
+    let same = !cullDirty;
+    const e = _pv.elements, le = _lpv.elements;
+    for (let i = 0; i < 16; i++) {
+      if (e[i] !== _pvPrev[i]) { _pvPrev[i] = e[i]; same = false; }
+      if (lightTest && le[i] !== _lpvPrev[i]) { _lpvPrev[i] = le[i]; same = false; }
+    }
+    cullDirty = false;
+    if (same) return;
+    _frus.setFromProjectionMatrix(_pv);
+    if (lightTest) _lfrus.setFromProjectionMatrix(_lpv);
+    for (const b of allBatches) {
+      for (let i = 0; i < b.n; i++) {
+        const rec = b.recs[i];
+        if (!cullOn || rec.fall || rec.vanish || rec.sink) { rec.cv = rec.cs = true; continue; }
+        const s = rec.scale, H = rec.bH * s;
+        _sph.center.set(rec.x + 0.25 * H, 0.5 * H, rec.z + 0.18 * H);
+        _sph.radius = 0.6 * H + rec.bR * s;
+        rec.cv = _frus.intersectsSphere(_sph);
+        if (rec.cv && lightTest) {
+          // the prop itself (not its shadow) must be inside the shadow frustum to land in the map
+          _sph.center.set(rec.x, 0.5 * H, rec.z);
+          _sph.radius = 0.5 * H + rec.bR * s;
+          rec.cs = _lfrus.intersectsSphere(_sph);
+        } else rec.cs = rec.cv;
+      }
+      b.partition();
+    }
+  }
+  let lastPrepared = -1;
+  function prepareRender() {
+    lastPrepared = clock;
+    cull();
+    for (const b of allBatches) b.flush();
+  }
+
   // wind clock: follow the grass (terrain's dt-advanced wind time) when exposed, else our own dt clock
   let windT = 0;
   function windClock(dt) {
@@ -990,6 +1106,20 @@ export function create(ctx) {
     _rec: id => recs.get(id) || null,
     // test/debug: props regrowing / sinking right now
     get regrowing() { return [...active].filter(r => r.grow || r.sink).map(r => ({ id: r.id, kind: r.kind, x: r.x, z: r.z, grow: r.grow ? +r.grow.t.toFixed(3) : null, k: r.grow?.k, sink: r.sink ? +r.sink.t.toFixed(3) : null })); },
+    // Re-cull against the camera as it is right now (post.js calls this just before rendering).
+    prepareRender,
+    // perf read-out / test switch: instances drawn per pass, and turning view culling off (draws everything)
+    get drawStats() {
+      let n = 0, vis = 0, shad = 0, tris = 0, shadowTris = 0;
+      for (const b of allBatches) {
+        const per = b.geo.userData.mainRange ? b.geo.userData.mainRange[1] / 3 : b.geo.attributes.position.count / 3;
+        const perS = b.geo.userData.shadowRange ? b.geo.userData.shadowRange[1] / 3 : per;
+        n += b.n; vis += b.vis; shad += b.mesh.castShadow ? b.shad : 0;
+        tris += b.vis * per; shadowTris += b.mesh.castShadow ? b.shad * perS : 0;
+      }
+      return { mobile: MOBILE, props: n, drawn: vis, shadowCasters: shad, tris: Math.round(tris), shadowTris: Math.round(shadowTris), treeTris: treeGeos.map(g => (g.userData.mainRange?.[1] ?? g.attributes.position.count) / 3), treeShadowTris: treeGeos.map(g => (g.userData.shadowRange?.[1] ?? 0) / 3) };
+    },
+    setCulling(on) { cullOn = !!on; cullDirty = true; prepareRender(); },
     update(dt, t) {
       live = true;
       clock += dt;
@@ -1007,6 +1137,8 @@ export function create(ctx) {
         }
       }
       for (const tile of activeTiles) if (!stepTile(tile, dt)) activeTiles.delete(tile);
+      // post.js culls right before rendering (camera final); this is the fallback when it doesn't
+      if (clock - lastPrepared > 0.25) cull();
       for (const b of allBatches) b.flush();
       for (const d of [1, 2]) { const b = nuggetBatches[d]; if (b.dirty) { b.mesh.instanceMatrix.needsUpdate = true; b.dirty = false; } }
     },

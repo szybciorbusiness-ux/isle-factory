@@ -71,10 +71,14 @@ function step(ux, uz, dt) {
 
 const dt = 1 / 20;
 let waitT = 0;
+const carriedPerMin = []; let noGoal = 0; let lastBeat = 0; const gaps = [];
+camp.events.on('pad:complete', () => { gaps.push(camp.time - lastBeat); lastBeat = camp.time; });
 for (let t = 0; t < minutes * 60; t += dt) {
   if ((think -= dt) <= 0) { think = 0.5; plan(); }
   if (goal) kinds[goal.kind] = (kinds[goal.kind] || 0) + dt;
   if (goal?.kind === 'wait') waitT += dt;
+  if (!goal) noGoal += dt;
+  const mi = Math.floor(t / 60); (carriedPerMin[mi] ||= [0, 0]); carriedPerMin[mi][0] += camp.total(); carriedPerMin[mi][1]++;
   move(dt);
   sim.update(dt);
   camp.update(dt);
@@ -83,4 +87,6 @@ for (let t = 0; t < minutes * 60; t += dt) {
 console.log(`\nPacing over ${minutes} min (bot follows camp.nextGoal at ${PLAYER.moveSpeed} tiles/s)\n`);
 for (const { t, what } of log) console.log(`${fmt(t).padStart(6)}  ${what}`);
 console.log(`\ntime by goal kind: ${Object.entries(kinds).map(([k, v]) => `${k} ${fmt(v)}`).join(', ')}`);
+console.log(`avg carried per minute: ${carriedPerMin.map(([s, n]) => (s / n).toFixed(1)).join(' ')}`);
+console.log(`no goal: ${noGoal.toFixed(0)} s; longest gaps between pads: ${gaps.sort((a, b) => b - a).slice(0, 4).map(g => g.toFixed(0) + ' s').join(', ')}`);
 console.log(`final: level ${camp.level}, capacity ${camp.capacity}, workers ${camp.workers.size}, bridges ${[...camp.bridges].join(',') || '-'}, pads left ${camp.pads.map(p => p.id).join(', ')}`);

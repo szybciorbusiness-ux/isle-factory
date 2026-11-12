@@ -18,6 +18,7 @@ const SUN_DIST = 30;
 const SHADOW_HALF = 13;         // fallback half extent (no camera yet)
 const FOOT_MARGIN = 0.9;        // light-space margin around the view footprint (units)
 const FOOT_FAR = 17;            // ignore ground further than this from the target (it's under cloud / blurred)
+const FOOT_FAR_TOP_MOBILE = 11.5; // phones: toward the top of the screen only (see create)
 const CROWN_Y = 1.6;            // receivers up to this height still get their shadow when at the frame edge
 
 // warm (lit hearth) and cold (level 0) light rigs
@@ -29,6 +30,11 @@ const RIG = {
 export function create(ctx) {
   const { scene, renderer, sim, map, camera } = ctx;
   const mapSize = Math.max(256, Math.min(4096, Number(ctx.quality?.shadowMapSize) || 2048));
+  // phones: toward the top of the screen the shadow frustum only reaches as far as the crisp part of the
+  // tilt-shift (further up is under the cloud frame / blurred), which keeps the 1024 map sharper and lets far
+  // casters drop out. The sides stay crisp in a sideways phone, so they keep the full reach.
+  const MOBILE = ctx.quality?.tier === 'mobile';
+  const footFar = FOOT_FAR, footFarTop = MOBILE ? FOOT_FAR_TOP_MOBILE : FOOT_FAR;
 
   renderer.shadowMap.enabled = true;
   renderer.shadowMap.type = THREE.PCFShadowMap;
@@ -76,16 +82,17 @@ export function create(ctx) {
     for (const y of [0, CROWN_Y]) {
       for (const [nx, ny] of CORNERS) {
         ray.set(nx, ny, 0.5).unproject(camera).sub(camPos);
+        const far = ny > 0 ? footFarTop : footFar;
         let px, pz;
         if (ray.y < -1e-4 && camPos.y > y) {
           const t = (y - camPos.y) / ray.y;
           px = camPos.x + ray.x * t; pz = camPos.z + ray.z * t;
         } else { // looking at/above the horizon: clamp to the far limit along the ray's heading
           const l = Math.hypot(ray.x, ray.z) || 1;
-          px = tx + (ray.x / l) * FOOT_FAR; pz = tz + (ray.z / l) * FOOT_FAR;
+          px = tx + (ray.x / l) * far; pz = tz + (ray.z / l) * far;
         }
         const dx = px - tx, dz = pz - tz, d = Math.hypot(dx, dz);
-        if (d > FOOT_FAR) { px = tx + dx * FOOT_FAR / d; pz = tz + dz * FOOT_FAR / d; }
+        if (d > far) { px = tx + dx * far / d; pz = tz + dz * far / d; }
         const r = px * right.x + y * right.y + pz * right.z;
         const u = px * upL.x + y * upL.y + pz * upL.z;
         box.r0 = Math.min(box.r0, r); box.r1 = Math.max(box.r1, r);
@@ -147,6 +154,8 @@ export function create(ctx) {
     sun, hemi, mood,
     sunDirection: SUN_DIR.clone(),
     get shadowExtent() { return { halfWidth: ext.hw, halfHeight: ext.hh, mapSize }; },
+    // how far (world units from the camera target) the shadow frustum reaches at most
+    shadowReach: footFar,
     update(dt) {
       mood.update(dt);
       applyWarmth(mood.warmth);

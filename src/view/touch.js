@@ -48,10 +48,14 @@ const CSS = `
 .touch .t-small svg { width: 24px; height: 24px; }
 .touch .t-rot { bottom: calc(var(--hud-bottom, calc(var(--safe-bottom, 0px) + 96px)) + 122px); }
 .touch .t-cancel { bottom: calc(var(--hud-bottom, calc(var(--safe-bottom, 0px) + 96px)) + 186px); color: #e2574c; }
-.touch .t-hint { position: absolute; left: 50%; bottom: calc(var(--safe-bottom, 0px) + 120px); width: 92px; height: 92px; margin-left: -46px;
-  border-radius: 50%; border: 2.5px dashed rgba(255, 250, 240, 0.85); pointer-events: none; will-change: transform, opacity; }
-.touch .t-hint::after { content: ''; position: absolute; left: 50%; top: 50%; width: 26px; height: 26px; margin: -13px; border-radius: 50%;
-  background: rgba(255, 250, 240, 0.95); box-shadow: 0 6px 14px -6px rgba(60, 50, 30, 0.5); }
+/* first-run hint, sticker style: a cream ring with the brown outline, a knob, and a small hand pushing it */
+.touch .t-hint { position: absolute; left: 50%; bottom: calc(var(--safe-bottom, 0px) + 110px); width: 96px; height: 96px; margin-left: -48px;
+  border-radius: 50%; border: 3px solid #5b3a21; background: rgba(255, 247, 230, 0.42);
+  box-shadow: 0 4px 0 rgba(91, 58, 33, 0.35), inset 0 0 0 4px rgba(255, 255, 255, 0.35); pointer-events: none; will-change: transform, opacity; }
+.touch .t-hint::after { content: ''; position: absolute; left: 50%; top: 50%; width: 34px; height: 34px; margin: -17px; border-radius: 50%;
+  background: radial-gradient(circle at 38% 32%, #fff 0%, #fff7e6 60%, #f1e1c2 100%); border: 3px solid #5b3a21; box-shadow: 0 3px 0 #dcc49b;
+  transform: translate(var(--kx, 0px), var(--ky, 0px)); }
+.touch .t-hint .t-hand { position: absolute; left: 50%; top: 50%; width: 34px; height: 34px; margin: -6px 0 0 -4px; z-index: 1; will-change: transform; }
 .touch.is-hidden .t-btn { opacity: 0 !important; }
 .touch.is-hidden .t-hit { pointer-events: none; }
 `;
@@ -69,7 +73,7 @@ export function create(ctx) {
   root.className = 'touch';
   root.innerHTML = `
     <div class="t-zone t-hit"></div>
-    <div class="t-hint"></div>
+    <div class="t-hint"><svg class="t-hand" viewBox="0 0 32 32" aria-hidden="true"><path d="M12 17V7.5a2 2 0 0 1 4 0V15m0-2V5.5a2 2 0 0 1 4 0V15m0-6a2 2 0 0 1 4 0v6m0-3a2 2 0 0 1 4 0v7c0 5-3.6 9-9 9-4.2 0-6.6-2.3-9-6L5.7 19a2.2 2.2 0 0 1 3.5-2.6L12 19" fill="#fff7e6" stroke="#5b3a21" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
     <div class="t-base"><div class="t-dir"></div><div class="t-knob"></div></div>
     ${campMode ? '' : `
     <button class="t-btn t-small t-cancel t-hit" type="button" aria-label="Cancel">${svg('cancel')}</button>
@@ -83,6 +87,9 @@ export function create(ctx) {
   const knob = root.querySelector('.t-knob');
   const dirEl = root.querySelector('.t-dir');
   const hint = root.querySelector('.t-hint');
+  const hand = root.querySelector('.t-hand');
+  // any real movement (keyboard, stick, mouse walk) also retires the hint
+  addEventListener('keydown', e => { if (/^(Key[WASD]|Arrow)/.test(e.code)) used = true; });
   const act = root.querySelector('.t-act');
   const rot = root.querySelector('.t-rot');
   const cancel = root.querySelector('.t-cancel');
@@ -252,12 +259,16 @@ export function create(ctx) {
       dirEl.style.opacity = Math.max(0, Math.min(1, (km - 0.25) * 2)).toFixed(3);
       dirEl.style.transform = `rotate(${Math.atan2(knobY.value, knobX.value).toFixed(3)}rad)`;
 
-      hintAlpha.target = !used && clock > 1.2 ? 0.85 : 0;
+      if (!used && (views.player?.moving || Math.hypot(input.move.x, input.move.z) > 0.05)) used = true;
+      hintAlpha.target = !used && clock > 1.2 && !views.player?.booting ? 1 : 0;
       hintAlpha.update(dt);
-      const nudge = Math.sin(clock * 2.4) * 10;
-      hint.style.opacity = Math.max(0, hintAlpha.value).toFixed(3);
-      hint.style.transform = `translate3d(0, 0, 0) scale(${(0.96 + Math.sin(clock * 2.4) * 0.03).toFixed(3)})`;
-      hint.style.setProperty('--n', `${nudge.toFixed(1)}px`);
+      hint.style.opacity = Math.max(0, Math.min(1, hintAlpha.value)).toFixed(3);
+      hint.style.transform = `scale(${(0.9 + 0.1 * Math.min(1, Math.max(0, hintAlpha.value))).toFixed(3)})`;
+      // the hand pushes the knob out and lets it spring back: "hold and drag"
+      const kp = Math.max(0, Math.sin(clock * 2.2)) * 20;
+      hint.style.setProperty("--kx", `${(kp * 0.8).toFixed(1)}px`);
+      hint.style.setProperty("--ky", `${(-kp * 0.6).toFixed(1)}px`);
+      hand.style.transform = `translate(${(kp * 0.8).toFixed(1)}px, ${(-kp * 0.6).toFixed(1)}px)`;
 
       // factory buttons
       if (!campMode) {

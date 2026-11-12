@@ -15,6 +15,7 @@ export const LAYOUT = {
     head: [0.165, 0.41, 0], ear: [0.05, 0.24, 0.064], tail: [-0.2, 0.405, 0],
     centerY: 0.36, headTopY: 0.72, length: 0.55, shadow: [0.62, 0.34],
     earRest: { x: 1.05, z: 0.35 }, tailRest: 0,
+    eye: { p: [0.124, 0.2, 0.068], r: 0.022, s: [0.8, 1.05, 0.7] }, lid: '#cf8a4f',
   },
   boar: {
     scale: 1.0,
@@ -22,6 +23,7 @@ export const LAYOUT = {
     head: [0.19, 0.27, 0], ear: [0.035, 0.088, 0.062], tail: [-0.245, 0.29, 0],
     centerY: 0.26, headTopY: 0.46, length: 0.62, shadow: [0.66, 0.46],
     earRest: { x: 0.55, z: 0.25 }, tailRest: 0,
+    eye: { p: [0.13, 0.035, 0.07], r: 0.017, s: [0.8, 1.05, 0.7] }, lid: '#7d5239',
   },
   rabbit: {
     scale: 1.3, tiltPivot: -0.08,
@@ -29,9 +31,12 @@ export const LAYOUT = {
     head: [0.065, 0.17, 0], ear: [0.005, 0.088, 0.026],
     centerY: 0.12, headTopY: 0.42, length: 0.3, shadow: [0.36, 0.28],
     earRest: { x: 0.14, z: 0.3 }, tailRest: 0,
+    eye: { p: [0.068, 0.056, 0.05], r: 0.015, s: [0.8, 1.05, 0.7] }, lid: '#ede1cf',
   },
 };
 
+// Eyes are merged into the head; a blink draws a coat-coloured lid over each one (LAYOUT[kind].eye must match
+// the eyes() call in the head below, see lidGeometry()).
 const eyes = (p, x, y, z, r) => {
   for (const s of [-1, 1]) {
     p.add(ball(r, 8, 6), EYE, { p: [x, y, s * z], s: [0.8, 1.05, 0.7], ao: false });
@@ -128,6 +133,12 @@ function rabbit(q) {
   const foot = new Parts({ ao: false });
   foot.add(ball(1, 8, 6), C.fur, { s: [0.062, 0.024, 0.03], p: [0.022, -0.012, 0], flat: true, faceColor: (cx, cy, cz, nx, ny) => (ny < -0.4 ? C.belly : null) });
   return { body: body.merge(), head: head.merge(), ear: ear.merge(), foot: foot.merge() };
+}
+
+// Eyelid: one small white ball shared by every species and role (tinted per instance with the coat or skin
+// colour, see kit.js lidMatrix). Its lower rim is darker so a closed lid reads as a little lash line.
+export function lidGeometry() {
+  return new Parts({ ao: false }).add(ball(1, 8, 6), '#ffffff', { flat: true, faceColor: (cx, cy) => (cy < -0.5 ? '#9a9088' : null) }).merge();
 }
 
 // q: { seg } (sphere segments; lower on mobile)

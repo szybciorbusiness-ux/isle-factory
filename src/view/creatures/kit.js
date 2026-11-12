@@ -72,20 +72,147 @@ export const capsule = (r, len, cap = 3, radial = 8) => new THREE.CapsuleGeometr
 export const lathe = (pts, seg = 14) => new THREE.LatheGeometry(pts.map(([r, y]) => new THREE.Vector2(Math.max(0.0005, r), y)), seg);
 
 // ---------- material: Lambert + per-instance white flash ----------
-// Every pooled geometry carries a per-instance `iFlash` (0..1): the diffuse blends to white and a little
-// emissive is added, so a hit reads as a bright white pop without changing any materials.
+// Every instance carries a white "hit flash" (0..1): the diffuse blends to white and a little emissive is added,
+// so a hit reads as a bright white pop without changing any materials. Batched (PartBatch): the flash rides in
+// the per-instance colour's alpha as 1 - flash (opaque output ignores alpha). Instanced fallback (PartPool):
+// a per-instance `iFlash` attribute.
 export function creatureMaterial() {
   const m = new THREE.MeshLambertMaterial({ vertexColors: true });
   m.onBeforeCompile = sh => {
     sh.vertexShader = sh.vertexShader
-      .replace('#include <common>', '#include <common>\nattribute float iFlash;\nvarying float vFlash;')
-      .replace('#include <begin_vertex>', '#include <begin_vertex>\nvFlash = iFlash;');
+      .replace('#include <common>', '#include <common>\n#ifndef USE_BATCHING\nattribute float iFlash;\n#endif\nvarying float vFlash;')
+      .replace('#include <begin_vertex>', [
+        '#include <begin_vertex>',
+        '#if defined( USE_BATCHING_COLOR )',
+        'vFlash = 1.0 - getBatchingColor( getIndirectIndex( gl_DrawID ) ).a;',
+        '#elif defined( USE_BATCHING )',
+        'vFlash = 0.0;',
+        '#else',
+        'vFlash = iFlash;',
+        '#endif',
+      ].join('\n'));
     sh.fragmentShader = sh.fragmentShader
       .replace('#include <common>', '#include <common>\nvarying float vFlash;')
       .replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\ndiffuseColor.rgb = mix(diffuseColor.rgb, vec3(1.0), vFlash * 0.85);\ntotalEmissiveRadiance += vec3(0.95, 0.97, 0.92) * vFlash * 0.75;');
   };
-  m.customProgramCacheKey = () => 'creature-flash-v1';
+  m.customProgramCacheKey = () => 'creature-flash-v2';
   return m;
+}
+
+// ---------- batched parts (the default: one draw call for many part types) ----------
+// A PartBatch is one THREE.BatchedMesh holding every part geometry of a group (e.g. all bodies, heads, legs and
+// tools of every species and role). Each frame the rigs push matrices into per-part slots; a slot reuses its
+// instance ids in order and hides the ones it did not use this frame. With WEBGL_multi_draw the whole batch is a
+// single draw call (plus one in the shadow pass when it casts), whatever the mix of species on screen.
+//   const b = new PartBatch(root, mat, [[key, geometry, capHint], ...], { cast });
+//   b.begin(); b.slot(key).push(matrix, flash, tint); ...; b.end();
+// All geometries must share the same attributes (position, normal, color) and be non-indexed (Parts.merge()).
+const _v4 = new THREE.Vector4();
+class BatchSlot {
+  constructor(batch, gid) { this.batch = batch; this.gid = gid; this.ids = []; this.n = 0; this.shown = 0; }
+  begin() { this.n = 0; }
+  push(matrix, flash = 0, tint = null) {
+    const m = this.batch.mesh;
+    let id = this.ids[this.n];
+    if (id === undefined) { id = this.batch.alloc(this.gid); this.ids.push(id); }
+    this.n++;
+    m.setMatrixAt(id, matrix);
+    if (tint) _v4.set(tint.r, tint.g, tint.b, 1 - flash); else _v4.set(1, 1, 1, 1 - flash);
+    m.setColorAt(id, _v4);
+    m.setVisibleAt(id, true);   // no-op when already visible
+  }
+  end() {
+    const m = this.batch.mesh;
+    for (let i = this.n; i < this.shown; i++) m.setVisibleAt(this.ids[i], false);
+    this.shown = this.n;
+    return this.n;
+  }
+}
+export class PartBatch {
+  constructor(parent, material, entries, { cast = false, receive = true, name = 'creatures:batch' } = {}) {
+    let verts = 0, cap = 0;
+    for (const [, g, c] of entries) { verts += g.attributes.position.count; cap += c || 8; }
+    const m = new THREE.BatchedMesh(Math.max(16, cap), verts, verts, material);
+    m.perObjectFrustumCulled = false;   // a few hundred small parts: culling and sorting cost more CPU than they save
+    m.sortObjects = false;
+    m.frustumCulled = false;
+    m.castShadow = cast; m.receiveShadow = receive; m.name = name;
+    m.visible = false;
+    m.raycast = () => {};               // rewritten every frame: never a pick target
+    this.mesh = m; this.parent = parent;
+    this.slots = new Map();
+    for (const [key, g] of entries) this.slots.set(key, new BatchSlot(this, m.addGeometry(g)));
+    this.count = 0;
+    parent.add(m);
+  }
+  slot(key) { return this.slots.get(key); }
+  alloc(gid) {
+    const m = this.mesh;
+    if (m.instanceCount >= m.maxInstanceCount) m.setInstanceCount(m.maxInstanceCount * 2);
+    return m.addInstance(gid);
+  }
+  begin() { for (const s of this.slots.values()) s.begin(); }
+  end() {
+    let n = 0;
+    for (const s of this.slots.values()) n += s.end();
+    this.count = n;
+    this.mesh.visible = n > 0;
+  }
+  dispose() { this.parent.remove(this.mesh); this.mesh.dispose(); }
+}
+// True when BatchedMesh can draw a whole batch in one call (WebGL2 + WEBGL_multi_draw). Without the extension
+// three loops one draw per instance, so the instanced PartPools are the better fallback there.
+export function canBatch(renderer) {
+  try { return !!THREE.BatchedMesh && !!renderer?.extensions?.has?.('WEBGL_multi_draw'); } catch { return false; }
+}
+
+// ---------- blinks ----------
+// Lid closure 0..1 for one creature: a quick blink every few seconds (now and then a double blink), plus a
+// held "squint" for expressions (eyes squeezed on a hit, happy closed eyes while munching).
+export class Blink {
+  constructor(rnd, { every = [2.2, 5.5] } = {}) {
+    this.rnd = rnd; this.every = every;
+    this.wait = 0.6 + rnd() * every[1]; this.t = -1; this.gap = 0; this.again = false;
+    this.squint = 0; this.squintT = 0; this.hold = 0;
+    this.value = 0;
+  }
+  // a closed-eyes beat: hold `dur` seconds at `amount`
+  close(dur = 0.18, amount = 1) { this.hold = Math.max(this.hold, dur); this.squintT = Math.max(this.squintT, amount); }
+  update(dt, want = 0) {
+    if (this.gap > 0) { this.gap -= dt; if (this.gap <= 0) this.t = 0; }
+    else if (this.t < 0) {
+      this.wait -= dt;
+      if (this.wait <= 0) { this.t = 0; this.again = this.rnd() < 0.18; this.wait = this.every[0] + this.rnd() * (this.every[1] - this.every[0]); }
+    }
+    let b = 0;
+    if (this.t >= 0) {
+      const t = (this.t += dt);
+      // shut fast (55 ms), hold a beat (45 ms), open a little slower (95 ms)
+      if (t < 0.055) b = smooth(0, 1, t / 0.055);
+      else if (t < 0.1) b = 1;
+      else if (t < 0.195) b = 1 - smooth(0, 1, (t - 0.1) / 0.095);
+      else { this.t = -1; if (this.again) { this.again = false; this.gap = 0.07; } } // now and then a double blink
+    }
+    this.hold -= dt;
+    if (this.hold <= 0) this.squintT = 0;
+    const sq = Math.max(this.squintT, want);
+    this.squint += (sq - this.squint) * (1 - Math.exp(-(sq > this.squint ? 40 : 14) * dt));
+    this.value = Math.max(b, this.squint);
+    return this.value;
+  }
+}
+
+// One eyelid instance matrix: the lid is a white unit ball (tinted with the coat) that grows down from the top of
+// the eye as `c` goes 0 -> 1. eye = { p: [x, y, z], r, s: [sx, sy, sz] } in head space; side = -1 | 1 (z mirror).
+const _lm = new THREE.Matrix4(), _lp = new THREE.Vector3(), _ls = new THREE.Vector3(), _lq = new THREE.Quaternion();
+export const LID_GROW = 1.2;
+export function lidMatrix(out, headMatrix, eye, side, c) {
+  const k = LID_GROW, ry = eye.r * eye.s[1] * k;
+  const cc = Math.max(0.02, c);
+  _lp.set(eye.p[0] + eye.r * 0.08, eye.p[1] + ry * (1 - cc), side * eye.p[2]);
+  _ls.set(eye.r * eye.s[0] * k, ry * cc, eye.r * eye.s[2] * k);
+  _lm.compose(_lp, _lq.identity(), _ls);
+  return out.multiplyMatrices(headMatrix, _lm);
 }
 
 // ---------- instanced pools ----------

@@ -9,12 +9,15 @@
 // from camp state / station:built. Bridges are built at runtime (pads view draws them): when one starts,
 // the rim tufts and shore stakes where its deck meets each shore tuck away. ctx.quality.grassDensity
 // (0.5 on phones) thins blades, rim fringe, field tufts and flowers while keeping the same look.
+// Phones also draw blades, rim tufts, field tufts, flowers and shore stakes from a VIEW WINDOW: one draw each,
+// refilled with the instances around the camera's ground footprint (world/window.js; views.terrain.windowStats).
 import * as THREE from 'three';
 import { STATIONS as CAMP_STATIONS } from '../sim/camp-data.js';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { traceLoops, groupIslands, ring } from './world/outline.js';
 import { WIND, WIND_GLSL, gustAt, leanAt } from './world/wind.js';
 import { createGrassField, TONE_GLSL } from './world/grass.js';
+import { createFootprint, createInstanceWindow } from './world/window.js';
 
 // ---- tuning ----
 const CAP_INSET = 0.2;          // grass cap sits this far inside the tile outline (sand lip width)
@@ -25,6 +28,9 @@ const CLUSTER_LEN = 0.3;        // rim is split in segments; some carry a cluste
 const STAKE_CHANCE = 0.3;       // share of straight-shore tile boundaries that get a little cream stake
 const BRIDGE_Y = -0.02;
 const EDGE_CHUNK = 16;          // rim tufts are split into culled meshes per EDGE_CHUNK x EDGE_CHUNK tiles
+// phones: tiles within this many tiles of the camera's ground footprint keep their clutter drawn (a tile's
+// half diagonal + the half-tile snap of the footprint + blade lean)
+const WINDOW_MARGIN = 1.6;
 
 // Rim profile: [d (inward offset), y, normalOut, normalUp]. Strips connect consecutive rows.
 const PROFILE = {
@@ -46,6 +52,12 @@ export function create(ctx) {
   const { scene, map, config, noise, events, sim, renderer } = ctx;
   const P = config.PALETTE;
   const density = Math.max(0.25, Math.min(1, Number(ctx.quality?.grassDensity) || 1));
+  // Phones: grass blades, rim tufts, field tufts and flowers each draw ONCE, refilled with what is inside the
+  // camera's ground footprint (world/window.js), instead of whole-map / per-chunk meshes.
+  const MOBILE = ctx.quality?.tier === 'mobile';
+  const footprint = MOBILE && ctx.camera ? createFootprint(ctx.camera, { margin: WINDOW_MARGIN }) : null;
+  footprint?.update();
+  const windows = new Map(); // master grow attribute -> window
   // rim fringe spacing / size and the share of field tufts + flowers kept at this density
   const edgeStep = EDGE_TUFT_STEP * Math.pow(1 / density, 0.7);
   const fringeScale = Math.pow(1 / density, 0.3);
@@ -160,7 +172,8 @@ ${TONE_GLSL}`)
   };
   for (const loop of loops) {
     pushStrip(loop, PROFILE.skirt[0], PROFILE.skirt[1], skirtCols[0], skirtCols[1]);
-    for (let k = 0; k < PROFILE.sand.length - 1; k++) pushStrip(loop, PROFILE.sand[k], PROFILE.sand[k + 1], sandCols[k], sandCols[k + 1]);
+    // the last strip (-0.6 -> -1.6) lies wholly under the opaque water plane (y -0.32): never visible, skipped
+    for (let k = 0; k < PROFILE.sand.length - 2; k++) pushStrip(loop, PROFILE.sand[k], PROFILE.sand[k + 1], sandCols[k], sandCols[k + 1]);
   }
   const rimGeo = new THREE.BufferGeometry();
   rimGeo.setAttribute('position', new THREE.Float32BufferAttribute(rimPos, 3));
@@ -177,7 +190,34 @@ ${TONE_GLSL}`)
   // =====================================================================
   // Dense grass blades over every grass tile
   // =====================================================================
-  const grass = createGrassField({ map, sim, loops, shared, baseColor: bladeBase, capInset: CAP_INSET, rng, density });
+  const grass = createGrassField({ map, sim, loops, shared, baseColor: bladeBase, capInset: CAP_INSET, rng, density, footprint });
+
+  // Phones: turn an InstancedMesh holding every instance into a windowed one. Its current matrices / colours
+  // become the masters; `growAttr` (what tileMembers / animating write) stays the master grow, and the mesh gets
+  // its own drawn copy (growAttr null: no grow, the window is keyed by the mesh). tileOf(i) -> [x, z] of instance i.
+  const windowize = (mesh, growAttr, n, tileOf, { animatedMatrix = false } = {}) => {
+    if (!footprint || !n) return null;
+    const tiles = new Int32Array(n);
+    for (let i = 0; i < n; i++) {
+      const [x, z] = tileOf(i);
+      tiles[i] = Math.max(0, Math.min(map.h - 1, z)) * map.w + Math.max(0, Math.min(map.w - 1, x));
+    }
+    const geo = mesh.geometry;
+    mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    mesh.instanceColor?.setUsage(THREE.DynamicDrawUsage);
+    const attrs = { matrix: { master: mesh.instanceMatrix.array.slice(), size: 16, target: mesh.instanceMatrix, animated: animatedMatrix } };
+    if (growAttr) {
+      const drawGrow = new THREE.InstancedBufferAttribute(new Float32Array(n).fill(1), 1).setUsage(THREE.DynamicDrawUsage);
+      geo.setAttribute('aGrow', drawGrow);
+      attrs.grow = { master: growAttr.array, size: 1, target: drawGrow, animated: true };
+    }
+    if (mesh.instanceColor) attrs.color = { master: mesh.instanceColor.array.slice(), size: 3, target: mesh.instanceColor };
+    mesh.frustumCulled = false;
+    const win = createInstanceWindow({ map, tiles, attrs, setCount: c => { mesh.count = c; mesh.visible = c > 0; } });
+    win.update(footprint);
+    windows.set(growAttr || mesh, win);
+    return win;
+  };
   group.add(grass.group);
 
   // =====================================================================
@@ -284,7 +324,7 @@ gl_Position = projectionMatrix * mvPosition;`);
     e.matrix = new THREE.Matrix4().compose(pv, q, sv);
     const v = 0.95 + rng() * 0.1;
     e.color = new THREE.Color().setRGB(v, v * (0.98 + rng() * 0.04), v * (0.92 + rng() * 0.1));
-    const key = `${Math.floor(e.px / EDGE_CHUNK)},${Math.floor(e.pz / EDGE_CHUNK)}`;
+    const key = footprint ? 'all' : `${Math.floor(e.px / EDGE_CHUNK)},${Math.floor(e.pz / EDGE_CHUNK)}`;
     if (!edgeChunks.has(key)) edgeChunks.set(key, []);
     edgeChunks.get(key).push(i);
   });
@@ -308,6 +348,7 @@ gl_Position = projectionMatrix * mvPosition;`);
     mesh.name = 'edgeTufts';
     edgeGroup.add(mesh);
     grow.push(attr);
+    windowize(mesh, attr, list.length, li => [edgeList[list[li]].tx, edgeList[list[li]].tz]);
   }
   group.add(edgeGroup);
   const edgeMesh = edgeGroup;
@@ -358,6 +399,7 @@ gl_Position = projectionMatrix * mvPosition;`);
   fieldMesh.name = 'fieldTufts';
   group.add(fieldMesh);
   grow.push(fieldGrow);
+  windowize(fieldMesh, fieldGrow, fieldList.length, i => [fieldList[i].tx, fieldList[i].tz]);
 
   const flowerGeo = makeFlowerGeometry();
   const flowerGrow = new THREE.InstancedBufferAttribute(new Float32Array(Math.max(1, flowerList.length)).fill(1), 1);
@@ -380,6 +422,7 @@ gl_Position = projectionMatrix * mvPosition;`);
   flowerMesh.name = 'flowers';
   group.add(flowerMesh);
   grow.push(flowerGrow);
+  windowize(flowerMesh, flowerGrow, flowerList.length, i => [flowerList[i].tx, flowerList[i].tz]);
 
   // =====================================================================
   // Shore stakes: small cream pegs at tile boundaries along straight shores (like the reference)
@@ -452,6 +495,18 @@ gl_Position = projectionMatrix * mvPosition;`);
   // =====================================================================
   let windT = 0;
   const playerPos = new THREE.Vector3();
+  let lastPrepared = -1;
+  function prepareRender(fromUpdate = false) {
+    if (!fromUpdate) lastPrepared = windT;
+    if (!footprint || !footprint.update()) return;
+    grass.refresh(footprint);
+    for (const w of windows.values()) w.update(footprint);
+  }
+  // phones: the little shore pegs' shadows are a few pixels; they stay out of the shadow map, and only the pegs
+  // inside the view window are drawn
+  if (MOBILE && stakes) stakes.castShadow = false;
+  const stakesWin = stakes ? windowize(stakes, null, stakes.count, i => [Math.round(stakes.userData.spots[i].x), Math.round(stakes.userData.spots[i].z)], { animatedMatrix: true }) : null;
+  const stakeMaster = stakesWin?.master('matrix');
   return {
     group, cap, rim, tufts: edgeMesh, edgeTuftCount: edgeList.length, fieldTufts: fieldMesh, flowers: flowerMesh, bridges: bridge, stakes, loops,
     grass,
@@ -495,10 +550,10 @@ gl_Position = projectionMatrix * mvPosition;`);
           const f = k < 0.25 ? 1 + 0.12 * Math.sin((k / 0.25) * Math.PI / 2) : 1.12 * (1 - Math.pow((k - 0.25) / 0.75, 3));
           const s0 = sp[a.i];
           m4.compose(pv.set(s0.x, 0, s0.z), s0.q, sv.copy(s0.s).multiplyScalar(Math.max(0, f)));
-          stakes.setMatrixAt(a.i, m4);
-          if (k >= 1) { stakeAnims.splice(n, 1); stakes.setMatrixAt(a.i, m4.makeScale(0, 0, 0)); }
+          if (k >= 1) { stakeAnims.splice(n, 1); m4.makeScale(0, 0, 0); }
+          if (stakeMaster) m4.toArray(stakeMaster, a.i * 16); else stakes.setMatrixAt(a.i, m4);
         }
-        stakes.instanceMatrix.needsUpdate = true;
+        if (stakesWin) stakesWin.sync('matrix'); else stakes.instanceMatrix.needsUpdate = true;
       }
       if (animating.size) {
         const touched = new Set();
@@ -511,8 +566,22 @@ gl_Position = projectionMatrix * mvPosition;`);
           arr[a.i] = v;
           touched.add(a.g);
         }
-        for (const g of touched) g.needsUpdate = true;
+        for (const g of touched) { g.needsUpdate = true; windows.get(g)?.sync('grow'); }
       }
+      // post.js refills the windows right before rendering; this is the fallback when it doesn't
+      if (windT - lastPrepared > 0.25) prepareRender(true);
+    },
+    // phones: refill the windowed grass / tufts / flowers for the camera as it is now (post.js calls this
+    // right before rendering, after the camera moved this frame)
+    prepareRender,
+    // test switch: windowing off draws every instance (the margin grows past the map)
+    setWindowing(on) { if (!footprint) return; footprint.margin = on ? WINDOW_MARGIN : 1e4; footprint.fresh = false; prepareRender(); },
+    // phones: instances drawn per windowed kind (null on desktop)
+    get windowStats() {
+      if (!footprint) return null;
+      const out = { grassClumps: grass.windowCount };
+      for (const [g, w] of windows) out[g === fieldGrow ? 'fieldTufts' : g === flowerGrow ? 'flowers' : g === stakes ? 'stakes' : 'edgeTufts'] = w.count;
+      return out;
     },
     dispose() { offs.forEach(f => f?.()); },
   };

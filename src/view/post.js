@@ -9,6 +9,11 @@
 // saturated. When it's lit, a warm wave spreads out from the hearth (world/mood.js drives its progress):
 // inside the front the colours are warm, outside still cold, and a band of warm light rides the front.
 // The wave is placed in the world by intersecting each pixel's view ray with the ground plane.
+//
+// Before rendering it gives the world modules a last look at the final camera: props.prepareRender (view /
+// shadow culling of instanced props), terrain.prepareRender (phones: windowed grass and clutter) and
+// sky.beginHalfRes (phones: half-res clouds). Phones render the scene into an R11F_G11F_B10F buffer
+// (?postfmt=hf forces RGBA16F).
 import * as THREE from 'three';
 import { FullScreenQuad } from 'three/addons/postprocessing/Pass.js';
 import { getMood } from './world/mood.js';
@@ -58,6 +63,32 @@ export function create(ctx) {
   }
 }
 
+// Can we render (with MSAA) into R11F_G11F_B10F? Asks for the per-format sample counts, then builds a tiny
+// multisampled framebuffer to make sure the driver really accepts it.
+function packedFloatSupport(gl, ext, wantSamples) {
+  try {
+    if (!ext.has('EXT_color_buffer_float')) return { ok: false };
+    const list = gl.getInternalformatParameter(gl.RENDERBUFFER, gl.R11F_G11F_B10F, gl.SAMPLES);
+    const counts = list ? Array.from(list) : [];
+    const samples = wantSamples > 0 ? counts.filter(s => s <= wantSamples).sort((a, b) => b - a)[0] || 0 : 0;
+    if (wantSamples > 0 && !samples) return { ok: false };
+    const prevFb = gl.getParameter(gl.FRAMEBUFFER_BINDING), prevRb = gl.getParameter(gl.RENDERBUFFER_BINDING);
+    const fb = gl.createFramebuffer(), rb = gl.createRenderbuffer();
+    gl.bindRenderbuffer(gl.RENDERBUFFER, rb);
+    if (samples) gl.renderbufferStorageMultisample(gl.RENDERBUFFER, samples, gl.R11F_G11F_B10F, 4, 4);
+    else gl.renderbufferStorage(gl.RENDERBUFFER, gl.R11F_G11F_B10F, 4, 4);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.RENDERBUFFER, rb);
+    const ok = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, prevFb);
+    gl.bindRenderbuffer(gl.RENDERBUFFER, prevRb);
+    gl.deleteFramebuffer(fb); gl.deleteRenderbuffer(rb);
+    return { ok, samples };
+  } catch {
+    return { ok: false };
+  }
+}
+
 function createPost(ctx) {
   const { renderer, scene, camera } = ctx;
   const gl = renderer.getContext();
@@ -65,13 +96,24 @@ function createPost(ctx) {
   if (!isWebGL2) return {};
   const ext = renderer.extensions;
   const halfOk = ext.has('EXT_color_buffer_float') || ext.has('EXT_color_buffer_half_float');
-  const type = halfOk ? THREE.HalfFloatType : THREE.UnsignedByteType;
-  const samples = Math.min(4, renderer.capabilities.maxSamples || 0);
+  let type = halfOk ? THREE.HalfFloatType : THREE.UnsignedByteType;
+  let format = THREE.RGBAFormat;
+  let samples = Math.min(4, renderer.capabilities.maxSamples || 0);
   const postScale = Math.max(0.25, Math.min(1, Number(ctx.quality?.postScale) || 1));
   const mood = getMood(ctx);
+  // Phones: the scene buffer is packed float R11F_G11F_B10F (4 bytes a pixel) instead of RGBA16F (8): still
+  // HDR (~5% of the frame is above 1.0, sand / clouds / highlights, and the composite rolls it off), half the
+  // memory traffic for the 4x MSAA samples and every pass that reads it. Needs EXT_color_buffer_float and MSAA
+  // support for the format; otherwise (or with ?postfmt=hf) it stays RGBA16F.
+  const MOBILE = ctx.quality?.tier === 'mobile';
+  const fmtParam = ctx.params?.get?.('postfmt');
+  if ((MOBILE && fmtParam !== 'hf') || fmtParam === 'rg11') {
+    const p = packedFloatSupport(gl, ext, samples);
+    if (p.ok) { type = THREE.UnsignedInt101111Type; format = THREE.RGBFormat; samples = p.samples; }
+  }
 
   const mkRT = (ms, depth) => new THREE.WebGLRenderTarget(1, 1, {
-    type, samples: ms ? samples : 0, depthBuffer: depth, stencilBuffer: false,
+    type, format, samples: ms ? samples : 0, depthBuffer: depth, stencilBuffer: false,
     minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, generateMipmaps: false,
   });
   const rtScene = mkRT(true, true);
@@ -279,10 +321,18 @@ function createPost(ctx) {
     rtScene,
     tilt: TILT, tiltTall: TILT_TALL, grade: GRADE, gradeTall: GRADE_TALL, cold: COLD,
     postScale,
+    // the scene buffer: 'RGBA16F' | 'R11F_G11F_B10F' | 'RGBA8', and its MSAA sample count
+    get sceneFormat() { return { format: type === THREE.UnsignedInt101111Type ? 'R11F_G11F_B10F' : type === THREE.HalfFloatType ? 'RGBA16F' : 'RGBA8', samples }; },
     render() {
+      // view culling of instanced props against the camera as it is now (it moved after props.update)
+      ctx.views.props?.prepareRender?.();
+      ctx.views.terrain?.prepareRender?.();   // phones: windowed grass / tufts / flowers
       const prevTarget = renderer.getRenderTarget();
+      // phones: the clouds are shaded at half res first, then upsampled inside the scene pass
+      const halfClouds = ctx.views.sky?.beginHalfRes?.(renderer) === true;
       renderer.setRenderTarget(rtScene);
       renderer.render(scene, camera);
+      if (halfClouds) ctx.views.sky.endHalfRes();
 
       quad.material = blurMat;
       blur(rtScene, rtH[0], 1, 0);

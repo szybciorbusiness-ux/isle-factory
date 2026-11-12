@@ -1,16 +1,24 @@
 // Animal view controller: one invisible Object3D rig per camp animal, animated from camp state with smoothing,
-// gaits tied to distance travelled, idle behaviours and hit / kill / spawn reactions. The rig's matrices are
-// written into the species' instanced part pools by creatures.js every frame.
+// gaits tied to distance travelled, idle behaviours, blinks and sleepy / squeezed eyelids, and hit (bonk star) /
+// kill (fx.poof) / spawn reactions. Bodies are eased off the camp works' tiles (belts, piles, zones, pads). The
+// rig's matrices are written into the shared part batches (or instanced pools) by creatures.js every frame.
 import * as THREE from 'three';
 import { ease, clamp, lerp, damp, dampAngle, angleDelta, arc, Spring } from '../../util/anim.js';
 import { ANIMALS } from '../../sim/camp-data.js';
 import { LAYOUT } from './animal-models.js';
-import { rng, hashStr } from './kit.js';
+import { rng, hashStr, Blink, lidMatrix } from './kit.js';
 
 const TAU = Math.PI * 2;
 const frac = v => v - Math.floor(v);
-const _v = new THREE.Vector3();
+const _v = new THREE.Vector3(), _lm = new THREE.Matrix4(), _push = { x: 0, z: 0 };
 const KNOCK = 0.6;            // knockback spring -> world offset
+// fx.poof size per species (1 = a deer-sized cloud); multiplied by the view's size factor (bigger on phones)
+const POOF = { deer: 1, boar: 0.95, rabbit: 0.62 };
+// Camp works keep-out: the sim keeps animal centres off station footprints, zones, lines, piles and pads; the
+// view also eases each body (radius ~ KEEP_R x shadow width) off their edges so nothing overlaps a belt or heap.
+const KEEP_R = 0.55;
+// Sleepy / busy eyelids per idle behaviour (0 open .. 1 closed); a blink or squint adds on top.
+const LID_MOOD = { rest: 0.42, graze: 0.3, root: 0.2, nibble: 0.22 };
 
 // Gaits: stride = world tiles per full cycle, duty = fraction of the cycle a foot is planted,
 // offsets for legs [LF, RF, LH, RH]. Rabbits hop instead (hopLen / hopH).
@@ -73,6 +81,10 @@ export class AnimalView {
     for (const f of this.feet) this.parts.push([`${K}.foot`, f]);
     const tone = 0.95 + this.rnd() * 0.1;
     this.tint = new THREE.Color(tone, tone * (0.985 + this.rnd() * 0.03), tone);
+    this.lidTint = new THREE.Color(L.lid || '#ffffff').multiply(this.tint);
+    this.blink = new Blink(this.rnd, { every: [2.4, 6] });
+    this.lidC = 0;
+    this.kx = 0; this.kz = 0;   // camp keep-out offset (world)
 
     // ---- motion state ----
     this.x = a.x; this.z = a.z; this.h = a.heading || 0;
@@ -125,10 +137,13 @@ export class AnimalView {
     this.pitch.velocity += fwd * -4; this.roll.velocity += side * 5;
     for (const e of this.earS) e.velocity += 9;
     this.alert = 1;
-    if (!killed) {
-      const hp = this.headWorld(_v);
-      this.sys.fx()?.sparkle?.({ x: hp.x, y: hp.y + 0.08, z: hp.z }, { count: 3, spread: 0.18, size: 0.07 });
-    }
+    this.blink.close(killed ? 0.4 : 0.22);   // eyes squeezed shut on the bonk
+    // the bonk: a contact star on the side facing the attacker (fx.impact), sparkles as a fallback
+    const fx = this.sys.fx();
+    const c = this.centerWorld(_v);
+    const sz = (POOF[this.kind] || 1) * this.sys.sizeK;
+    if (fx?.impact) fx.impact({ x: c.x - dx * 0.2 * this.k, y: c.y + 0.06 * this.k, z: c.z - dz * 0.2 * this.k }, { size: (killed ? 0.95 : 0.8) * Math.max(0.75, sz), dir: [dx, dz], small: killed ? 3 : 2 });
+    else if (!killed) { const hp = this.headWorld(_v); fx?.sparkle?.({ x: hp.x, y: hp.y + 0.08, z: hp.z }, { count: 3, spread: 0.18, size: 0.07 }); }
   }
   kill(attacker) {
     if (this.life === 'dying' || this.life === 'gone') return;
@@ -146,7 +161,29 @@ export class AnimalView {
     return out.set(0.08, 0.12, 0).applyMatrix4(this.head.matrixWorld);
   }
   centerWorld(out) {
-    return out.set(this.x, this.y + (this.L.centerY + this.hopY) * this.k, this.z);
+    return out.set(this.x + this.kx, this.y + (this.L.centerY + this.hopY) * this.k, this.z + this.kz);
+  }
+  // Push (world xz) that keeps a circle of radius R at (x, z) off the camp works' tiles around it.
+  keepOut(x, z, R, out) {
+    out.x = 0; out.z = 0;
+    const test = this.sys.campTile;
+    if (!test) return out;
+    const cx = Math.round(x), cz = Math.round(z);
+    for (let ix = cx - 1; ix <= cx + 1; ix++) for (let iz = cz - 1; iz <= cz + 1; iz++) {
+      if (!test(ix, iz)) continue;
+      const px = clamp(x, ix - 0.5, ix + 0.5), pz = clamp(z, iz - 0.5, iz + 0.5);
+      let dx = x - px, dz = z - pz;
+      const d = Math.hypot(dx, dz);
+      if (d >= R) continue;
+      if (d < 1e-4) { // centre inside the tile: out along the shallow axis
+        const ex = 0.5 - Math.abs(x - ix), ez = 0.5 - Math.abs(z - iz);
+        if (ex < ez) { dx = Math.sign(x - ix) || 1; dz = 0; out.x += dx * (ex + R); }
+        else { dz = Math.sign(z - iz) || 1; dx = 0; out.z += dz * (ez + R); }
+        continue;
+      }
+      out.x += (dx / d) * (R - d); out.z += (dz / d) * (R - d);
+    }
+    return out;
   }
 
   // ---------- per-frame ----------
@@ -170,6 +207,10 @@ export class AnimalView {
     const runK = clamp((this.spd - this.def.speed * 1.15) / Math.max(0.1, this.def.fleeSpeed * 0.8 - this.def.speed * 1.15));
     this.runW = damp(this.runW, a.state === 'flee' ? Math.max(runK, 0.6) : runK, 6, dt);
     this.y = damp(this.y, sys.groundAt(this.x, this.z), 10, dt);
+    // ease the body off camp works (view only: the sim already keeps the centre off them)
+    const push = this.keepOut(this.x, this.z, KEEP_R * L.shadow[1] * this.k, _push);
+    const kRate = this.life === 'dying' ? 0 : 7;
+    this.kx = damp(this.kx, push.x, kRate, dt); this.kz = damp(this.kz, push.z, kRate, dt);
 
     // heading: movement direction while moving, the sim's heading otherwise
     const prevH = this.h;
@@ -190,12 +231,13 @@ export class AnimalView {
     const pd = pl ? Math.hypot(pl.x - this.x, pl.z - this.z) : 99;
     const alertTarget = pd < 2.3 && this.life !== 'dying' ? 1 : 0;
     this.alert = damp(this.alert, alertTarget, alertTarget ? 6 : 1.4, dt);
-    let hp = 0, hy = 0, bodyPitchT = 0, earT = 0, bodyRise = 0;
+    let hp = 0, hy = 0, bodyPitchT = 0, earT = 0, bodyRise = 0, lidWant = 0;
     if (idle && this.idleT > 0.25) {
       const b = this.beh;
       b.t += dt;
       if (b.t > b.dur) this.pickBehaviour();
       const k = clamp(Math.min(b.t / 0.35, (b.dur - b.t) / 0.4 + 0.2));
+      lidWant = (LID_MOOD[b.kind] || 0) * k;
       switch (b.kind) {
         case 'graze':
           hp = lerp(0, -1.45, k) + Math.sin(this.time * 8.5) * 0.06 * k;
@@ -223,6 +265,7 @@ export class AnimalView {
       const rel = clamp(angleDelta(this.h, Math.atan2(pl.z - this.z, pl.x - this.x)), -1.1, 1.1);
       const w = this.alert * (moving ? 0.3 : 1);
       hy = lerp(hy, -rel, w); hp = lerp(hp, 0.15, w); earT = lerp(earT, -0.35, w); bodyPitchT = lerp(bodyPitchT, 0, w);
+      lidWant *= 1 - this.alert;   // wide awake when someone comes close
     }
     if (moving) {
       hp += headNod + (this.kind === 'deer' ? -0.22 : -0.1) * this.runW;
@@ -230,6 +273,7 @@ export class AnimalView {
       hy += clamp(-this.turn * 0.12, -0.4, 0.4);
     }
     this.headPitch.target = hp; this.headYaw.target = hy;
+    this.lidC = this.blink.update(dt, this.life === 'dying' ? 1 : lidWant);
     this.headPitch.update(dt); this.headYaw.update(dt);
 
     // ---- ears & tail ----
@@ -283,7 +327,7 @@ export class AnimalView {
     // ---- compose the rig ----
     const r = this.root;
     r.visible = lifeS > 0.001;
-    r.position.set(this.x + this.knock.x.value * KNOCK + offX, this.y, this.z + this.knock.z.value * KNOCK + offZ);
+    r.position.set(this.x + this.kx + this.knock.x.value * KNOCK + offX, this.y, this.z + this.kz + this.knock.z.value * KNOCK + offZ);
     r.rotation.set(0, -this.h, 0);
     r.scale.setScalar(this.k * Math.max(lifeS, 1e-4));
     this.tilt.rotation.set(this.roll.value, 0, this.pitch.value);
@@ -366,10 +410,14 @@ export class AnimalView {
     this.beh = { kind: pick[0], t: 0, dur: lerp(pick[2], pick[3], this.rnd()), yaw: (this.rnd() < 0.5 ? -1 : 1) * lerp(0.45, 0.95, this.rnd()) };
   }
 
+  // the death POOF: fx.poof (cloud + dust ring + stars) sized to the species, at the body as it is drawn now
   poof() {
     const fx = this.sys.fx();
     if (!fx) return;
-    const c = this.centerWorld(_v).clone();
+    const rp = this.root.position;
+    const c = new THREE.Vector3(rp.x, this.y + (this.L.centerY + this.hopY) * this.k, rp.z);
+    if (typeof fx.poof === 'function') { fx.poof(c, { size: (POOF[this.kind] || 1) * this.sys.sizeK }); return; }
+    // fallback for an fx module without poof(): the older puff + ring + sparkle mix
     const k = this.k;
     const big = this.kind === 'rabbit' ? 0.7 : 1;   // a cloud about the animal's size
     fx.puff?.(c, { count: 9, size: 0.115 * big * k, spread: 0.22 * big * k, up: 0.7 });
@@ -382,12 +430,16 @@ export class AnimalView {
   write(pools) {
     if (!this.root.visible) return;
     for (const [key, node] of this.parts) pools[key]?.push(node.matrixWorld, this.flash, this.tint);
+    // blink: two lid instances on the shared lid mesh, only while the eyes are (partly) closed
+    if (this.lidC > 0.04 && pools.lid && this.L.eye) {
+      for (const side of [-1, 1]) pools.lid.push(lidMatrix(_lm, this.head.matrixWorld, this.L.eye, side, this.lidC), this.flash, this.lidTint);
+    }
   }
   shadow(out) {
     if (!this.root.visible) return null;
     const lift = this.hopY + (this.life === 'spawn' ? arc(clamp(this.lifeT / 0.46)) * 0.32 * this.k : 0);
     const s = this.lifeScale * clamp(1 - lift * 1.6, 0.45, 1) * this.k;
-    out.x = this.x + this.knock.x.value * KNOCK; out.z = this.z + this.knock.z.value * KNOCK; out.y = this.y;
+    out.x = this.x + this.kx + this.knock.x.value * KNOCK; out.z = this.z + this.kz + this.knock.z.value * KNOCK; out.y = this.y;
     out.h = this.h; out.sx = this.L.shadow[0] * s; out.sz = this.L.shadow[1] * s;
     return out;
   }

@@ -4,7 +4,8 @@ import assert from 'node:assert/strict';
 import { createMap } from '../src/world/map-camp.js';
 import { createSim } from '../src/sim/sim.js';
 import { createCamp } from '../src/sim/camp.js';
-import { STATIONS, CAMP } from '../src/sim/camp-data.js';
+import { STATIONS, CAMP, PADS } from '../src/sim/camp-data.js';
+const costOf = id => PADS.find(p => p.id === id).cost;
 
 // A camp with a controllable player position.
 function setup() {
@@ -56,7 +57,7 @@ test('a full stack stops gathering and extra drops land loose, then get picked u
 test('paying the sawmill pad builds it; its footprint blocks walking', () => {
   const { sim, camp, step, moveTo } = setup();
   camp.completePad('hearth:1');
-  sim.inventory.add('wood', 10);
+  sim.inventory.add('wood', costOf('build:sawmill').wood);
   const [x, z] = STATIONS.sawmill.footprint;
   moveTo(x + 0.5, z + 0.5);
   step(3);
@@ -110,7 +111,8 @@ test('a bridge pad builds the bridge tile by tile and the far island becomes wal
   const visible = camp.pads.find(p => p.id === 'bridge:west');
   assert.ok(visible, `pads ${camp.pads.map(p => p.id)}`);
   const c = camp.padCenter(visible);
-  moveTo(c.x, c.z); step(3); sim.inventory.add('plank', 10); step(4);
+  moveTo(c.x, c.z); step(3);
+  for (let i = 0; i < 4 && !camp.bridges.has('west'); i++) { sim.inventory.add('plank', 10); step(4); }
   assert.ok(camp.bridges.has('west'));
   for (const [x, z] of map.bridges.west.tiles) assert.equal(sim.isWalkable(x, z), true);
 });

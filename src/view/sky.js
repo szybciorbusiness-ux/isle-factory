@@ -17,6 +17,12 @@
 // around the cold camp) and scales the view framing (level 5: wide open over every island). Islands whose
 // bridge isn't built yet sit under a thin, drifting veil of cloud that clears from the bridge's landing once
 // it is built (bridge:built). Factory mode: no caps, no veils (as before).
+//
+// Phones (ctx.quality.tier 'mobile'): the three layers are shaded in ONE merged pass (each layer sampled where
+// the fragment's camera ray crosses its height, composited bottom to top exactly like three blended passes),
+// and post.js has that pass shade a half-res buffer (beginHalfRes / endHalfRes) that a cheap composite plane
+// upsamples inside the scene pass. Everywhere: the always-clear inner hole exits before any noise fetch.
+// ?clouds=layers | full forces the desktop layers / the full-res merged pass for A/B checks.
 import * as THREE from 'three';
 import { getNoiseTexture } from './world/noise-tex.js';
 import { getMood } from './world/mood.js';
@@ -48,6 +54,8 @@ const H_MID = 3.3;
 export function create(ctx) {
   const { scene, config, camera, sim, map } = ctx;
   const P = config.PALETTE;
+  // phones: the three cloud layers are drawn in one merged pass (see mergedShader)
+  const MOBILE = ctx.quality?.tier === 'mobile' && ctx.params?.get?.('clouds') !== 'layers'; // ?clouds=layers: A/B test
 
   scene.background = new THREE.Color(P.sky);
   scene.fog = new THREE.Fog(new THREE.Color(P.sky).lerp(new THREE.Color(P.cloud), 0.3), 26, 95);
@@ -84,14 +92,12 @@ export function create(ctx) {
       vW = wp.xyz;
       gl_Position = projectionMatrix * viewMatrix * wp;
     }`;
-  const fragmentShader = /* glsl */`
+  const cloudCommon = /* glsl */`
     #include <common>
     uniform sampler2D uNoise;
     uniform vec2 uDrift, uCenter;
     uniform vec3 uRadii;
     uniform vec3 uSun, uWhite, uMint, uCrease;
-    uniform float uKind;       // 0 veil, 1 body, 2 tops
-    uniform vec2 uOffset;      // per-layer noise offset (tops boil a little differently)
     uniform sampler2D uLockMask;
     uniform vec4 uLockRect, uLockAmt, uLockFront, uLandA, uLandB, uHome;
     uniform float uHomeAmt;
@@ -123,16 +129,17 @@ export function create(ctx) {
     }
 
     // Billow noise at a world point. fine = 1 adds the small billows (soft lobed edges); fine = 0 is the
-    // coarse field the shading normal comes from. (No out-parameters: some GLSL compilers are picky.)
-    float cloudNoise(vec2 p, float fine) {
-      vec2 q = p * ${NOISE_SCALE.toFixed(4)} + uDrift + uOffset;
+    // coarse field the shading normal comes from. off = the layer's noise offset. (No out-parameters: some
+    // GLSL compilers are picky.)
+    float cloudNoise(vec2 p, float fine, vec2 off) {
+      vec2 q = p * ${NOISE_SCALE.toFixed(4)} + uDrift + off;
       return texture2D(uNoise, q).r * 0.62
            + texture2D(uNoise, q * 2.17 + vec2(0.31, 0.17) + uDrift * 0.7).g * 0.3
            + (texture2D(uNoise, q * 3.6 + vec2(0.71, 0.43) - uDrift * 1.3).b - 0.5) * 0.09 * fine + 0.04;
     }
     // Cloud density: the billow noise n inside the frame, nothing in the hole around the camera target.
-    float cloudDensity(vec2 p, float n) {
-      vec2 q = p * ${NOISE_SCALE.toFixed(4)} + uDrift + uOffset;
+    float cloudDensity(vec2 p, float n, vec2 off) {
+      vec2 q = p * ${NOISE_SCALE.toFixed(4)} + uDrift + off;
       float nL = texture2D(uNoise, q * 0.5 + vec2(0.13, 0.71) + uDrift * 0.4).a;
       vec2 dc = p - uCenter;
       float e0 = length(dc / vec2(uRadii.x, dc.y < 0.0 ? uRadii.y : uRadii.z));
@@ -143,38 +150,44 @@ export function create(ctx) {
       return mix(-0.6, den, smoothstep(0.56, 0.7, e0));
     }
 
-    void main() {
-      vec2 p = vW.xz;
-      float n = cloudNoise(p, 1.0);
-      float den = cloudDensity(p, n);
-      vec2 gp = groundPt();
+    // One cloud layer at world point p (kind 0 veil, 1 body, 2 tops; gp = the ground point on this camera
+    // ray, lk = lockVeil(gp)). Returns premultiplied (rgb, cover), or w = -1 where the layer is empty.
+    vec4 cloudLayer(vec2 p, float kind, vec2 off, vec2 gp, float lk) {
+      // the inner part of the hole is always clear (cloudDensity's guarantee), so most of the screen leaves
+      // here without a single noise fetch, unless a locked island's veil shows through it
+      {
+        vec2 dc = p - uCenter;
+        float e0 = length(dc / vec2(uRadii.x, dc.y < 0.0 ? uRadii.y : uRadii.z));
+        if (e0 < 0.56 && lk <= 0.001) return vec4(0.0, 0.0, 0.0, -1.0);
+      }
+      float n = cloudNoise(p, 1.0, off);
+      float den = cloudDensity(p, n, off);
       den = mix(den, -0.6, homeClear(gp, n));
       // locked island: a thin drifting veil, thicker in the billows and see-through between them
-      float lk = lockVeil(gp);
       float lockA = 0.0;
       if (lk > 0.001) {
-        lockA = uKind < 0.5 ? lk * 0.24
-              : uKind < 1.5 ? lk * smoothstep(0.4, 0.86, n) * 0.5
+        lockA = kind < 0.5 ? lk * 0.24
+              : kind < 1.5 ? lk * smoothstep(0.4, 0.86, n) * 0.5
               : lk * smoothstep(0.66, 0.94, n) * 0.36;
       }
       float a;
       vec3 c;
-      if (uKind < 0.5) {
+      if (kind < 0.5) {
         // veil: a soft, bright haze just ahead of the cloud body
         a = max(smoothstep(0.1, 0.48, den) * 0.34, lockA);
         c = uMint;
       } else {
-        float body = step(uKind, 1.5);     // 1 body, 0 tops
+        float body = step(kind, 1.5);     // 1 body, 0 tops
         float lo = mix(0.58, 0.26, body);
         // a fairly quick ramp: billowy lobes that turn opaque soon, rather than a wide grey see-through band
         a = max(smoothstep(lo, lo + 0.33, den), lockA);
-        if (a <= 0.003) discard;
+        if (a <= 0.003) return vec4(0.0, 0.0, 0.0, -1.0);
         // normal from the billows alone (not the frame's ramp, which would draw contour lines along the
         // rim) -> soft puffy shading, lit from the sun side
         float eps = 1.4;
-        float n0 = cloudNoise(p, 0.0);
-        float dx = cloudNoise(p + vec2(eps, 0.0), 0.0) - n0;
-        float dz = cloudNoise(p + vec2(0.0, eps), 0.0) - n0;
+        float n0 = cloudNoise(p, 0.0, off);
+        float dx = cloudNoise(p + vec2(eps, 0.0), 0.0, off) - n0;
+        float dz = cloudNoise(p + vec2(0.0, eps), 0.0, off) - n0;
         vec3 N = normalize(vec3(-dx * 6.0, eps, -dz * 6.0));
         float lit = smoothstep(0.05, 0.92, dot(N, uSun));
         c = mix(uCrease, uWhite, lit);
@@ -184,18 +197,138 @@ export function create(ctx) {
         // thin edges lean mint-cyan: over dark ground they read as sunlit mist rather than grey smoke
         c = mix(uMint, c, smoothstep(0.1, 0.7, a));
       }
-      if (a <= 0.003) discard;
+      if (a <= 0.003) return vec4(0.0, 0.0, 0.0, -1.0);
       // premultiplied, and thin cloud covers a little less than it adds: a veil over dark trees reads as
       // bright sunlit haze instead of grey smoke
       float cover = a * mix(0.55, 1.0, smoothstep(0.35, 0.9, a));
-      gl_FragColor = vec4(c * a + uWhite * a * (1.0 - a) * 0.6, cover);
+      return vec4(c * a + uWhite * a * (1.0 - a) * 0.6, cover);
+    }
+`;
+  // one layer per mesh (desktop)
+  const fragmentShader = cloudCommon + /* glsl */`
+    uniform float uKind;       // 0 veil, 1 body, 2 tops
+    uniform vec2 uOffset;      // per-layer noise offset (tops boil a little differently)
+    void main() {
+      vec2 gp = groundPt();
+      vec4 r = cloudLayer(vW.xz, uKind, uOffset, gp, lockVeil(gp));
+      if (r.w < 0.0) discard;
+      gl_FragColor = r;
+      #include <tonemapping_fragment>
+      #include <colorspace_fragment>
+    }`;
+  // phones: all three layers in ONE pass on a plane at the top layer's height. Each layer is sampled where
+  // this fragment's camera ray crosses its height (the same points the three planes would shade) and the
+  // three are composited bottom to top, exactly as the blending of three passes would. One draw, one blend,
+  // the ground point and lock veil looked up once.
+  const LAYER_GLSL = LAYERS.map((L, i) => `
+      {
+        vec2 p = C.xz + (vW.xz - C.xz) * ((C.y - ${L.h.toFixed(2)}) / max(C.y - vW.y, 0.1));
+        vec4 r = cloudLayer(p, ${L.kind.toFixed(1)}, vec2(${L.kind === 2 ? '0.013, -0.009' : '0.0, 0.0'}), gp, lk);
+        if (r.w >= 0.0) { col = r.rgb + col * (1.0 - r.w); trans *= 1.0 - r.w; }
+      }`).join('');
+  const mergedShader = cloudCommon + /* glsl */`
+    void main() {
+      vec3 C = cameraPosition;
+      vec2 gp = groundPt();
+      float lk = lockVeil(gp);
+      vec3 col = vec3(0.0);
+      float trans = 1.0;
+      ${LAYER_GLSL}
+      if (trans >= 1.0) discard;
+      gl_FragColor = vec4(col, 1.0 - trans);
       #include <tonemapping_fragment>
       #include <colorspace_fragment>
     }`;
 
   const geo = new THREE.PlaneGeometry(320, 320, 1, 1);
   geo.rotateX(-Math.PI / 2);
-  const layers = LAYERS.map((L, i) => {
+  // Phones, step 2: post.js asks beginHalfRes() each frame to shade the merged clouds into a HALF-RES buffer
+  // (a private scene, no depth test: the plane sits above everything), and for the main pass the procedural
+  // mesh is swapped for a cheap full-screen composite that upsamples that buffer (bilinear, premultiplied).
+  // The clouds are soft everywhere, so this reads the same at a quarter of the shading cost. Without post
+  // (fallback rendering), the full-res merged mesh simply draws itself.
+  let half = null;
+  const mergedMat = MOBILE ? new THREE.ShaderMaterial({
+    name: 'IsleCloudsMerged',
+    uniforms: { ...shared },
+    vertexShader, fragmentShader: mergedShader,
+    transparent: true, premultipliedAlpha: true, depthWrite: false, depthTest: true, fog: false,
+  }) : null;
+  const mergedMesh = () => {
+    const mesh = new THREE.Mesh(geo, mergedMat);
+    mesh.position.set(map.w / 2, LAYERS[LAYERS.length - 1].h, map.h / 2);
+    mesh.renderOrder = 50;
+    mesh.frustumCulled = false;
+    mesh.name = 'cloudLayers';
+    return mesh;
+  };
+  const merged = () => {
+    const mesh = mergedMesh();
+    scene.add(mesh);
+    if (ctx.params?.get?.('clouds') !== 'full') half = createHalfRes(mesh);
+    return [mesh];
+  };
+  function createHalfRes(mainMesh) {
+    const ext = ctx.renderer.extensions;
+    const hf = ext.has('EXT_color_buffer_float') || ext.has('EXT_color_buffer_half_float');
+    const rt = new THREE.WebGLRenderTarget(1, 1, {
+      type: hf ? THREE.HalfFloatType : THREE.UnsignedByteType, depthBuffer: false, stencilBuffer: false,
+      minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, generateMipmaps: false,
+    });
+    const own = new THREE.Scene();
+    const gen = mergedMesh();
+    gen.material = mergedMat.clone();
+    gen.material.uniforms = mergedMat.uniforms;   // same uniform objects (hole, drift, locks)
+    gen.material.depthTest = false;
+    own.add(gen);
+    const comp = new THREE.Mesh(geo, new THREE.ShaderMaterial({
+      name: 'IsleCloudsComposite',
+      uniforms: { tClouds: { value: rt.texture }, uInvSize: { value: new THREE.Vector2(1, 1) } },
+      vertexShader: /* glsl */`void main() { gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+      fragmentShader: /* glsl */`
+        uniform sampler2D tClouds;
+        uniform vec2 uInvSize;
+        void main() {
+          vec4 c = texture2D(tClouds, gl_FragCoord.xy * uInvSize);
+          if (c.a < 0.002) discard;
+          gl_FragColor = c;
+        }`,
+      transparent: true, premultipliedAlpha: true, depthWrite: false, depthTest: true, fog: false,
+    }));
+    comp.position.copy(mainMesh.position);
+    comp.renderOrder = 50;
+    comp.frustumCulled = false;
+    comp.visible = false;
+    comp.name = 'cloudComposite';
+    scene.add(comp);
+    const size = new THREE.Vector2(), clear = new THREE.Color();
+    let active = false;
+    return {
+      rt, gen, comp,
+      begin(renderer) {
+        if (!mainMesh.visible) return false;   // hidden from outside (a test / profiler): leave it alone
+        renderer.getDrawingBufferSize(size);
+        const w = Math.max(1, Math.floor(size.x / 2)), h = Math.max(1, Math.floor(size.y / 2));
+        if (rt.width !== w || rt.height !== h) rt.setSize(w, h);
+        comp.material.uniforms.uInvSize.value.set(1 / size.x, 1 / size.y);
+        const prevRT = renderer.getRenderTarget(), prevA = renderer.getClearAlpha();
+        renderer.getClearColor(clear);
+        renderer.setClearColor(0x000000, 0);
+        renderer.setRenderTarget(rt);
+        renderer.render(own, camera);
+        renderer.setRenderTarget(prevRT);
+        renderer.setClearColor(clear, prevA);
+        mainMesh.visible = false; comp.visible = true; active = true;
+        return true;
+      },
+      end() {
+        if (!active) return;
+        active = false;
+        mainMesh.visible = true; comp.visible = false;
+      },
+    };
+  }
+  const layers = MOBILE ? merged() : LAYERS.map((L, i) => {
     const mat = new THREE.ShaderMaterial({
       name: `IsleCloud${i}`,
       uniforms: {
@@ -248,6 +381,7 @@ export function create(ctx) {
     shared.uHomeAmt.value = mood.campMode && home ? Math.max(0, Math.min(1, levelCurve(HOME_CLEAR, lv))) : 0;
   };
   layers[0].onBeforeRender = placeHole;
+  if (half) half.gen.onBeforeRender = placeHole;
 
   // the home island's bounds (camp maps)
   const home = (() => {
@@ -281,6 +415,12 @@ export function create(ctx) {
     mood,
     // the current hole radii (world units at cloud height): sides, top (far), bottom (near)
     get holeRadii() { return shared.uRadii.value.toArray(); },
+    // Phones: post.js calls beginHalfRes(renderer) right before the main scene render (true = the clouds were
+    // shaded at half res and the composite mesh stands in for them) and endHalfRes() right after.
+    beginHalfRes: renderer => (half ? half.begin(renderer) : false),
+    endHalfRes: () => half?.end(),
+    // 'layers' (desktop: three passes) | 'merged' (phones without post) | 'half' (phones: half-res + composite)
+    get cloudMode() { return !MOBILE ? 'layers' : half ? 'half' : 'merged'; },
     update(dt) {
       time += dt;
       shared.uDrift.value.set(0.137 + time * 0.0042, 0.611 + time * 0.0017);

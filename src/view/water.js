@@ -94,14 +94,16 @@ export function create(ctx) {
           vec4 A = uBrA[i], B = uBrB[i];
           if (B.y <= 0.001 && B.z <= 0.001) continue;
           vec2 dir = A.zw, across = vec2(abs(dir.y), abs(dir.x));
+          vec2 o2 = p - A.xy;
+          float u2 = dot(o2, dir), v2 = dot(o2, across);
+          // far from this bridge every term below is zero: skip the exp / pow work
+          if (abs(v2) > 1.0 || u2 < -1.5 || u2 > B.x + 0.7) continue;
           // deck shadow: a soft box from the shore end out to how far the planks have got
           vec2 o = p - A.xy - uShadeOff;
           float u = dot(o, dir), v = dot(o, across);
           float uEnd = mix(-0.6, B.x - 0.4, B.y);
           float sd = max(max(-0.6 - u, u - uEnd), abs(v) - 0.44);
           // plus a soft contact shade hugging the deck on both sides, so it sits on the water
-          vec2 o2 = p - A.xy;
-          float u2 = dot(o2, dir), v2 = dot(o2, across);
           float sd2 = max(max(-0.6 - u2, u2 - uEnd), abs(v2) - 0.42);
           float sh = max(1.0 - smoothstep(-0.08, 0.24, sd), (1.0 - smoothstep(-0.05, 0.36, sd2)) * 0.6);
           r.x = max(r.x, sh * step(0.001, B.y));
@@ -166,13 +168,16 @@ export function create(ctx) {
         c = mix(c, uLine, (1.0 - smoothstep(0.03, 0.2 + 0.03 * breathe, dW)) * 0.75);
 
         // caustics in the shallows: a faint net of wobbly cell lines, strongest near the sand
-        vec2 cp = vW.xz * 2.25 + vec2(n2 - 0.5, n1 - 0.5) * 1.1;
-        float e = cellEdge(cp, t * 0.7);
-        float lines = 1.0 - smoothstep(0.03, 0.15, e);
-        float e2 = cellEdge(cp * 1.37 + 3.1, -t * 0.55);
-        lines = max(lines * 0.85, (1.0 - smoothstep(0.03, 0.12, e2)) * 0.3);
+        // (the two voronoi lookups are the costliest part of the water: only where the mask lets them show)
         float cMask = (1.0 - smoothstep(0.35, 1.7, dW)) * smoothstep(0.05, 0.3, dN);
-        c = mix(c, uCaustic, lines * cMask * 0.13);
+        if (cMask > 0.0) {
+          vec2 cp = vW.xz * 2.25 + vec2(n2 - 0.5, n1 - 0.5) * 1.1;
+          float e = cellEdge(cp, t * 0.7);
+          float lines = 1.0 - smoothstep(0.03, 0.15, e);
+          float e2 = cellEdge(cp * 1.37 + 3.1, -t * 0.55);
+          lines = max(lines * 0.85, (1.0 - smoothstep(0.03, 0.12, e2)) * 0.3);
+          c = mix(c, uCaustic, lines * cMask * 0.13);
+        }
 
         // bridges: the deck's soft shadow on the water, foam around the posts
         vec2 br = bridgeWater(vW.xz, t);

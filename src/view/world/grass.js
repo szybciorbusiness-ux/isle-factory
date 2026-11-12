@@ -14,6 +14,7 @@
 import * as THREE from 'three';
 import { WIND, WIND_GLSL } from './wind.js';
 import { ring, insidePoly } from './outline.js';
+import { createInstanceWindow } from './window.js';
 
 // ---- tuning ----
 const GRID_X = 5, GRID_Z = 4;      // stratified clump slots per tile
@@ -63,7 +64,9 @@ vec3 grassTone(vec2 w) {
 }
 `;
 
-export function createGrassField({ map, sim, loops, shared, baseColor, capInset, rng, density = 1 }) {
+// footprint (phones): instead of one culled mesh per chunk, ONE mesh whose instances are refilled with the clumps
+// inside the camera's ground footprint (world/window.js). Same scatter, same look, one draw call.
+export function createGrassField({ map, sim, loops, shared, baseColor, capInset, rng, density = 1, footprint = null }) {
   density = Math.max(0.25, Math.min(1, Number(density) || 1));
   const sparse = density < 0.75;               // keep a staggered half of the clump slots
   const widen = sparse ? Math.sqrt(1 / 0.5) * 0.9 : 1; // fuller clumps where there are fewer of them
@@ -201,6 +204,7 @@ float occAt(vec2 p) { vec4 o = texture2D(uOcc, (p + 0.5) / uOccSize); return o.r
 
   const chunks = [];
   let total = 0;
+  const all = footprint ? { roots: [], tiles: [] } : null;   // phones: every clump goes into one windowed mesh
   for (let cz = 0; cz < map.h; cz += CHUNK) for (let cx = 0; cx < map.w; cx += CHUNK) {
     const roots = [];
     for (let z = cz; z < Math.min(map.h, cz + CHUNK); z++) for (let x = cx; x < Math.min(map.w, cx + CHUNK); x++) {
@@ -211,17 +215,15 @@ float occAt(vec2 p) { vec4 o = texture2D(uOcc, (p + 0.5) / uOccSize); return o.r
           const lx = -0.5 + (gx + rng()) / GRID_X, lz = -0.5 + (gz + rng()) / GRID_Z;
           if (!inside(x, z, lx, lz)) continue;
           roots.push(x + lx, z + lz, rng() * Math.PI * 2, (0.8 + rng() * 0.45) * (sparse ? 1.08 : 1), rng());
+          if (all) all.tiles.push(z * map.w + x);
           break;
         }
       }
     }
+    if (all) { for (const v of roots) all.roots.push(v); continue; }
     const n = roots.length / 5;
     if (!n) continue;
-    const geo = new THREE.InstancedBufferGeometry();
-    geo.setAttribute('position', new THREE.BufferAttribute(clumpGeo.pos, 3));
-    geo.setAttribute('normal', new THREE.BufferAttribute(clumpGeo.nrm, 3));
-    geo.setAttribute('aBlade', new THREE.BufferAttribute(clumpGeo.bl, 2));
-    geo.setIndex(clumpGeo.idx);
+    const geo = clumpGeometry();
     const aRoot = new Float32Array(n * 4), aSeed = new Float32Array(n);
     let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
     for (let i = 0; i < n; i++) {
@@ -242,6 +244,45 @@ float occAt(vec2 p) { vec4 o = texture2D(uOcc, (p + 0.5) / uOccSize); return o.r
     group.add(mesh);
     chunks.push(mesh);
     total += n;
+  }
+  function clumpGeometry() {
+    const geo = new THREE.InstancedBufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(clumpGeo.pos, 3));
+    geo.setAttribute('normal', new THREE.BufferAttribute(clumpGeo.nrm, 3));
+    geo.setAttribute('aBlade', new THREE.BufferAttribute(clumpGeo.bl, 2));
+    geo.setIndex(clumpGeo.idx);
+    return geo;
+  }
+
+  // ---------- phones: one windowed mesh ----------
+  let win = null;
+  if (all && all.tiles.length) {
+    const n = all.tiles.length;
+    const mRoot = new Float32Array(n * 4), mSeed = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      for (let k = 0; k < 4; k++) mRoot[i * 4 + k] = all.roots[i * 5 + k];
+      mSeed[i] = all.roots[i * 5 + 4];
+    }
+    const geo = clumpGeometry();
+    const aRoot = new THREE.InstancedBufferAttribute(new Float32Array(n * 4), 4).setUsage(THREE.DynamicDrawUsage);
+    const aSeed = new THREE.InstancedBufferAttribute(new Float32Array(n), 1).setUsage(THREE.DynamicDrawUsage);
+    geo.setAttribute('aRoot', aRoot);
+    geo.setAttribute('aSeed', aSeed);
+    geo.instanceCount = 0;
+    const mesh = new THREE.Mesh(geo, material);
+    mesh.frustumCulled = false;      // the window is the culling
+    mesh.receiveShadow = true;
+    mesh.castShadow = false;
+    mesh.name = 'grassBlades';
+    group.add(mesh);
+    chunks.push(mesh);
+    total = n;
+    win = createInstanceWindow({
+      map, tiles: Int32Array.from(all.tiles),
+      attrs: { aRoot: { master: mRoot, size: 4, target: aRoot }, aSeed: { master: mSeed, size: 1, target: aSeed } },
+      setCount: c => { geo.instanceCount = c; mesh.visible = c > 0; },
+    });
+    win.update(footprint);
   }
 
   // ---------- occupancy upkeep ----------
@@ -272,6 +313,10 @@ float occAt(vec2 p) { vec4 o = texture2D(uOcc, (p + 0.5) / uOccSize); return o.r
     group, material, chunks, occupancy: occTex, count: total, trianglesPerClump: BLADES * 3, density,
     // mark a tile as covered (0..1) by something that isn't a sim entity; blades shrink / part smoothly
     cover(x, z, amount = 1) { if (map.inBounds(x, z)) extraCover[map.idx(x, z)] = Math.max(0, Math.min(1, amount)); },
+    // phones: clumps drawn right now (null on desktop)
+    get windowCount() { return win ? win.count : null; },
+    // phones: refill the drawn clumps if the camera footprint changed (terrain calls it before rendering)
+    refresh(fp) { win?.update(fp); },
     update(dt) {
       fillWant();
       const k = 1 - Math.exp(-OCC_LAMBDA * dt);

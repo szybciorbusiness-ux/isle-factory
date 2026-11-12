@@ -2,30 +2,35 @@
 // (ctx.camp, GAMEPLAY.md) with smooth, springy animation. Inactive outside camp mode.
 //
 // Rendering: every creature is an invisible Object3D rig (src/view/creatures/animals.js, workers.js); each
-// frame the rigs' part matrices are written into one InstancedMesh per part type (src/view/creatures/kit.js
-// PartPool), so all animals of a species share ~5 draw calls and the whole module stays well under 40.
-// A per-instance `iFlash` attribute gives the white hit flash. Contact shadows are one instanced quad.
+// frame the rigs' part matrices are written into shared meshes. Default: two THREE.BatchedMesh batches
+// (src/view/creatures/kit.js PartBatch) hold every part geometry of every species and role, one that casts
+// shadows (bodies, heads, legs, tools) and one that doesn't (ears, tails, feet, eyelids, bubble, snack), so the
+// whole cast of animals and workers is 2 draw calls + 1 in the shadow pass, plus the contact-shadow quads and
+// the carried items. Without WEBGL_multi_draw (or with ?creaturesInstanced) it falls back to one InstancedMesh
+// per part type (PartPool). A per-instance white hit flash rides along either way.
 //
-// Events: animal:spawned (hop in from a dust puff), animal:hit (flash, squash, knockback hop),
-// animal:killed (squash + POOF, the fx module flies the drumsticks), animal:removed, camp:swing (target flinches;
-// worker swings), worker:hired (hop out of the hut door), worker:state, worker:carry (items fly onto the rack),
-// worker:hungry / worker:ate (thought bubble, munch), station:drop by a worker (items fly into the station).
+// Events: animal:spawned (hop in from a dust puff), animal:hit (flash, squash, bonk star, knockback hop, eyes
+// squeezed), animal:killed (squash + fx.poof; the fx module flies the drumsticks), animal:removed, camp:swing
+// (target flinches; worker swings: lumberjack chops overhead, hunter side-swipes), worker:hired (hop out of the
+// hut door), worker:state, worker:carry (items fly onto the rack), worker:hungry / worker:ate (thought bubble,
+// munch), station:drop by a worker (items toss into views.campview.intakePoint).
 //
 // API: views.creatures = { animalObject(id), workerObject(id), animalCenter(id, out?), workerStackTop(id, out?),
-//   update, stats() }
+//   update, stats() -> { animals, workers, drawCalls, shadowCalls, batched, meshes } }
 import * as THREE from 'three';
-import { creatureMaterial, PartPool, shadowTexture } from './creatures/kit.js';
-import { buildAnimalGeometries } from './creatures/animal-models.js';
+import { creatureMaterial, PartPool, PartBatch, canBatch, shadowTexture } from './creatures/kit.js';
+import { buildAnimalGeometries, lidGeometry } from './creatures/animal-models.js';
 import { buildWorkerGeometries } from './creatures/worker-models.js';
 import { AnimalView } from './creatures/animals.js';
 import { WorkerView } from './creatures/workers.js';
+import { STATIONS, PADS } from '../sim/camp-data.js';
 
 const SIZE_MOBILE = 1.22;   // portrait phones sit farther out: creatures a touch bigger there
 
 export function create(ctx) {
   const camp = ctx.camp;
   if (!camp) return {};
-  const { scene, events, views, camera, map, config } = ctx;
+  const { scene, events, views, camera, config } = ctx;
   const mobile = !!ctx.mobile || ctx.quality?.tier === 'mobile';
   const q = { seg: mobile ? 8 : 10 };
 
@@ -34,24 +39,41 @@ export function create(ctx) {
   scene.add(root);
   const mat = creatureMaterial();
 
-  // ---------- pools ----------
+  // ---------- part geometries: [key, geometry, capacity hint, casts shadow] ----------
   const ag = buildAnimalGeometries(q);
   const wg = buildWorkerGeometries(q);
-  const pools = {};
+  const parts = [];
   const CAST = new Set(['body', 'head', ...(mobile ? [] : ['leg'])]);
-  for (const [kind, parts] of Object.entries(ag)) {
-    for (const [part, geo] of Object.entries(parts)) {
+  for (const [kind, ps] of Object.entries(ag)) {
+    for (const [part, geo] of Object.entries(ps)) {
       const per = part === 'leg' ? 4 : part === 'ear' || part === 'foot' ? 2 : 1;
-      pools[`${kind}.${part}`] = new PartPool(root, geo, mat, 16 * per, { cast: CAST.has(part), name: `creatures:${kind}.${part}` });
+      parts.push([`${kind}.${part}`, geo, 8 * per, CAST.has(part)]);
     }
   }
   for (const [key, geo] of Object.entries(wg)) {
     const part = key.split('.').pop();
     const per = part === 'arm' || key === 'foot' ? 2 : 1;
     const cast = part === 'body' || part === 'head' || (!mobile && (key === 'axe' || key === 'club'));
-    pools[key] = new PartPool(root, geo, mat, 6 * per, { cast, name: `creatures:${key}` });
+    parts.push([key, geo, 4 * per, cast]);
   }
-  pools.bubble.mesh.castShadow = false; pools.bubble.mesh.receiveShadow = false;
+  parts.push(['lid', lidGeometry(), 16, false]);   // blinks: one shared lid ball, tinted per species / role
+
+  const params = ctx.params || new URLSearchParams(location.search);
+  const batched = !params.has?.('creaturesInstanced') && canBatch(ctx.renderer);
+  const pools = {};     // key -> { push(matrix, flash, tint) }
+  let drawers;          // things with begin() / end() around the per-frame writes
+  if (batched) {
+    const castBatch = new PartBatch(root, mat, parts.filter(p => p[3]), { cast: true, name: 'creatures:batch' });
+    const flatBatch = new PartBatch(root, mat, parts.filter(p => !p[3]), { cast: false, name: 'creatures:batch-flat' });
+    for (const [key, , , cast] of parts) pools[key] = (cast ? castBatch : flatBatch).slot(key);
+    drawers = [castBatch, flatBatch];
+  } else {
+    // every casting pool is one more call in the shadow pass here: only bodies cast (heads, legs and tools rely
+    // on the contact shadow), which keeps a full camp under 40 calls even without multi-draw
+    for (const [key, geo, cap, cast] of parts) pools[key] = new PartPool(root, geo, mat, cap * 2, { cast: cast && key.endsWith('.body'), name: `creatures:${key}` });
+    pools.bubble.mesh.receiveShadow = false;
+    drawers = Object.values(pools);
+  }
   const shadowMat = new THREE.MeshBasicMaterial({ map: shadowTexture(), transparent: true, opacity: 0.3, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 });
   const shadowPool = new PartPool(root, new THREE.PlaneGeometry(1, 1).rotateX(-Math.PI / 2), shadowMat, 32, { flash: false, receive: false, name: 'creatures:shadows', renderOrder: 1 });
 
@@ -88,11 +110,23 @@ export function create(ctx) {
     return p;
   }
 
+  // Camp works animals keep off (the sim's rule: every station's footprint, zone, line and pile, and every pad)
+  const campTiles = new Set();
+  const tileKey = (x, z) => x * 4096 + z;
+  const addRect = r => { if (r) for (let i = 0; i < r[2]; i++) for (let j = 0; j < r[3]; j++) campTiles.add(tileKey(r[0] + i, r[1] + j)); };
+  for (const def of Object.values(STATIONS)) {
+    addRect(def.footprint); addRect(def.zone);
+    for (const [x, z] of def.line || []) campTiles.add(tileKey(x, z));
+    if (def.pile) campTiles.add(tileKey(def.pile[0], def.pile[1]));
+  }
+  for (const pd of PADS) addRect(pd.zone);
+
   // ---------- shared context for the controllers ----------
-  const tmp = new THREE.Vector3();
   const sys = {
     root, ctx, camp, camera, sizeK: mobile ? SIZE_MOBILE : 1,
     fx: () => views.fx,
+    fxScale: () => (mobile ? 1.2 : 1),   // fx draws flights at this scale (FXK in fx.js)
+    campTile: (x, z) => campTiles.has(tileKey(x, z)),
     playerPos() {
       let p = null;
       try { p = views.player?.getPosition?.() || null; } catch { p = null; }
@@ -105,9 +139,13 @@ export function create(ctx) {
       return y < -0.1 ? 0 : y;
     },
     itemHeight: () => (Number.isFinite(views.items?.itemHeight) ? views.items.itemHeight : 0.2),
-    // where an item delivered into a station flies to
+    // where an item a worker delivers into a station lands: the camp view's intake (rack / basket / hopper)
     stationPoint(id, out) {
-      try { const p = views.campview?.inputPoint?.(id) || views.campview?.dropPoint?.(id); if (p && Number.isFinite(p.x)) return out.set(p.x, p.y ?? 0.5, p.z); } catch { /* fall through */ }
+      try {
+        const cv = views.campview;
+        const p = cv?.intakePoint?.(id, out) || cv?.inputPoint?.(id, out);
+        if (p && Number.isFinite(p.x)) return out.set(p.x, Number.isFinite(p.y) ? p.y : 0.5, p.z);
+      } catch { /* fall through */ }
       const s = camp.stations?.get?.(id);
       const fp = s?.def?.footprint;
       if (!fp) return null;
@@ -180,24 +218,25 @@ export function create(ctx) {
     for (const v of animals.values()) v.update(dt);
     for (const v of workers.values()) v.update(dt);
 
-    for (const p of Object.values(pools)) p.begin();
+    for (const d of drawers) d.begin();
     shadowPool.begin();
     for (const p of itemPools.values()) p.begin();
     for (const v of animals.values()) { v.write(pools); pushShadow(v.shadow(sh)); }
     for (const v of workers.values()) { v.write(pools, itemPool); pushShadow(v.shadow(sh)); }
-    for (const p of Object.values(pools)) p.end();
+    for (const d of drawers) d.end();
     shadowPool.end();
     for (const p of itemPools.values()) p.end();
   }
 
+  const meshes = () => [...drawers.map(d => d.mesh), shadowPool.mesh, ...[...itemPools.values()].map(p => p.mesh)];
   return {
     animalObject: id => animals.get(id)?.root || null,
     workerObject: id => workers.get(id)?.root || null,
     animalCenter: (id, out = new THREE.Vector3()) => animals.get(id)?.centerWorld(out) || null,
     workerStackTop: (id, out = new THREE.Vector3()) => workers.get(id)?.stackTop(out) || null,
     stats() {
-      const all = [...Object.values(pools), shadowPool, ...itemPools.values()];
-      return { animals: animals.size, workers: workers.size, drawCalls: all.filter(p => p.mesh.visible && p.mesh.count > 0).length, meshes: all.length };
+      const vis = meshes().filter(m => m.visible && (m.isBatchedMesh || m.count > 0));
+      return { animals: animals.size, workers: workers.size, drawCalls: vis.length, shadowCalls: vis.filter(m => m.castShadow).length, batched, meshes: meshes().length };
     },
     _animals: animals, _workers: workers,
     update,
