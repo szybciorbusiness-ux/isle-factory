@@ -104,6 +104,15 @@ export const GLYPHS = {
     + '<path d="M4.5 14h23c0 1.2-.2 2.3-.5 3.4H5c-.3-1.1-.5-2.2-.5-3.4z" fill="#f08a74"/>'
     + '<ellipse cx="16" cy="14" rx="11.5" ry="2.2" fill="#c98a4b"/>',
   ),
+  // a round wooden clock: time played (completion card)
+  clock: wrap(
+    '<ellipse cx="16" cy="29" rx="9" ry="1.8" fill="#b48a52" opacity=".22"/>'
+    + '<circle cx="16" cy="16" r="11.6" fill="#c98a4b"/>'
+    + '<circle cx="16" cy="16" r="9" fill="#fff4dc"/>'
+    + '<path d="M16 9.6v6.6l4.4 2.6" fill="none" stroke="#a8683a" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>'
+    + '<circle cx="16" cy="16" r="1.6" fill="#f08a24"/>'
+    + '<path d="M9.4 9.2c1.4-1.6 3.2-2.5 5-2.8" fill="none" stroke="#fff" stroke-width="1.6" stroke-linecap="round" opacity=".7"/>',
+  ),
   dot: wrap('<circle cx="16" cy="16" r="6" fill="#f08a24"/>'),
 };
 

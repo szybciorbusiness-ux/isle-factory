@@ -116,3 +116,22 @@ export function bezier(x1, y1, x2, y2) {
 // The HUD's two curves (Emil): ease-out for enters / exits / state changes, ease-in-out for things moving on screen.
 export const easeOut = bezier(0.23, 1, 0.32, 1);
 export const easeInOut = bezier(0.77, 0, 0.175, 1);
+
+// ---- per-frame patch helpers for the camp HUD (camp-hud.js, camp-ribbon.js, camp-complete.js) ----
+// Outlined numerals / words (UI-STYLE "numbers are the hero"): a stroked layer under a plain fill layer (.ol).
+export const ol = (text, cls = '') => h('span', { class: `ol ${cls}`, 'data-t': String(text) }, String(text));
+export function setOl(el, text) {
+  const s = String(text);
+  if (el.__t === s) return;
+  el.__t = s; el.textContent = s; el.dataset.t = s;
+}
+export const clamp01 = v => (v < 0 ? 0 : v > 1 ? 1 : v);
+export const easeIn = t => t * t * t;
+// transform / opacity writers that skip unchanged values
+export const tf = (el, v) => { if (el.__tf !== v) { el.__tf = v; el.style.transform = v; } };
+export const op = (el, v) => { const s = typeof v === 'number' ? v.toFixed(3) : v; if (el.__op !== s) { el.__op = s; el.style.opacity = s; } };
+// A tiny seeded random (confetti etc.): the same celebration looks the same in every capture.
+export function rng(seed = 1) {
+  let s = (seed >>> 0) || 1;
+  return () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; };
+}

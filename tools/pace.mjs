@@ -8,6 +8,8 @@ import { PLAYER } from '../src/config.js';
 
 const minutes = Number(process.argv[2]) || 25;
 const verbose = process.argv.includes('--verbose');
+// --dump=<seconds>: print the camp state once at that game time (debugging a stall)
+const dumpAt = Number((process.argv.find(a => a.startsWith('--dump=')) || '').slice(7)) || null;
 const map = createMap(7);
 const sim = createSim(map, { inventory: {} });
 const pos = { x: map.start.x, z: map.start.z };
@@ -79,6 +81,14 @@ for (let t = 0; t < minutes * 60; t += dt) {
   if (goal?.kind === 'wait') waitT += dt;
   if (!goal) noGoal += dt;
   const mi = Math.floor(t / 60); (carriedPerMin[mi] ||= [0, 0]); carriedPerMin[mi][0] += camp.total(); carriedPerMin[mi][1]++;
+  if (dumpAt && t >= dumpAt && t - dt < dumpAt) {
+    const counts = {}; for (const i of camp.stack) counts[i] = (counts[i] || 0) + 1;
+    console.log('--- dump at', fmt(t), 'pos', pos.x.toFixed(2), pos.z.toFixed(2), 'goal', JSON.stringify(goal), 'path', path && path.length, 'pi', pi);
+    console.log('stack', JSON.stringify(counts), 'free', camp.free(), 'exchanging', camp.exchanging);
+    { const tx = Math.round(pos.x), tz = Math.round(pos.z); const e = sim.at(tx, tz); console.log('tile', tx, tz, 'walkable', sim.isWalkable(tx, tz), 'entity', e && e.kind, 'island', camp.map?.islandAt?.(tx, tz)); for (const [dx, dz] of [[1,0],[-1,0],[0,1],[0,-1]]) console.log('  nb', tx+dx, tz+dz, sim.isWalkable(tx+dx, tz+dz), sim.at(tx+dx, tz+dz)?.kind, map.isLand(tx+dx, tz+dz)); }
+    for (const st of camp.stations.values()) console.log(' station', st.id, 'input', JSON.stringify(st.input), 'busy', st.busy, 'line', st.line?.items.length, 'pile', st.pile?.count);
+    for (const p of camp.pads) console.log(' pad', p.id, JSON.stringify(p.cost), JSON.stringify(p.paid));
+  }
   move(dt);
   sim.update(dt);
   camp.update(dt);

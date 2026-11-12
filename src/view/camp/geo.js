@@ -2,9 +2,12 @@
 // (Item meshes, the drumsticks and the copper ingot included, live in src/view/items.js.)
 // Everything is built with the buildings toolkit (Parts: merged, vertex-coloured, one Lambert material).
 import * as THREE from 'three';
-import { Parts, rbox, puck, gear, jitter, rng } from '../buildings/geom.js';
+import { Parts, rbox as rbox2, puck, gear, jitter, rng } from '../buildings/geom.js';
 
-export { Parts, rbox, puck, gear, jitter, rng };
+export { Parts, puck, gear, jitter, rng };
+// Camp models are seen from a high camera at a few dozen pixels a part: one rounding segment (a soft chamfer,
+// 108 triangles a box) reads the same as two (300), so that is the camp default; pass seg = 2 where a part is big.
+export const rbox = (w, h, d, r = 0.04, seg = 1) => rbox2(w, h, d, r, seg);
 
 // Same family as buildings/models.js COL (honey wood, cream stone, copper) plus camp extras.
 // No near-black anywhere: the darkest tone is a soft cocoa.
@@ -52,7 +55,7 @@ export function log(p, a, b, r, { color = C.wood, ends = C.endGrain, seg = 8, se
 export function beam(p, a, b, w, color, { r = 0.025, d = w } = {}) {
   const A = new THREE.Vector3(...a), B = new THREE.Vector3(...b);
   const len = A.distanceTo(B), mid = A.clone().add(B).multiplyScalar(0.5);
-  const g = rbox(w, len, d, r, 2);
+  const g = rbox(w, len, d, r, 1);
   g.applyQuaternion(new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 1, 0), B.clone().sub(A).normalize()));
   p.add(g, color, { p: [mid.x, mid.y, mid.z] });
   return p;

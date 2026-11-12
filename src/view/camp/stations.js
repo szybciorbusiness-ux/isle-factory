@@ -55,6 +55,47 @@ function flagGeometry() {
 // =====================================================================================================
 // HEARTH
 // =====================================================================================================
+// The hearth keeps growing with the camp (FIRST-20): every level a bigger, taller flame and a wider pool of warm
+// light; level 4 adds a tall core with a column of sparks and lights the lanterns; level 5 is the bonfire with a
+// crown of sparks circling above it.
+//   size, stretch (flame height on top of size), active tongues, glow radius, glow strength, embers / s,
+//   column sparks / s, crown 0..1
+const HEARTH_LV = [
+  [1.0, 1.0, 10, 1.3, 0.24, 2, 0, 0],
+  [1.0, 1.0, 10, 1.6, 0.3, 4, 0, 0],
+  [1.1, 1.22, 10, 2.05, 0.33, 6, 0, 0],
+  [1.2, 1.42, 10, 2.5, 0.36, 8, 0, 0],
+  [1.3, 1.45, 13, 2.95, 0.4, 9, 22, 0],
+  [1.45, 1.55, 21, 3.4, 0.44, 12, 12, 1],
+];
+// lanterns (level 4): two lantern posts at the front corners, four paper lanterns on a string between the banner
+// poles. [x, y, z] of each glowing heart in hearth-local space, and the lamp's scale.
+const HEARTH_LANTERNS = [[-0.98, 0.84, 0.5], [0.98, 0.84, 0.5]];
+const HEARTH_STRING = { x0: 0.8, y0: 1.47, sag: 0.16, z: -0.8 };
+const HEARTH_PAPER = [-0.42, -0.15, 0.15, 0.42].map(x => [x, HEARTH_STRING.y0 - HEARTH_STRING.sag * (1 - (x / HEARTH_STRING.x0) ** 2) - 0.13, HEARTH_STRING.z]);
+const HEARTH_LAMPS = [...HEARTH_LANTERNS.map(p => [...p, 0.092, 1.1, '#ffffff']), ...HEARTH_PAPER.map((p, i) => [...p, 0.078, 1.2, i % 2 ? '#ff8f66' : '#ffa24f'])];
+
+// a thin cylinder between two points (ropes, cords, slim posts): a few dozen triangles instead of a rounded box
+function rod(p, a, b, r, color, seg = 6) {
+  const A = V(...a), B = V(...b);
+  const len = A.distanceTo(B), mid = A.clone().add(B).multiplyScalar(0.5);
+  const g = new THREE.CylinderGeometry(r, r, len, seg, 1, true);
+  g.applyQuaternion(new THREE.Quaternion().setFromUnitVectors(V(0, 1, 0), B.clone().sub(A).normalize()));
+  p.add(g, color, { p: [mid.x, mid.y, mid.z] });
+  return p;
+}
+
+// a faceted paper-lantern / glowing-orb shape (unit radius): warm cream belly, orange caps
+function lampGeometry() {
+  return once('lamp', () => {
+    const p = new Parts({ ao: false });
+    const prof = [[0.001, -1], [0.5, -0.94], [0.86, -0.62], [1, -0.12], [1, 0.12], [0.86, 0.62], [0.5, 0.94], [0.001, 1]].map(([r, y]) => new THREE.Vector2(r, y));
+    p.add(new THREE.LatheGeometry(prof, 8), '#fff3c4', { flat: true, faceColor: (cx, cy) => (Math.abs(cy) > 0.7 ? '#ffb24a' : Math.abs(cy) > 0.4 ? '#ffd877' : null) });
+    for (const y of [-1, 1]) p.add(new THREE.CylinderGeometry(0.42, 0.42, 0.16, 8), '#e9772e', { p: [0, y * 1.0, 0], flat: true });
+    return p.merge();
+  });
+}
+
 function hearthGeometry() {
   return once('hearth', () => {
     const body = new Parts({ ao: { y0: 0, y1: 0.4, min: 0.8 } });
@@ -105,21 +146,28 @@ function hearthGeometry() {
       beam(l3, [x, 1.38, z], [x - sx * 0.27, 1.38, z], 0.045, C.woodDark, { r: 0.018 });
     }
 
-    // level 4: copper brazier ring + two lanterns at the front corners
+    // level 4: copper brazier ring, two lantern posts at the front corners (their glowing hearts are the lamps
+    // mesh) and a string of paper lanterns hung high between the banner poles
     const l4 = new Parts({ ao: { y0: 0, y1: 0.4, min: 0.85 } });
     l4.add(new THREE.TorusGeometry(0.66, 0.04, 6, 36), C.copper, { p: [0, 0.27, 0], r: [Math.PI / 2, 0, 0] });
     for (let i = 0; i < 6; i++) {
       const a = (i / 6) * Math.PI * 2 + 0.26;
-      l4.add(rbox(0.05, 0.22, 0.05, 0.015), C.copperDark, { p: [Math.cos(a) * 0.66, 0.15, Math.sin(a) * 0.66] });
+      l4.add(new THREE.BoxGeometry(0.05, 0.22, 0.05), C.copperDark, { p: [Math.cos(a) * 0.66, 0.15, Math.sin(a) * 0.66], r: [0, -a, 0] });
     }
-    for (const sx of [-1, 1]) {
-      const x = sx * 0.97, z = 0.48;
-      beam(l4, [x, 0.0, z], [x, 0.62, z], 0.06, C.woodDark, { r: 0.022 });
-      l4.add(rbox(0.15, 0.04, 0.15, 0.015), C.copperDark, { p: [x, 0.64, z] });
-      l4.add(rbox(0.12, 0.13, 0.12, 0.02), C.glass, { p: [x, 0.725, z], ao: false });
-      for (const [dx, dz] of [[1, 1], [1, -1], [-1, 1], [-1, -1]]) l4.add(rbox(0.022, 0.15, 0.022, 0.008), C.copper, { p: [x + dx * 0.06, 0.725, z + dz * 0.06], ao: false });
-      l4.add(new THREE.ConeGeometry(0.1, 0.08, 4), C.copper, { p: [x, 0.83, z], r: [0, Math.PI / 4, 0], flat: true });
+    for (const [x, , z] of HEARTH_LANTERNS) {
+      rod(l4, [x, 0.0, z], [x, 0.7, z], 0.036, C.woodDark, 6);
+      l4.add(rbox(0.21, 0.045, 0.21, 0.018, 1), C.copperDark, { p: [x, 0.72, z] });
+      for (const [dx, dz] of [[1, 1], [1, -1], [-1, 1], [-1, -1]]) l4.add(new THREE.BoxGeometry(0.026, 0.23, 0.026), C.copper, { p: [x + dx * 0.1, 0.85, z + dz * 0.1], ao: false });
+      l4.add(new THREE.ConeGeometry(0.15, 0.08, 4), C.copper, { p: [x, 1.0, z], r: [0, Math.PI / 4, 0], flat: true });
+      l4.add(new THREE.SphereGeometry(0.03, 6, 4), C.copperLight, { p: [x, 1.05, z], flat: true, ao: false });
     }
+    // the lantern string: a sagging rope from pole top to pole top, a short cord over each paper lantern
+    const rope = x => HEARTH_STRING.y0 - HEARTH_STRING.sag * (1 - (x / HEARTH_STRING.x0) ** 2);
+    for (let i = 0; i < 10; i++) {
+      const xa = -HEARTH_STRING.x0 + (i / 10) * 2 * HEARTH_STRING.x0, xb = -HEARTH_STRING.x0 + ((i + 1) / 10) * 2 * HEARTH_STRING.x0;
+      rod(l4, [xa, rope(xa), HEARTH_STRING.z], [xb, rope(xb), HEARTH_STRING.z], 0.009, C.woodDark, 4);
+    }
+    for (const [x, y, z] of HEARTH_PAPER) rod(l4, [x, rope(x), z], [x, y + 0.07, z], 0.006, C.woodDark, 4);
 
     // level 5: a copper crown of spikes on the ring + two tall front poles (their banners are instanced flags)
     const l5 = new Parts({ ao: { y0: 0, y1: 0.6, min: 0.85 } });
@@ -173,14 +221,34 @@ function buildHearth(env) {
   flags.count = 0; flags.castShadow = env.cast; flags.receiveShadow = true; flags.frustumCulled = false;
   root.add(flags);
   const flagState = HEARTH_FLAGS.map(() => ({ t: 10, on: false }));
+  // lamps (level 4): the unlit glowing hearts of the lanterns, one InstancedMesh; instance colour = how lit
+  const lampMat = new THREE.MeshBasicMaterial({ vertexColors: true });
+  const lamps = new THREE.InstancedMesh(lampGeometry(), lampMat, HEARTH_LAMPS.length);
+  lamps.count = 0; lamps.frustumCulled = false; lamps.castShadow = false; lamps.receiveShadow = false;
+  lamps.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(HEARTH_LAMPS.length * 3).fill(1), 3);
+  root.add(lamps);
+  const lampState = HEARTH_LAMPS.map(() => ({ t: 10, on: false, litT: 10, lit: false, sway: new Spring(0, { stiffness: 60, damping: 3 }) }));
+  // the front lanterns also pool warm light on the grass (ground glows from the fire system)
+  const lanternGlows = HEARTH_LANTERNS.map((p, i) => env.fire.add({ preset: 'none', size: 1, heat: 0, glowRadius: 0.62, glowColor: '#ffb24d', glowStrength: 0.26, emberRate: 0, seed: 11 + i }));
+  const lanternLocal = HEARTH_LANTERNS.map(([x, , z]) => new THREE.Matrix4().makeTranslation(x, 0, z));
+  const UNLIT = new THREE.Color('#9a8270'), LIT = HEARTH_LAMPS.map(l => new THREE.Color(l[5])), _lc = new THREE.Color(), _o = new THREE.Vector3();
 
-  const fire = env.fire.add({ preset: 'hearth', size: 1, heat: 0, glowRadius: 1.6, glowColor: '#ffa04d', glowStrength: 0.34, emberRate: 5, seed: 1 });
+  const fire = env.fire.add({ preset: 'hearth', size: 1, heat: 0, active: 10, glowRadius: 1.6, glowColor: '#ffa04d', glowStrength: 0.34, emberRate: 5, seed: 1 });
   const fireLocal = new THREE.Matrix4().makeTranslation(0, 0.1, 0);
-  const sizeFor = lv => 0.96 + 0.1 * lv;
   const COLD = new THREE.Color('#8f8580'), WARM = new THREE.Color('#ffffff');
-  let level = -1, time = 0, smokeT = 0;
+  let level = -1, time = 0, smokeT = 0, whoosh = null;
   const _m = new THREE.Matrix4(), _q = new THREE.Quaternion(), _e = new THREE.Euler(), _p = new THREE.Vector3(), _s = new THREE.Vector3();
 
+  // the fire's targets for a level (its springs swell it there)
+  function fireFor(lv, animate) {
+    const [size, stretch, active, glowR, glowS, embers, column, crown] = HEARTH_LV[clamp(lv, 0, HEARTH_LV.length - 1)];
+    fire.heat = lv >= 1 ? 1 : 0;
+    fire.size = size; fire.stretch = stretch; fire.active = active;
+    fire.glowRadius = glowR; fire.glowStrength = glowS; fire.emberRate = embers; fire.column = column;
+    if (crown > 0 && !(fire.crown > 0) && animate) fire.crownT = -0.35;   // the crown assembles just after the whoosh
+    fire.crown = crown;
+    if (!animate) fire.snap?.();
+  }
   function setLevel(lv, animate) {
     for (let k = 1; k <= 5; k++) {
       const d = decor[k];
@@ -193,13 +261,15 @@ function buildHearth(env) {
       if (on && !st.on) { st.on = true; st.t = animate ? -(0.6 + i * 0.12) : 10; }
       if (!on && st.on) { st.on = false; st.t = animate ? 0 : 10; }
     });
+    // lanterns: grow in with the level-4 decor, then light one after another (posts first, then the string)
+    lampState.forEach((st, i) => {
+      const on = lv >= 4;
+      if (on && !st.on) { st.on = true; st.t = animate ? -0.3 : 10; st.lit = true; st.litT = animate ? -(0.62 + i * 0.13) : 10; }
+      if (!on && st.on) { st.on = false; st.t = animate ? 0 : 10; st.lit = false; }
+    });
     level = lv;
-    fire.heat = lv >= 1 ? 1 : 0;
-    if (!animate) fire.heatNow = fire.heat;
-    fire.size = sizeFor(Math.max(1, lv));
-    fire.glowRadius = 1.3 + 0.24 * lv;
-    fire.glowStrength = 0.26 + 0.05 * lv;
-    fire.emberRate = 3 + 1.6 * lv;
+    // a level-up's fire change waits for the whoosh (levelUp); everything else gets its fire at once
+    if (!animate || !whoosh) fireFor(lv, animate);
   }
   setLevel(env.camp.level || 0, false);
 
@@ -208,21 +278,41 @@ function buildHearth(env) {
     anchors: { out: V(0, 0.6, 0), intake: V(0, 0.4, 0.3), top: V(0, 1.6, 0), fire: V(0, 0.1, 0) },
     fire,
     get lit() { return level >= 1; },
+    get level() { return level; },
     levelUp(lv) {
+      if (lv <= 1) {
+        // lighting the cold hearth starts small and whooshes up
+        whoosh = null;
+        setLevel(lv, true);
+        fire.heatNow = 0.05; fire.flare(1.1); env.fire.burst(fire, 18);
+        return;
+      }
+      // anticipation: the flame ducks for a beat, then whooshes up past its new size and settles there, bigger
+      whoosh = { t: 0.17, lv };
+      fire.boost.kick(-3.2);
       setLevel(lv, true);
-      // lighting the cold hearth starts small and whooshes up; later levels flare
-      if (lv <= 1) { fire.heatNow = 0.05; fire.flare(1.1); env.fire.burst(fire, 18); }
-      else { fire.flare(1.5); env.fire.burst(fire, 26); }
     },
     update(dt) {
       time += dt;
       if ((env.camp.level || 0) !== level) setLevel(env.camp.level || 0, true);
+      if (whoosh && (whoosh.t -= dt) <= 0) {
+        const lv = whoosh.lv;
+        whoosh = null;
+        fireFor(lv, true);
+        fire.flare(0.75 + 0.1 * lv);
+        fire.sizeS.velocity += 0.45 + 0.08 * lv;          // overshoot into the new size
+        fire.stretchS.velocity += 0.6 + 0.12 * lv;
+        fire.glowS.velocity += 3 + 0.8 * lv;               // a pulse of warm light rolls out over the grass
+        fire.glowFlash = 1;
+        env.fire.burst(fire, 18 + 6 * lv);
+        if (lv >= 4) env.fire.burstColumn?.(fire, 14 + 8 * (lv - 3));
+      }
       root.updateMatrixWorld();
       fire.base.multiplyMatrices(root.matrixWorld, fireLocal);
       const heat = fire.heatNow;
       const fl = 1 + 0.12 * Math.sin(time * 7.7) + 0.08 * Math.sin(time * 12.9);
       coalMat.color.copy(COLD).lerp(WARM, Math.min(1, heat * 1.2));
-      coalMat.emissiveIntensity = heat * 0.32 * fl;
+      coalMat.emissiveIntensity = heat * (0.28 + 0.03 * Math.max(0, level)) * fl;
       // a cold hearth breathes a thin wisp of smoke, asking to be lit
       if (level < 1) {
         smokeT -= dt;
@@ -262,8 +352,46 @@ function buildHearth(env) {
       });
       flags.count = n; flags.visible = n > 0;
       if (n) flags.instanceMatrix.needsUpdate = true;
+      // lamps: grow in with the decor, then light up one by one (a bright flash, a little hop, the paper ones
+      // swing on the string), then a soft candle flicker
+      n = 0;
+      const nPost = HEARTH_LANTERNS.length;
+      HEARTH_LAMPS.forEach(([x, y, z, r, sy], i) => {
+        const st = lampState[i];
+        st.t += dt;
+        const prevLit = st.litT;
+        st.litT += dt;
+        const s = popScale(st.on, st.t, 0.42, 0.2);
+        if (i < nPost) { const lg = lanternGlows[i]; lg.heat = 0; }
+        if (s <= 0.01) return;
+        if (st.lit && prevLit < 0 && st.litT >= 0) {
+          st.sway.kick(i >= nPost ? 2.4 : 0.6);
+          env.fx?.sparkle?.(env.toWorld(V(x, y + 0.05, z)), { count: i < nPost ? 5 : 3, spread: 0.16, size: 0.07, color: '#fff1b8' });
+        }
+        const lk = st.lit ? clamp(st.litT / 0.12) : 0;
+        const flashK = st.lit && st.litT > 0 && st.litT < 0.8 ? Math.exp(-st.litT * 5) : 0;
+        const flick = 1 + (0.05 * Math.sin(time * 8.3 + i * 1.9) + 0.03 * Math.sin(time * 13.1 + i)) * lk;
+        _lc.copy(UNLIT).lerp(LIT[i], lk).multiplyScalar(flick * (1 + flashK * 0.45));
+        const pop = 1 + 0.4 * flashK;
+        const sw = st.sway.update(dt) + (i >= nPost ? 0.06 * Math.sin(time * 1.7 + i * 1.1) : 0);
+        const hang = i >= nPost ? 0.1 : 0;   // paper lanterns swing about their cord's knot
+        _q.setFromEuler(_e.set(sw * 0.3, i * 0.7, 0));
+        _o.set(0, -hang, 0).applyQuaternion(_q);
+        _m.compose(_p.set(x + _o.x, y + hang + _o.y, z + _o.z), _q, _s.set(r * s * pop, r * sy * s * pop, r * s * pop));
+        lamps.setMatrixAt(n, _m);
+        lamps.setColorAt(n, _lc);
+        n++;
+        if (i < nPost) {
+          const lg = lanternGlows[i];
+          lg.heat = lk > 0 ? 1 : 0;
+          lg.glowStrength = 0.26 * (1 + flashK * 1.6);
+          lg.base.multiplyMatrices(root.matrixWorld, lanternLocal[i]);
+        }
+      });
+      lamps.count = n; lamps.visible = n > 0;
+      if (n) { lamps.instanceMatrix.needsUpdate = true; lamps.instanceColor.needsUpdate = true; }
     },
-    dispose() { env.fire.remove(fire); coalMat.dispose(); },
+    dispose() { env.fire.remove(fire); lanternGlows.forEach(f => env.fire.remove(f)); coalMat.dispose(); lampMat.dispose(); },
   };
   return rig;
 }

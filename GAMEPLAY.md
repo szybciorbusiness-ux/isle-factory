@@ -26,7 +26,32 @@ gathers automatically, carries a visible stack, and you pay for things by standi
    pile to eat. No food → a hungry bubble and they work at half speed. The camp slowly runs itself.
 
 Loose items: if your stack is full, extra drops fall on the ground and wait ~40 s to be picked up by walking over.
-Regrowth: stumps grow back into trees (35 s), rocks respawn (50 s), animals respawn (~16–24 s).
+Regrowth: stumps grow back into trees (35 s), rocks respawn (50 s), animals respawn (~16–24 s). A tree or rock
+only grows back where it keeps the walkable map connected, so a tunnel you chopped can never seal you in.
+
+## Guidance and intent rules (src/sim/camp.js, tuned with tools/pace.mjs and the playtest critics)
+
+- **One goal** (`camp.goal`, recomputed 4×/s from `camp.nextGoal()`): pay / drop / pickup / gather / hunt / wait.
+  The main pad is the first visible pad in PADS order; if it can't progress, the next one that can is used, and
+  as a last resort the guide waits by the pile the main pad's item comes from. The arrow never goes blank.
+- **Fill, then deliver.** Gather until you hold enough for the pad (or the pack is full), drop raw in batches,
+  take a pile once it covers a full load, pay once. Stations' queued input, line and pile count as "on the way".
+- **Sticky.** While you stand in the goal's pad / drop zone / pile and the exchange can go on, the goal stays put
+  until it's spent: the arrow never jumps to a tree mid-payment.
+- **Intent.** The goal's own pad pays at once. Any other pad only pays after you stand (nearly) still on it for
+  0.32 s, so walking across a pad never spends your stack. Station drop zones take raw on walk-over (raw only
+  ever goes to its station). `camp.exchanging` says what is being exchanged right now (pads lift their sticker
+  from it).
+- **No dead weight.** Auto-gather takes the goal's item freely; anything else only while a quarter of the pack
+  or less holds it. Raw the main pad doesn't need, holding more than that, is unloaded at its station first.
+- **Boosts between deliveries.** A hire / upgrade pad whose whole remaining cost sits in the pack or on a pile
+  within 10 tiles is taken right after a delivery, so a full pile never idles next to an unpaid hire pad.
+- **Backed-up lines.** When a station's input and pile are full, the guide takes the pile before asking for
+  more raw.
+
+Pacing (bot, `node tools/pace.mjs 24`; people play about 1.35× slower): camp level 2 at 2:10, level 3 at 6:59,
+east bridge 10:19, copper tools 13:18, level 4 14:25, level 5 17:30. The test "a bot following the guide finishes
+the camp" (tests/camp.test.mjs) plays the whole loop in about 0.6 s.
 
 ## Map (src/world/map-camp.js)
 

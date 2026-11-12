@@ -5,9 +5,14 @@
 // hue-preserving highlight roll-off, sRGB output and dithering. Returns {} if anything is unsupported so
 // main.js renders directly.
 //
+// Focus pull (update(dt), which runs after the camera and the guide): the crisp band stretches to hold the
+// guide's target and arrow, the station tops and signs and the pad plates in view, so nothing the player
+// must read sits in the blur; the frame's outer edge still goes soft (see FOCUS).
+//
 // Camp mode: while the hearth is cold (camp level 0) the frame is graded cooler, a little dimmer and less
-// saturated. When it's lit, a warm wave spreads out from the hearth (world/mood.js drives its progress):
-// inside the front the colours are warm, outside still cold, and a band of warm light rides the front.
+// saturated (vivid oranges, the guide arrow and Dug's helmet, mostly keep theirs). When it's lit, a warm wave
+// spreads out from the hearth (world/mood.js drives its progress): inside the front the colours are warm,
+// outside still cold, and a band of warm light rides the front.
 // The wave is placed in the world by intersecting each pixel's view ray with the ground plane.
 //
 // Before rendering it gives the world modules a last look at the final camera: props.prepareRender (view /
@@ -21,15 +26,32 @@ import { getMood } from './world/mood.js';
 // Tilt-shift band, in screen space. Landscape and tall portrait (phones) have their own tuning and are
 // blended by aspect: a portrait screen shows ~2x more world vertically, so its crisp band is taller in
 // screen terms (the middle 60% stays sharp) and the blur ramps in over a shorter stretch at the edges.
+// Landscape shows only ~13 tiles top to bottom (the home isle is 11), so its band is wide too: the soft
+// edge sits on the clouds and far water, not on the camp's north row.
 const TILT = {
   focus: 0.47,      // screen-space y (0 bottom .. 1 top) of the crisp band centre
-  band: 0.17,       // half height of the fully crisp band
-  softTop: 0.3,     // distance over which blur ramps in above the band
-  softBottom: 0.36,
-  maxTop: 1.0,      // 0..1, 1 = quarter-res blur
-  maxBottom: 0.45,
+  band: 0.26,       // half height of the fully crisp band
+  softTop: 0.25,    // distance over which blur ramps in above the band
+  softBottom: 0.21,
+  maxTop: 0.9,      // 0..1, 1 = quarter-res blur
+  maxBottom: 0.38,
 };
 const TILT_TALL = { focus: 0.5, band: 0.3, softTop: 0.16, softBottom: 0.18, maxTop: 0.92, maxBottom: 0.42 };
+// Focus pull: the band above is only the resting shape. Every frame it also stretches (never shrinks) to hold
+// what the player must read: the guide's target and its bouncing arrow (all the way to the screen edge), and,
+// up to a cap that keeps a sliver of soft edge, every station top and signboard (FIRST-20 rule 3: the
+// input -> output sign) and every pad plate in view. The band edges glide there (fast to open, slow to close),
+// and the soft ramp beyond a stretched edge gets shorter, so the top of the frame still melts into the clouds.
+const FOCUS = {
+  margin: 0.035,    // screen-y headroom past the topmost / bottommost point held
+  capTop: 0.935,    // how far up stations and pads may push the band (the guide target: 1)
+  capBottom: 0.07,
+  minSoft: 0.075,   // shortest blur ramp beyond a stretched edge
+  arrowH: 1.35,     // world height of the bouncing arrow above its tip (size + hop)
+  open: 7,          // 1/s, band edge easing toward a wider band
+  close: 2.2,       // 1/s, back toward the resting band
+  every: 1 / 15,    // s between re-measuring (the easing runs every frame)
+};
 // Grade. Portrait (phones) is blended in by aspect like the tilt band: a phone shows more far-away ground
 // through more aerial haze, so it gets a little more colour and less lift to stay as vivid as the reference.
 const GRADE = {
@@ -52,6 +74,8 @@ const COLD = {
   front: 1.7,       // world units over which the wave's edge blends cold -> warm
   rim: [0.2, 0.12, 0.03], // warm light riding the wave front
   rimWidth: 1.15,
+  // vivid warm hues (gamma-2 red minus blue from keepFrom to keepTo) keep this much of their own colour
+  keepFrom: 0.4, keepTo: 0.6, keep: 0.65,
 };
 
 export function create(ctx) {
@@ -151,7 +175,8 @@ function createPost(ctx) {
     uniforms: {
       tSharp: { value: rtScene.texture }, tB1: { value: rtH[1].texture }, tB2: { value: rtQ[1].texture },
       uAspect: { value: 1 },
-      uTilt: { value: new THREE.Vector4(TILT.focus, TILT.band, TILT.softTop, TILT.softBottom) },
+      // crisp band bottom, top (screen y), blur ramp length below, above
+      uBand: { value: new THREE.Vector4(TILT.focus - TILT.band, TILT.focus + TILT.band, TILT.softBottom, TILT.softTop) },
       uTiltMax: { value: new THREE.Vector2(TILT.maxTop, TILT.maxBottom) },
       uSat: { value: GRADE.saturation },
       uVibrance: { value: GRADE.vibrance },
@@ -172,7 +197,7 @@ function createPost(ctx) {
       #include <common>
       uniform sampler2D tSharp, tB1, tB2;
       uniform float uAspect, uSat, uVibrance, uContrast, uLift, uVig, uShoulder, uCold;
-      uniform vec4 uTilt, uWave;
+      uniform vec4 uBand, uWave;
       uniform vec2 uTiltMax;
       uniform vec3 uWarm, uLiftCol, uVigCol;
       uniform mat4 uInvVP;
@@ -193,13 +218,12 @@ function createPost(ctx) {
         vec3 sharp = texture2D(tSharp, vUv).rgb;
         vec3 b1 = texture2D(tB1, vUv).rgb;
         vec3 b2 = texture2D(tB2, vUv).rgb;
-        float dy = vUv.y - uTilt.x;
-        float k = dy > 0.0
-          ? smoothstep(uTilt.y, uTilt.y + uTilt.z, dy) * uTiltMax.x
-          : smoothstep(uTilt.y, uTilt.y + uTilt.w, -dy) * uTiltMax.y;
-        // a little extra softness toward the far left/right corners
+        float above = vUv.y - uBand.y, below = uBand.x - vUv.y;
+        float k = above > 0.0 ? smoothstep(0.0, uBand.w, above) * uTiltMax.x
+                : below > 0.0 ? smoothstep(0.0, uBand.z, below) * uTiltMax.y : 0.0;
+        // a little extra softness toward the far left/right corners (only toward the band's edges)
         float sx = abs(vUv.x - 0.5) * 2.0;
-        k = clamp(k + smoothstep(0.75, 1.0, sx) * smoothstep(0.05, 0.3, abs(dy)) * 0.12, 0.0, 1.0);
+        k = clamp(k + smoothstep(0.75, 1.0, sx) * smoothstep(-0.08, 0.15, max(above, below)) * 0.12, 0.0, 1.0);
         vec3 col = k < 0.5 ? mix(sharp, b1, k * 2.0) : mix(b1, b2, k * 2.0 - 1.0);
 
         // grade in a gamma-2 domain so it reads perceptually even
@@ -217,8 +241,10 @@ function createPost(ctx) {
         if (uCold > 0.001) {
           float d = length(groundXZ(vUv) - uWave.xy);
           float lc = dot(g, LUMA);
-          // near-whites (clouds, foam) only take half of it, so the cold sky stays clean instead of grey
-          float cold = uCold * smoothstep(uWave.z - ${COLD.front.toFixed(2)}, uWave.z + 0.2, d) * (1.0 - 0.5 * smoothstep(0.8, 0.96, lc));
+          // near-whites (clouds, foam) only take half of it, so the cold sky stays clean instead of grey; vivid
+          // oranges (the guide arrow, Dug's helmet) keep most of their punch: the one warm thing in a grey world
+          float vivid = smoothstep(${COLD.keepFrom.toFixed(2)}, ${COLD.keepTo.toFixed(2)}, g.r - g.b) * ${COLD.keep.toFixed(2)};
+          float cold = uCold * smoothstep(uWave.z - ${COLD.front.toFixed(2)}, uWave.z + 0.2, d) * (1.0 - 0.5 * smoothstep(0.8, 0.96, lc)) * (1.0 - vivid);
           vec3 cg = mix(vec3(lc), g, ${COLD.saturation.toFixed(3)}) * vec3(${COLD.tint.map(v => v.toFixed(3)).join(', ')}) * ${COLD.dim.toFixed(3)};
           g = mix(g, cg, cold);
           float rim = exp(-pow((d - uWave.z) / ${COLD.rimWidth.toFixed(2)}, 2.0)) * uWave.w;
@@ -252,6 +278,98 @@ function createPost(ctx) {
   const quad = new FullScreenQuad(blurMat);
   let W = 1, H = 1;
 
+  // ---- focus pull: the crisp band (screen y) and where it wants to be ----
+  const band = {
+    baseLo: TILT.focus - TILT.band, baseHi: TILT.focus + TILT.band, softLo: TILT.softBottom, softHi: TILT.softTop,
+    lo: TILT.focus - TILT.band, hi: TILT.focus + TILT.band, wantLo: 0, wantHi: 1,
+    primed: false, measureT: 0, held: 0, by: '',
+  };
+  function pushBand() {
+    // beyond a stretched edge the ramp gets shorter, so the frame's edge still goes soft
+    const softHi = THREE.MathUtils.clamp(1.02 - band.hi, FOCUS.minSoft, band.softHi);
+    const softLo = THREE.MathUtils.clamp(band.lo + 0.02, FOCUS.minSoft, band.softLo);
+    compMat.uniforms.uBand.value.set(band.lo, band.hi, softLo, softHi);
+  }
+  const ndc = new THREE.Vector3(), probe = new THREE.Vector3();
+  // screen y (0 bottom .. 1 top) of a world point, or NaN when it is behind the camera
+  const screenY = (x, y, z) => {
+    ndc.set(x, y, z).project(camera);
+    return ndc.z < 1 ? ndc.y * 0.5 + 0.5 : NaN;
+  };
+  // is this ground anchor in the frame (with a little slack)?
+  const inFrame = (x, z) => {
+    ndc.set(x, 0, z).project(camera);
+    return ndc.z < 1 && Math.abs(ndc.x) < 1.06 && Math.abs(ndc.y) < 1.06;
+  };
+  let want = { hi: 0, lo: 1, n: 0, by: '' };
+  const hold = (x, y, z, capHi, capLo, tag) => {
+    const sy = screenY(x, y, z);
+    if (!Number.isFinite(sy)) return;
+    const hi = Math.min(capHi, sy + FOCUS.margin), lo = Math.max(capLo, sy - FOCUS.margin);
+    if (hi > want.hi) { want.hi = hi; want.by = tag; }
+    if (lo < want.lo) want.lo = lo;
+    want.n++;
+  };
+  function measureFocus() {
+    want.hi = band.baseHi; want.lo = band.baseLo; want.n = 0; want.by = '';
+    camera.updateMatrixWorld();
+    const views = ctx.views || {}, camp = ctx.camp;
+    // 1) the guide's target, its arrow tip and the arrow's top: may hold the band to the frame's very edge
+    const guide = views.guide;
+    const t = guide && guide.enabled !== false && !guide.retired ? guide.target : null;
+    if (t && Number.isFinite(t.x) && Number.isFinite(t.z) && inFrame(t.x, t.z)) {
+      hold(t.x, 0, t.z, 1, 0, 'target');
+      const a = guide.aim;
+      if (a && Number.isFinite(a.x) && Number.isFinite(a.y)) {
+        hold(a.x, a.y, a.z, 1, 0, 'arrow');
+        hold(a.x, a.y + FOCUS.arrowH, a.z, 1, 0, 'arrow');
+      }
+    }
+    if (!camp) return;
+    // 2) station tops and their input -> output signs
+    const cv = views.campview;
+    if (cv?.stationTop && camp.stations) {
+      const station = id => {
+        const top = cv.stationTop(id, probe);
+        if (!top || !inFrame(top.x, top.z)) return;
+        hold(top.x, top.y + 0.15, top.z, FOCUS.capTop, FOCUS.capBottom, id);
+        const s = cv.signPoint?.(id, probe);
+        if (s && Number.isFinite(s.y)) hold(s.x, s.y + 0.42, s.z - 0.22, FOCUS.capTop, FOCUS.capBottom, `${id} sign`);
+      };
+      if (!camp.stations.has?.('hearth')) station('hearth');
+      for (const id of camp.stations.keys()) station(id);
+    }
+    // 3) pad plates (their far edge and the tag row on the near side)
+    const pv = views.pads;
+    if (pv?.plateRect && Array.isArray(camp.pads)) {
+      for (const pad of camp.pads) {
+        const r = pv.plateRect(pad.id);
+        if (!r || !inFrame(r.x, r.z)) continue;
+        hold(r.x, 0.05, r.z - r.hz, FOCUS.capTop, FOCUS.capBottom, pad.id);
+        hold(r.x, 0.05, r.z + r.hz + 0.42, FOCUS.capTop, FOCUS.capBottom, pad.id);
+      }
+    }
+  }
+  function updateFocus(dt) {
+    band.measureT -= dt;
+    if (band.measureT <= 0 || !band.primed) {
+      band.measureT = FOCUS.every;
+      want.hi = band.baseHi; want.lo = band.baseLo;
+      try { measureFocus(); } catch (e) { want.hi = band.baseHi; want.lo = band.baseLo; }
+      band.wantHi = Math.max(band.baseHi, want.hi);
+      band.wantLo = Math.min(band.baseLo, want.lo);
+      band.held = want.n; band.by = want.by;
+    }
+    if (!band.primed || !(dt > 0)) {
+      if (!band.primed) { band.hi = band.wantHi; band.lo = band.wantLo; band.primed = true; }
+    } else {
+      const ease = (cur, to, widen) => cur + (to - cur) * (1 - Math.exp(-(widen ? FOCUS.open : FOCUS.close) * dt));
+      band.hi = ease(band.hi, band.wantHi, band.wantHi > band.hi);
+      band.lo = ease(band.lo, band.wantLo, band.wantLo < band.lo);
+    }
+    pushBand();
+  }
+
   const resize = (w, h) => {
     const pr = renderer.getPixelRatio();
     W = Math.max(1, Math.round(w * pr));
@@ -267,7 +385,13 @@ function createPost(ctx) {
     // blend the tilt-shift + grade tuning between tall portrait (aspect <= 0.6) and landscape (>= 1.2)
     const k = THREE.MathUtils.smoothstep(aspect, 0.6, 1.2);
     const m = key => TILT_TALL[key] + (TILT[key] - TILT_TALL[key]) * k;
-    u.uTilt.value.set(m('focus'), m('band'), m('softTop'), m('softBottom'));
+    band.baseLo = m('focus') - m('band');
+    band.baseHi = m('focus') + m('band');
+    band.softLo = m('softBottom');
+    band.softHi = m('softTop');
+    band.measureT = 0;
+    if (!band.primed) { band.lo = band.wantLo = band.baseLo; band.hi = band.wantHi = band.baseHi; }
+    pushBand();
     u.uTiltMax.value.set(m('maxTop'), m('maxBottom'));
     const gm = key => (GRADE_TALL[key] ?? GRADE[key]) + (GRADE[key] - (GRADE_TALL[key] ?? GRADE[key])) * k;
     u.uSat.value = gm('saturation');
@@ -323,6 +447,13 @@ function createPost(ctx) {
     postScale,
     // the scene buffer: 'RGBA16F' | 'R11F_G11F_B10F' | 'RGBA8', and its MSAA sample count
     get sceneFormat() { return { format: type === THREE.UnsignedInt101111Type ? 'R11F_G11F_B10F' : type === THREE.HalfFloatType ? 'RGBA16F' : 'RGBA8', samples }; },
+    // runs last in main.js's update order, so the camera and the guide are already where this frame has them
+    update(dt) { updateFocus(Math.max(0, Math.min(0.1, Number(dt) || 0))); },
+    // tests: the crisp band now (screen y, 0 bottom .. 1 top), its resting shape and what holds it open
+    focusState() {
+      const b = compMat.uniforms.uBand.value, f = n => +n.toFixed(3);
+      return { lo: f(b.x), hi: f(b.y), softBelow: f(b.z), softAbove: f(b.w), baseLo: f(band.baseLo), baseHi: f(band.baseHi), wantLo: f(band.wantLo), wantHi: f(band.wantHi), held: band.held, by: band.by };
+    },
     render() {
       // view culling of instanced props against the camera as it is now (it moved after props.update)
       ctx.views.props?.prepareRender?.();

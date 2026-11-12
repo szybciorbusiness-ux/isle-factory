@@ -16,17 +16,28 @@ import { hash2, mulberry32 } from '../util/noise.js';
 
 const TREE_VARIANTS = 4, ROCK_VARIANTS = 4;
 
-// Tree fall timeline (seconds) for a fall onto open ground
-// pop: after landing on open ground the log swells and bursts into the logs that fly to the pack (arcade pace:
-// the drops leave ~0.75 s after the final blow instead of waiting for the log to settle)
-const FALL = { antic: 0.1, fall: 0.46, b1: 0.2, b2: 0.12, rest: 0.12, grow: 0.08, shrink: 0.28, lean: 0.075, land: 1.36, bounce1: 0.15, bounce2: 0.05, pop: 0.16, popWater: 0.32, popLean: 0.42 };
+// Tree fall timeline (seconds) for a fall onto open ground. The crown first touches the ground ~0.43 s after the
+// final blow (hit-stop 0.05 + antic + fall) and that is when the logs burst out and fly to the pack (flightDelay):
+// "tree gives logs" reads at once. The felled log bounces, then swells and shrinks away (pop: landing -> vanish).
+const FALL = { antic: 0.08, fall: 0.3, b1: 0.2, b2: 0.12, rest: 0.12, grow: 0.08, shrink: 0.28, lean: 0.075, land: 1.36, bounce1: 0.15, bounce2: 0.05, pop: 0.16, popWater: 0.32, popLean: 0.42, release: -0.03 };
 FALL.tLand = FALL.antic + FALL.fall;
 FALL.tVanish = FALL.tLand + FALL.b1 + FALL.b2 + FALL.rest;
 const WATER_LAND = 1.64;   // a crown over water sinks past the ground angle until it rests on the surface
-const LEAN_MIN = 0.3;      // a tree caught by a neighbour leans at least this much (~73 degrees above ground)
+const LEAN_MIN = 0.5;      // a tree caught by a neighbour leans at least this much (~61 degrees above ground), shoving the neighbour's crown
 const LEAN_MAX = FALL.land - 0.16;
 // rough shapes of buildings a felled tree can lean on: [height, half width]
 const BUILD_SHAPE = { drill: [1.0, 0.4], chest: [0.66, 0.38], workshop: [1.08, 0.44], belt: [0.12, 0.48] };
+// Which way a felled tree falls (planFall): the cheapest of 8 directions. Away from whoever swung is free, toward
+// them costs up to 2; across the screen is free, toward the camera costs `toward`, away from it `away` (from the
+// high camera a tree falling south reads as its crown sliding down the screen with the trunk hidden under it, one
+// falling north barely changes its outline; one falling east / west visibly lies down, trunk and all). So a blow
+// from the north or south tips the tree sideways when that way is open. Diagonals only when the straight ways are
+// blocked. A blocked way (the crown would rest on a neighbour) is taken only when every way is blocked: then the
+// one that lets it fall furthest. `cover`: the felled log would lie on / right next to the swinger (Dug never gets
+// a tree on his feet). `hidden`: per tree standing just in front of (south of) where the crown lands.
+const FALL_PREF = { toward: 1.2, away: 1.3, diag: 0.6, water: 0.04, blocked: 10, cover: 1.5, hidden: 0.05 };
+const STATION_H = 1.1;     // camp stations (sim.blockers tiles) as obstacles: height, tile half width
+const STATION_R = 0.5;
 
 // Hover highlight
 const HOVER = { in: 0.16, out: 0.24, scale: 0.05, pulseHz: 1.15 };
@@ -47,7 +58,8 @@ const RISE = { lead: 0.05, dur: 0.5, from: 0.72, scale0: 0.7 };
 const BRUSH = { dist: 0.9, release: 1.02, cooldown: 0.7, wobble: 0.03 };
 
 const _m = new THREE.Matrix4(), _m2 = new THREE.Matrix4(), _q = new THREE.Quaternion(), _qy = new THREE.Quaternion();
-const _p = new THREE.Vector3(), _v = new THREE.Vector3(), _s = new THREE.Vector3(), _ax = new THREE.Vector3();
+const _qt = new THREE.Quaternion(), _q2 = new THREE.Quaternion();
+const _p = new THREE.Vector3(), _v = new THREE.Vector3(), _s = new THREE.Vector3(), _ax = new THREE.Vector3(), _ax2 = new THREE.Vector3();
 const UP = new THREE.Vector3(0, 1, 0);
 const smooth = t => t * t * (3 - 2 * t);
 
@@ -276,6 +288,7 @@ export function create(ctx) {
   const recs = new Map();      // entity id -> rec (also keeps dying props until their animation ends)
   const active = new Set();    // recs animating this frame
   const falling = new Map();   // tile index -> falling tree rec (for flightDelay / flightOrigin)
+  const fallLog = [];          // test/debug: the last felled trees' plans (views.props.fallLog)
 
   function makeRec(e) {
     const rng = mulberry32((e.x * 73856093) ^ (e.z * 19349663) ^ (e.kind.length * 83492791));
@@ -309,14 +322,18 @@ export function create(ctx) {
     return rec;
   }
 
+  // o.tilt tips the top toward (rec.dirX, rec.dirZ) about the pivot; o.tilt2 adds a tip toward (o.d2x, o.d2z)
+  // (a felled tree blending out of the last blow's wobble when it falls another way)
   function compose(rec, o = {}) {
     const tilt = o.tilt || 0, k = (o.sizeK ?? 1) * rec.scale;
     const sy = o.sy ?? 1, sxz = o.sxz ?? 1;
     _qy.setFromAxisAngle(UP, rec.rot);
     _ax.set(rec.dirZ, 0, -rec.dirX); // rotating +tilt about this axis tips the top toward (dirX, dirZ)
-    _q.setFromAxisAngle(_ax, tilt).multiply(_qy);
+    _qt.setFromAxisAngle(_ax, tilt);
+    if (o.tilt2) { _ax2.set(o.d2z, 0, -o.d2x); _qt.multiply(_q2.setFromAxisAngle(_ax2, o.tilt2)); }
+    _q.copy(_qt).multiply(_qy);
     _p.set(o.pivotX || 0, 0, o.pivotZ || 0);
-    _v.copy(_p).applyAxisAngle(_ax, tilt);
+    _v.copy(_p).applyQuaternion(_qt);
     _s.set(k * sxz, k * sy, k * sxz);
     _m.compose(_v.set(rec.x + _p.x - _v.x + (o.offX || 0), (o.offY || 0) + _p.y - _v.y, rec.z + _p.z - _v.z + (o.offZ || 0)), _q, _s);
     if (o.shrink !== undefined && o.shrink !== 1) {
@@ -510,56 +527,135 @@ export function create(ctx) {
     const b = BUILD_SHAPE[e.kind] || [0.6, 0.4];
     return { r: b[1], y0: 0, y1: b[0], building: e.id };
   }
-  // First tilt angle at which the felled crown touches an obstacle `dist` tiles ahead, or null.
-  function contactTilt(rec, ob, dist) {
-    const g = treeGeo(rec), s = rec.scale, pv = 0.1 * s;
-    const u0 = dist - ob.r, u1 = dist + ob.r;
-    const prof = g.profile;
-    const radiusAt = d => {
-      if (d < g.crownBase * s) return 0.07 * s; // trunk
-      let r = prof[0][1];
-      for (let i = 0; i < prof.length; i++) if (d >= prof[i][0] * s) r = prof[i][1];
-      return r * s * 0.7; // foliage squishes a little before it stops anything
-    };
-    for (let th = 0; th <= FALL.land; th += 0.01) {
-      const sn = Math.sin(th), cs = Math.cos(th);
-      for (let d = 0.15; d <= g.height * s; d += 0.1) {
-        const u = pv - pv * cs + d * sn, y = pv * sn + d * cs;
-        const dx = Math.max(u0 - u, 0, u - u1), dy = Math.max(ob.y0 - y, 0, y - ob.y1);
-        if (dx * dx + dy * dy < radiusAt(d) ** 2) return th;
+  // Everything a felled tree could come to rest on: the props / buildings on the 5x5 tiles around it and the
+  // camp's station footprints (sim.blockers), each a vertical cylinder at its tile centre.
+  function obstaclesAround(rec) {
+    const out = [];
+    for (let oz = -2; oz <= 2; oz++) for (let ox = -2; ox <= 2; ox++) {
+      if (!ox && !oz) continue;
+      const x = rec.x + ox, z = rec.z + oz;
+      if (!map.inBounds(x, z)) continue;
+      const e = sim.at?.(x, z);
+      if (e && e.id !== rec.id) {
+        const ob = obstacleShape(e);
+        if (ob) { ob.cx = x; ob.cz = z; ob.id = e.id; out.push(ob); }
+        continue;
       }
+      if (sim.blockers?.has?.(map.idx(x, z))) out.push({ r: STATION_R, y0: 0, y1: STATION_H, station: true, cx: x, cz: z });
+    }
+    return out;
+  }
+  // First tilt angle at which the felled tree touches obstacle `ob`, which stands `ua` tiles ahead along the fall
+  // axis and `wa` tiles to its side, or null. The obstacle is a vertical cylinder (radius ob.r, y0..y1); the
+  // felled tree a chain of spheres along its axis (trunk, then the crown profile, squished a little).
+  // The felled tree's spheres: distance along the axis and radius (trunk, then the crown profile squished a little,
+  // foliage gives before it stops anything). One set per plan.
+  function fallSamples(rec) {
+    const g = treeGeo(rec), s = rec.scale, prof = g.profile;
+    const H = g.height * s, ds = [], rs = [];
+    for (let d = 0.15; d <= H; d += 0.1) {
+      let r = 0.07 * s; // trunk
+      if (d >= g.crownBase * s) { r = prof[0][1]; for (let i = 0; i < prof.length; i++) if (d >= prof[i][0] * s) r = prof[i][1]; r *= s * 0.7; }
+      ds.push(d); rs.push(r);
+    }
+    return { ds, rs, H, pv: 0.1 * s, rMax: g.crownR * s * 0.7 };
+  }
+  // First tilt angle below `upTo` at which the felled tree touches obstacle `ob`, which stands `ua` tiles ahead
+  // along the fall axis and `wa` tiles to its side, or null. The obstacle is a vertical cylinder (radius ob.r,
+  // y0..y1). Coarse sweep, then refined to 0.01 rad.
+  function contactTilt(S, ob, ua, wa, upTo = FALL.land) {
+    const { ds, rs, H, pv, rMax } = S;
+    if (wa - ob.r >= rMax || ua + ob.r + rMax <= 0 || ua - ob.r - rMax >= H + pv) return null;
+    const touches = th => {
+      const sn = Math.sin(th), cs = Math.cos(th);
+      for (let i = 0; i < ds.length; i++) {
+        const u = pv - pv * cs + ds[i] * sn, y = pv * sn + ds[i] * cs;
+        const dh = Math.max(0, Math.hypot(u - ua, wa) - ob.r), dy = Math.max(ob.y0 - y, 0, y - ob.y1);
+        if (dh * dh + dy * dy < rs[i] * rs[i]) return true;
+      }
+      return false;
+    };
+    const STEP = 0.04;
+    for (let th = 0; th <= upTo + STEP; th += STEP) {
+      if (!touches(th)) continue;
+      for (let f = Math.max(0, th - STEP + 0.01); f < th; f += 0.01) if (touches(f)) return f < upTo ? f : null;
+      return th < upTo ? th : null;
     }
     return null;
   }
-  function planFall(rec) {
-    const dx = rec.dirX, dz = rec.dirZ;
-    let best = null;
-    for (const dist of [1, 2]) {
-      const e = sim.at?.(rec.x + dx * dist, rec.z + dz * dist);
-      if (!e || e.id === rec.id) continue;
-      const ob = obstacleShape(e);
-      if (!ob) continue;
-      const th = contactTilt(rec, ob, dist);
-      if (th !== null && th < LEAN_MAX && (!best || th < best.th)) best = { th, ob, e };
+  // Which way a felled tree falls and how far (see FALL_PREF). (hdx, hdz) = the blow's direction; (hx, hz) = where
+  // the swinger stood (null: unknown, the blow's direction stands in). Returns the chosen direction, the mode
+  // ('ground' | 'water' | 'lean') and the resting tilt. opts.onlyHit = the old rule (fall along the blow only).
+  const S2 = Math.SQRT1_2;
+  const FALL_DIRS = [[1, 0], [0, 1], [-1, 0], [0, -1], [S2, S2], [-S2, S2], [-S2, -S2], [S2, -S2]];
+  function planFall(rec, hdx, hdz, hx = null, hz = null, { onlyHit = false } = {}) {
+    let ax = hdx, az = hdz;
+    if (hx != null && hz != null) {
+      const vx = rec.x - hx, vz = rec.z - hz, d = Math.hypot(vx, vz);
+      if (d > 0.2) { ax = vx / d; az = vz / d; }
     }
-    if (best) return { mode: 'lean', land: Math.max(LEAN_MIN, best.th), ob: best.ob, obId: best.e.id };
-    const water = !isGround(rec.x + dx, rec.z + dz);
-    return { mode: water ? 'water' : 'ground', land: water ? WATER_LAND : FALL.land };
+    const obs = obstaclesAround(rec);
+    const S = fallSamples(rec);
+    const reach = S.H + 0.2;
+    let best = null;
+    for (const [dx, dz] of onlyHit ? [[hdx, hdz]] : FALL_DIRS) {
+      // everything but the obstacles first: a way that can't beat the best even unblocked skips the contact sweeps
+      let cost = (1 - (dx * ax + dz * az)) + (dz > 0 ? FALL_PREF.toward * dz : -FALL_PREF.away * dz) + (dx && dz ? FALL_PREF.diag : 0);
+      if (hx != null && hz != null) {
+        const rx = hx - rec.x, rz = hz - rec.z, u = rx * dx + rz * dz, w = Math.abs(rx * dz - rz * dx);
+        if (u > -0.2 && u < reach) cost += FALL_PREF.cover * clamp((0.95 - w) / 0.2);
+      }
+      // tall trees one row nearer the camera than the landing crown hide it
+      for (const k of [1, 2]) {
+        const lx = Math.round(rec.x + dx * k), lz = Math.round(rec.z + dz * k) + 1;
+        if (lx === rec.x && lz === rec.z) continue;
+        if (sim.at?.(lx, lz)?.kind === 'tree') cost += FALL_PREF.hidden;
+      }
+      if (best && cost >= best.cost - 1e-6) continue;
+      let block = null;
+      for (const ob of obs) {
+        const rx = ob.cx - rec.x, rz = ob.cz - rec.z;
+        const th = contactTilt(S, ob, rx * dx + rz * dz, Math.abs(rx * dz - rz * dx), block ? block.th : LEAN_MAX);
+        if (th !== null) block = { th, ob };
+      }
+      const water = !block && !isGround(rec.x + dx, rec.z + dz);
+      if (water) cost += FALL_PREF.water;
+      if (block) cost += FALL_PREF.blocked + (LEAN_MAX - block.th) * 2;
+      if (!best || cost < best.cost - 1e-6) best = { dx, dz, block, water, cost };
+    }
+    const { dx, dz, block, water } = best;
+    if (block) return { dx, dz, mode: 'lean', land: Math.max(LEAN_MIN, block.th), th0: block.th, ob: block.ob, obId: block.ob.id ?? null };
+    return { dx, dz, mode: water ? 'water' : 'ground', land: water ? WATER_LAND : FALL.land };
   }
 
   // ---------------- reactions ----------------
   // Who swung at what: camp:swing lands `hitIn` s later as resource:hit. Only the player's blows shake the camera.
+  // Where the swinger stood is kept too: a felled tree falls away from them (planFall).
   let clock = 0;
-  const swingBy = new Map(); // entity id -> { by, t }
+  const swingBy = new Map(); // entity id -> { by, t, hx, hz }
+  const _hp = new THREE.Vector3();
+  function playerXZ() {
+    let p = null;
+    try { p = views.player?.getPosition?.(_hp) || null; } catch { p = null; }
+    if (p && Number.isFinite(p.x) && Number.isFinite(p.z)) return [p.x, p.z];
+    return sim.player ? [sim.player.wx ?? sim.player.x, sim.player.wz ?? sim.player.z] : null;
+  }
   function onSwing({ by, target }) {
     if (target?.type !== 'resource' || target.id == null) return;
-    swingBy.set(target.id, { by, t: clock });
+    let at = null;
+    if (by === 'player') at = playerXZ();
+    else { const w = ctx.camp?.workers?.get?.(by); if (w && Number.isFinite(w.x)) at = [w.x, w.z]; }
+    swingBy.set(target.id, { by, t: clock, hx: at?.[0] ?? null, hz: at?.[1] ?? null });
   }
-  function hitByPlayer(id) {
+  // -> { byPlayer, hx, hz } for the blow landing on `id` now
+  function takeSwing(id) {
     const s = swingBy.get(id);
     swingBy.delete(id);
-    if (s) return s.by === 'player' && clock - s.t < 1.5;
-    return !ctx.camp; // the sandbox: every hit is the player's (Space / click)
+    if (s && clock - s.t < 1.5) return { byPlayer: s.by === 'player', hx: s.hx, hz: s.hz };
+    if (s) return { byPlayer: false, hx: null, hz: null };
+    if (ctx.camp) return { byPlayer: false, hx: null, hz: null };
+    const at = playerXZ(); // the sandbox: every hit is the player's (Space / click)
+    return { byPlayer: true, hx: at?.[0] ?? null, hz: at?.[1] ?? null };
   }
   // A regrowing prop that gets chopped / removed mid-growth keeps its current size (never pops to full).
   function bakeGrow(rec) {
@@ -575,7 +671,9 @@ export function create(ctx) {
     if (!rec || rec.dead) return;
     const [dx, dz] = dirOf(fromDir);
     rec.dirX = dx; rec.dirZ = dz;
-    const byPlayer = hitByPlayer(entity.id);
+    const sw = takeSwing(entity.id);
+    const byPlayer = sw.byPlayer;
+    rec.hx = sw.hx; rec.hz = sw.hz;
     if (!live) return;
     const final = !(hp > 0);
     rec.byPlayer = byPlayer;
@@ -654,8 +752,9 @@ export function create(ctx) {
     const [dx, dz] = dirOf(fromDir);
     if (!rec) { if (replacedBy) addResource(replacedBy); return; }
     bakeGrow(rec);
+    // the fall blends out of the current wobble (about the blow's direction) instead of snapping upright
+    rec.tilt0 = rec.wob.value;
     rec.dirX = dx; rec.dirZ = dz;
-    rec.tilt0 = rec.wob.value; // the fall blends out of the current wobble instead of snapping upright
     rec.dead = true;
     rec.hovTarget = 0;
     recs.delete(entity.id); // the id is gone from the sim; the rec lives on in `active` until it finishes
@@ -666,12 +765,16 @@ export function create(ctx) {
       return;
     }
     if (rec.kind === 'tree') {
-      const plan = planFall(rec);
+      let plan;
+      try { plan = planFall(rec, dx, dz, rec.hx, rec.hz); } catch (err) { console.error('[props] planFall', err); plan = { dx, dz, mode: 'ground', land: FALL.land }; }
+      rec.dirX = plan.dx; rec.dirZ = plan.dz;
       const fallDur = plan.mode === 'lean' ? Math.max(0.2, FALL.fall * Math.sqrt(plan.land / FALL.land)) : FALL.fall * (plan.mode === 'water' ? 1.06 : 1);
       const tLand = FALL.antic + fallDur;
       const tVanish = tLand + (plan.mode === 'lean' ? FALL.popLean : plan.mode === 'water' ? FALL.popWater : FALL.pop);
-      rec.fall = { t: 0, ...plan, fallDur, tLand, tVanish, tEnd: tVanish + FALL.grow + FALL.shrink, landed: false, bounced: false, vanished: false, tilt: 0 };
+      rec.fall = { t: 0, ...plan, hdx: dx, hdz: dz, fallDur, tLand, tVanish, tEnd: tVanish + FALL.grow + FALL.shrink, landed: false, bounced: false, vanished: false, tilt: 0 };
       falling.set(map.idx(rec.x, rec.z), rec);
+      fallLog.push({ t: +clock.toFixed(2), x: rec.x, z: rec.z, hit: [dx, dz], dir: [+plan.dx.toFixed(3), +plan.dz.toFixed(3)], mode: plan.mode, land: +plan.land.toFixed(3), byPlayer: !!rec.byPlayer, from: rec.hx != null ? [+rec.hx.toFixed(2), +rec.hz.toFixed(2)] : null });
+      if (fallLog.length > 64) fallLog.shift();
       rec.shiver = 0.6;
       if (replacedBy) addResource(replacedBy, { appear: true, delay: FALL.antic + 0.1 });
     } else {
@@ -721,10 +824,14 @@ export function create(ctx) {
     const t = f.t, s = rec.scale;
     const pivot = 0.1 * s;
     const L = f.land, tLand = f.tLand;
-    let tilt;
-    // knocked pose of the last blow, blending into the anticipation lean
-    if (t < FALL.antic) tilt = lerp(rec.tilt0 || 0, -FALL.lean, ease.sineOut(t / FALL.antic));
-    else if (t < tLand) { const k = (t - FALL.antic) / f.fallDur; tilt = lerp(-FALL.lean, L, 0.2 * k + 0.8 * k * k); }
+    let tilt, tilt2 = 0;
+    // knocked pose of the last blow (about the blow's direction), blending into the anticipation lean (about the
+    // fall's direction, which may differ when the blow's way is blocked)
+    if (t < FALL.antic) {
+      const k = ease.sineOut(t / FALL.antic);
+      tilt = lerp(0, -FALL.lean, k);
+      tilt2 = (rec.tilt0 || 0) * (1 - k);
+    } else if (t < tLand) { const k = (t - FALL.antic) / f.fallDur; tilt = lerp(-FALL.lean, L, 0.3 * k + 0.7 * k * k); }
     else if (f.mode === 'lean') {
       // knocked back a little by the neighbour, then settles against it in smaller and smaller bounces
       const tau = t - tLand;
@@ -749,7 +856,7 @@ export function create(ctx) {
         const o = f.ob?.rec;
         if (o && !o.dead) {
           o.dirX = dx; o.dirZ = dz;
-          o.wob.hit(o.kind === 'tree' ? 0.07 : 0.025);
+          o.wob.hit(o.kind === 'tree' ? 0.06 + 0.12 * clamp((LEAN_MIN + 0.05 - (f.th0 ?? f.land)) / 0.3) : 0.025);
           if (o.kind === 'tree') o.shiver = Math.max(o.shiver, 0.9);
           o.sq.kick(-0.8);
           active.add(o);
@@ -796,7 +903,7 @@ export function create(ctx) {
     const sy = rec.sq.value;
     writeRec(rec, {
       tilt, pivotX: dx * pivot, pivotZ: dz * pivot, sy, sxz: 1 / Math.sqrt(Math.max(0.4, sy)),
-      shrink, shrinkAt,
+      shrink, shrinkAt, tilt2, d2x: f.hdx ?? dx, d2z: f.hdz ?? dz,
     });
     return t < f.tEnd;
   }
@@ -1071,10 +1178,11 @@ export function create(ctx) {
   return {
     meshFor: id => recs.get(id)?.handle || null,
     hitPoint,
-    // Seconds fx should wait before flying drops from tile (x, z): lets a falling tree land first.
+    // Seconds fx should wait before flying drops from tile (x, z): a felled tree's logs burst out the moment its
+    // crown first touches the ground (or the water, or the neighbour it leans on), hit-stop included.
     flightDelay(x, z) {
       const rec = map.inBounds(x, z) ? falling.get(map.idx(x, z)) : null;
-      if (rec?.fall) return Math.max(0, rec.fall.tVanish + 0.03 - rec.fall.t);
+      if (rec?.fall) return Math.max(0, Math.max(0, rec.stop || 0) + rec.fall.tLand + FALL.release - rec.fall.t);
       return 0.05;
     },
     // Where the n-th of `count` drops from tile (x, z) starts its flight (along a fallen log, or the tile).
@@ -1083,7 +1191,14 @@ export function create(ctx) {
       if (rec?.fall) {
         const len = fallLen(rec);
         const k = count > 1 ? i / (count - 1) : 0.5;
-        const o = alongAxis(rec, lerp(0.25, 1.45, k) * len, rec.fall.land);
+        const d = lerp(0.25, 1.45, k) * len, L = rec.fall.land;
+        const o = alongAxis(rec, d, L);
+        // start just under the felled crown's top surface (not its middle), so the logs burst visibly out of it
+        // the moment it lands instead of hiding inside the foliage for their whole hop
+        const g = treeGeo(rec), s = rec.scale;
+        let lift = 0.06 * s;
+        if (d >= g.crownBase * s) { let r = g.profile[0][1]; for (const [py, pr] of g.profile) if (d >= py * s) r = pr; lift = r * s * 0.7; }
+        o.y += lift * Math.sin(Math.min(L, Math.PI / 2));
         o.y = Math.max(o.y, rec.fall.mode === 'water' ? WATER_Y + 0.15 : 0.25);
         return o;
       }
@@ -1101,7 +1216,20 @@ export function create(ctx) {
     setHover(id) { hoverExplicit = true; applyHover(id); },
     get hoverId() { return hoverId; },
     // test/debug snapshot of felled trees in progress (tilt in radians from upright)
-    get falling() { return [...falling.values()].map(r => ({ x: r.x, z: r.z, mode: r.fall?.mode, land: r.fall?.land, tilt: r.fall?.tilt, t: r.fall?.t })); },
+    get falling() { return [...falling.values()].map(r => ({ x: r.x, z: r.z, mode: r.fall?.mode, land: r.fall?.land, tilt: r.fall?.tilt, t: r.fall?.t, dir: [r.dirX, r.dirZ], tLand: r.fall?.tLand })); },
+    // test/debug: the last felled trees' plans { t, x, z, hit: [dx, dz], dir: [dx, dz], mode, land, byPlayer }
+    get fallLog() { return fallLog.slice(); },
+    // test/debug: the fall-direction weights (FALL_PREF), live and mutable for tuning
+    _fallPref: FALL_PREF,
+    // test/debug: how the tree with this id would fall if hit from fromDir by someone standing at (hx, hz)
+    // (no side effects); opts.onlyHit = the old rule (along the blow only)
+    planFallFor(id, fromDir, hx = null, hz = null, opts) {
+      const rec = recs.get(id);
+      if (!rec || rec.kind !== 'tree' || rec.dead) return null;
+      const [dx, dz] = dirOf(fromDir);
+      const p = planFall(rec, dx, dz, hx, hz, opts);
+      return { dir: [+p.dx.toFixed(3), +p.dz.toFixed(3)], mode: p.mode, land: +p.land.toFixed(3), ob: p.ob ? [p.ob.cx, p.ob.cz] : null };
+    },
     // test/debug: the live animation record of a prop
     _rec: id => recs.get(id) || null,
     // test/debug: props regrowing / sinking right now

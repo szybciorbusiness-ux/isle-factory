@@ -8,7 +8,8 @@
 //        └ tilt (lean / bank, pivot on the ground) └ hop (bounce) └ squash (scale, pivot at the ground)
 //            ├ hipL, hipR (markers the legs attach to)
 //            └ upper (rotation.y = upper-body twist)
-//                ├ body (plum pear + overalls + snout + buckles), face decal (eyes, brows, whiskers)
+//                ├ body (plum pear, nose, buckles), overalls (cream cloth: trousers, bib, straps, muzzle),
+//                │      face decal (eyes, brows, whiskers)
 //                ├ helmet (dome, brim, ridges, hose socket) ─ lampMount ─ antenna (bracket, springy) ─ antJoint
 //                │      (lamp head, springy) ─ bulb (lens centre; the glow sprite follows it)
 //                ├ pack (pivot at the canister's top centre) ─ packMesh (canister + hose + valve), pipeTip (valve)
@@ -17,6 +18,11 @@
 // Mapping onto the robot's rig: the headlamp is the antenna bulb (the antenna springs drive a small, damped
 // wobble of the lamp on its bracket), the visor glow is an extra lamp flare when he faces the camera, the screen,
 // bezel, band and gauge are harmless stand-ins, and the axe / pickaxe / club are empty: the shovels do the work.
+//
+// Read from the 58° game camera: the head is tipped back (HEAD_TIP) with a short-brimmed helmet sitting back on
+// the crown, the face bulges forward, and the eyes, brows, muzzle and nose are oversized, so his stern face shows
+// in every walking direction instead of a hat. The overalls use their own cloth material (a full warm fill and a
+// soft light floor) so they stay cream under the green bounce light.
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { createDugFace } from './dug-face.js';
@@ -31,8 +37,16 @@ export const ARM_SPLAY = 0.1;     // the arms hang this far out (rad), after und
 export const ARM_FWD = 0.2;       // ... and this far forward of player.js's pose: the shovels rest in front of the thighs
 const PLAYER_ARM_TILT = 0.36;     // player.js sets armR.rotation.x = +0.36, armL = -0.36 (cancelled, see the arms)
 const BLADE_YAW = 0.65;           // shovel faces point this far (rad) outward from straight ahead
-export const HELMET = { x: -0.02, y: 0.5, tilt: 0.22, rx: 0.167, ry: 0.168, rz: 0.177, brim: 0.205, frontTrim: 0.11 };
-const HEAD_FWD = 0.012;           // the head sits a touch forward of the belly (face closer to the brim edge)
+// The helmet in the untipped head frame (the head tip below turns it back with the head). It sits a little back
+// and high on the crown with a short brim, so from the high game camera the stern face shows in front of it.
+export const HELMET = { x: -0.04, y: 0.516, tilt: 0.08, rx: 0.158, ry: 0.16, rz: 0.168, brim: 0.182, frontTrim: 0.14 };
+const HEAD_FWD = 0.04;            // the face bulges forward of the belly (eyes out in front of the brim edge)
+// Head tip: everything above the shoulders turns back about a pivot in the "neck", so the face looks up toward
+// the 58° game camera and the helmet leans back off the brows. Smooth weight by height: the belly, straps and
+// shoulders stay put, the head turns rigidly.
+export const HEAD_TIP = 0.27;     // rad (~15°)
+const TIP_PIVOT = { x: -0.03, y: 0.37 };
+const TIP_Y0 = 0.36, TIP_Y1 = 0.46;
 export const PACK_PIVOT = new THREE.Vector3(-0.252, 0.424, 0);         // canister top centre (hose base)
 export const PIPE_TIP = new THREE.Vector3(-0.014, 0.052, -0.07);      // valve on the canister top, in pack space
 export const PACK_TOP = new THREE.Vector3(-0.012, 0.012, 0);          // lid top centre, in pack space (stack.js sets the column BACK behind it, clear of the hose)
@@ -40,9 +54,9 @@ export const HEIGHT = 0.72;       // lamp top above the ground
 
 export const COLORS = {
   fur: '#5d2829', furLight: '#7b3a39', furDark: '#43191b', sole: '#3b1517',
-  muzzle: '#f4dcb2', nose: '#e8766a',
+  muzzle: '#f4dcb2', nose: '#f2705f',
   helmet: '#fb8b2e', helmetLip: '#c35f1c', lampHousing: '#8e5433', lampRim: '#5c3322', lens: '#ffd34d', lensCore: '#fff3c4',
-  overalls: '#fbe0ab', overallsShade: '#dcbc86', buckle: '#f08a3a', buckleDark: '#bd5a1c',
+  overalls: '#ffebc2', overallsShade: '#ebcf9c', buckle: '#f08a3a', buckleDark: '#bd5a1c',
   blade: '#cdb39d', bladeDark: '#ad9785', bladeWorn: '#f4e5c6', cuff: '#a2867a',
   copper: '#d2663b', copperBand: '#9c472a', copperLight: '#ea8c55',
 };
@@ -123,6 +137,31 @@ function shiftHead(geo) {
   for (let i = 0; i < p.count; i++) p.setX(i, p.getX(i) + headShift(p.getY(i)));
   return geo;
 }
+// The head tip (see HEAD_TIP): the angle for a point at (untipped) height y, and the tip applied to a point,
+// or to a whole geometry (positions and normals turn by the same angle about +z, the lateral axis).
+export const tipAngle = y => HEAD_TIP * smooth01(TIP_Y0, TIP_Y1, y);
+export function tipPoint(v) {
+  const a = tipAngle(v.y), c = Math.cos(a), s = Math.sin(a);
+  const dx = v.x - TIP_PIVOT.x, dy = v.y - TIP_PIVOT.y;
+  v.x = TIP_PIVOT.x + dx * c - dy * s; v.y = TIP_PIVOT.y + dx * s + dy * c;
+  return v;
+}
+function tipHead(geo) {
+  const p = geo.attributes.position, n = geo.attributes.normal;
+  const v = new THREE.Vector3();
+  for (let i = 0; i < p.count; i++) {
+    v.set(p.getX(i), p.getY(i), p.getZ(i));
+    const a = tipAngle(v.y);
+    if (a <= 1e-6) continue;
+    const c = Math.cos(a), s = Math.sin(a);
+    tipPoint(v);
+    p.setXYZ(i, v.x, v.y, v.z);
+    if (n) { const nx = n.getX(i), ny = n.getY(i); n.setXY(i, nx * c - ny * s, nx * s + ny * c); }
+  }
+  p.needsUpdate = true;
+  if (n) n.needsUpdate = true;
+  return geo;
+}
 
 // A rounded-rectangle patch lying on the body (superellipse corners), centred at angle a0, height yc.
 // UVs run left-to-right as seen by someone facing that spot, so a texture reads correctly.
@@ -188,25 +227,29 @@ function radialTexture(stops, size = 64) {
 // Toon Lambert (or a soft Phong for the helmet and copper) under the scene's own lights, plus two character
 // touches: a warm rim (as the robot's ceramic has) so the dark plum separates from the grass, and a warm fill
 // that half-neutralises the green hemisphere bounce, so cream overalls stay cream on the shaded sides.
+// warm: how much of the (green) hemisphere fill is replaced by its warm-neutral luminance; lift: extra fill
+// irradiance (a soft floor, so a pale cloth keeps its value on the shaded sides instead of going khaki).
 const WARM_FILL = 0.6;
-function toonMaterial({ phong = false, rim = '#ffe2c4', rimStrength = 0.24, rimPower = 2.6, shininess = 30, specular = '#3c3024', ...extra } = {}) {
+function toonMaterial({ phong = false, rim = '#ffe2c4', rimStrength = 0.24, rimPower = 2.6, shininess = 30, specular = '#3c3024',
+  warm = WARM_FILL, warmTint = [1.07, 0.99, 0.9], lift = 0, ...extra } = {}) {
   const opts = { vertexColors: !extra.map, ...extra };
   const m = phong ? new THREE.MeshPhongMaterial({ ...opts, shininess, specular: new THREE.Color(specular) }) : new THREE.MeshLambertMaterial(opts);
   const uRim = { value: new THREE.Color(rim).multiplyScalar(rimStrength) };
+  const f = v => Number(v).toFixed(3);
   m.onBeforeCompile = sh => {
     sh.uniforms.uRim = uRim;
     sh.fragmentShader = sh.fragmentShader
       .replace('void main() {', 'uniform vec3 uRim;\nvoid main() {')
       .replace('#include <lights_fragment_end>', // (irradiance is still light only here: the albedo comes after)
         `{ float l = dot(irradiance, vec3(0.299, 0.587, 0.114));
-           irradiance = mix(irradiance, l * vec3(1.07, 0.99, 0.9), ${WARM_FILL.toFixed(2)}); }
+           irradiance = mix(irradiance, l * vec3(${warmTint.map(f).join(', ')}), ${f(warm)}) + vec3(${f(lift)}); }
          #include <lights_fragment_end>`)
       .replace('#include <opaque_fragment>',
         `{ float fres = pow(1.0 - clamp(dot(normal, normalize(vViewPosition)), 0.0, 1.0), ${rimPower.toFixed(2)});
            outgoingLight += uRim * fres * (0.55 + 0.45 * normal.y); }
          #include <opaque_fragment>`);
   };
-  m.customProgramCacheKey = () => `dug-toon-${phong ? 'p' : 'l'}-${rimPower}-${rimStrength}`;
+  m.customProgramCacheKey = () => `dug-toon-${phong ? 'p' : 'l'}-${rimPower}-${rimStrength}-${f(warm)}-${warmTint.map(f).join('/')}-${f(lift)}`;
   return m;
 }
 
@@ -256,15 +299,22 @@ function bodyGeometry() {
     buckles.push(paint(onSurface(place(new THREE.BoxGeometry(0.058, 0.016, 0.054), { y: 0.008 }), 31 * s, 0.318, 0.006), C.buckle, (x, y) => 0.95 + (y - 0.3)));
     buckles.push(paint(onSurface(place(new THREE.BoxGeometry(0.03, 0.008, 0.027), { y: 0.016 }), 31 * s, 0.318, 0.006), C.buckleDark));
   }
-  // snout: a long tapered cream muzzle pointing forward and a touch up, ending in a round coral nose
-  const SN = { y: 0.42, tilt: 0.27, len: 0.14 };
+  // snout: a long tapered cream muzzle pointing forward and a touch up (the head tip lifts it a little more),
+  // ending in a big round coral nose. Chunky enough to read from the game camera in every walking direction.
+  const SN = { y: 0.395, tilt: 0.02, len: 0.135, r: 1.22 };
   const snoutPts = [[0.0005, 0], [0.06, 0.0], [0.067, 0.026], [0.063, 0.058], [0.052, 0.09], [0.038, 0.116], [0.024, 0.133], [0.0005, 0.14]]
-    .map(([r, t]) => new THREE.Vector2(r, t));
-  const baseX = bodyRadiusAt(SN.y) + headShift(SN.y) - 0.03;
-  const snout = paint(place(new THREE.LatheGeometry(snoutPts, 12), { x: baseX, y: SN.y, rz: -(Math.PI / 2 - SN.tilt) }), C.muzzle, (x, y) => 0.88 + 1.4 * (y - SN.y + 0.03));
+    .map(([r, t]) => new THREE.Vector2(r * SN.r, (t * SN.len) / 0.14));
+  const baseX = bodyRadiusAt(SN.y) + headShift(SN.y) - 0.034;
+  const snout = paint(place(new THREE.LatheGeometry(snoutPts, 14), { x: baseX, y: SN.y, rz: -(Math.PI / 2 - SN.tilt) }), C.muzzle, (x, y) => 0.9 + 1.3 * (y - SN.y + 0.03));
   const tip = new THREE.Vector3(Math.cos(SN.tilt) * SN.len, Math.sin(SN.tilt) * SN.len, 0).add(new THREE.Vector3(baseX, SN.y, 0));
-  const nose = paint(place(new THREE.SphereGeometry(0.035, 10, 7), { x: tip.x - 0.007, y: tip.y + 0.002, sx: 0.85, sy: 0.92 }), C.nose, (x, y) => 0.9 + 3 * (y - tip.y + 0.02));
-  return merge([fur, trousers, waistSeam, bib, bibSeam, back, pocket, pocketTop, ...sidePockets, ...cuffs, ...straps, ...buckles, snout, nose]);
+  const nose = paint(place(new THREE.SphereGeometry(0.047, 12, 8), { x: tip.x - 0.006, y: tip.y + 0.004, sx: 0.88, sy: 0.92 }), C.nose, (x, y) => 0.92 + 2.6 * (y - tip.y + 0.02));
+  // a soft highlight on the top of the nose (it faces the high camera)
+  const noseHi = paint(place(new THREE.SphereGeometry(0.013, 6, 4), { x: tip.x + 0.006, y: tip.y + 0.04, z: -0.012, sx: 1, sy: 0.55 }), '#ffc0b0');
+  return {
+    fur: tipHead(merge([fur, ...buckles, nose, noseHi])),
+    // (the muzzle is cream too: in the cloth material it stays cream instead of going grey in its own shade)
+    cream: tipHead(merge([trousers, waistSeam, bib, bibSeam, back, pocket, pocketTop, ...sidePockets, ...cuffs, ...straps, snout])),
+  };
 }
 
 // Shrink a helmet-frame geometry's radius toward the front (the brim is shorter over the face, so the stern
@@ -301,11 +351,14 @@ function helmetGeometry() {
   const brim = paint(trimFront(place(new THREE.LatheGeometry(brimPts, 26), { sz: H.rz / H.rx }), H.frontTrim), C.helmet, (x, y) => (y < -0.009 ? 0.72 : 0.92 + 3 * y));
   const lip = paint(trimFront(place(new THREE.TorusGeometry(R, 0.0075, 3, 26), { y: -0.013, rx: Math.PI / 2, sy: H.rz / H.rx }), H.frontTrim), C.helmetLip);
   // hose socket on the back of the dome (the hose from the canister plugs in here)
-  const sock = helmetSurface(Math.PI, 0.3);
+  const sock = helmetSurface(Math.PI, SOCKET_ELEV);
   const socket = paint(placeAlong(new THREE.CylinderGeometry(0.025, 0.028, 0.03, 10), sock.p, sock.n, 0.01), C.copperBand);
   const socketRing = paint(placeAlong(new THREE.CylinderGeometry(0.03, 0.03, 0.01, 10), sock.p, sock.n, 0.022), C.copperLight);
   return merge([dome, ...ridges, brim, lip, socket, socketRing]);
 }
+// The hose socket on the back of the dome (elevation in the helmet frame: high enough that the tipped-back
+// helmet still shows it above the brim, where the hose from the canister plugs in).
+const SOCKET_ELEV = 0.72;
 // Point + outward normal on the helmet dome: yaw around +y (0 = front), elevation 0..pi/2.
 function helmetSurface(yaw, elev) {
   const H = HELMET;
@@ -359,10 +412,13 @@ function packGeometry() {
 }
 // The helmet socket's mouth, expressed in pack space (pack pivot = PACK_PIVOT, unrotated).
 function hoseEndInPack() {
-  const H = HELMET, s = helmetSurface(Math.PI, 0.3);
-  const p = s.p.clone().addScaledVector(s.n, 0.03).applyAxisAngle(new THREE.Vector3(0, 0, 1), H.tilt).add(new THREE.Vector3(H.x, H.y, 0));
-  return p.sub(PACK_PIVOT);
+  const s = helmetSurface(Math.PI, SOCKET_ELEV);
+  return helmetToBody(s.p.clone().addScaledVector(s.n, 0.03)).sub(PACK_PIVOT);
 }
+// The helmet group's placement in the body frame: tilted on the head, then turned back with the (fully tipped) head.
+const HELMET_POS = tipPoint(new THREE.Vector3(HELMET.x, HELMET.y, 0));
+const HELMET_ROT = HELMET.tilt + tipAngle(HELMET.y);
+function helmetToBody(p) { return p.applyAxisAngle(new THREE.Vector3(0, 0, 1), HELMET_ROT).add(HELMET_POS); }
 
 function armGeometry() {
   // one chunky plum sausage from the shoulder down into the glove's cuff (runs along -y from the pivot)
@@ -454,26 +510,31 @@ export function buildDug(P) { // eslint-disable-line no-unused-vars
   shadow.renderOrder = 1;
   root.add(shadow);
 
-  // body: fur, overalls, snout
-  const body = mesh(bodyGeometry());
+  // body: fur + snout, and the overalls in their own cream cloth (a full warm fill and a soft floor, so they
+  // read cream like the sheet instead of khaki under the green bounce light)
+  const bodyGeo = bodyGeometry();
+  const body = mesh(bodyGeo.fur);
   body.receiveShadow = true;
   upper.add(body);
+  const cloth = toonMaterial({ warm: 1, warmTint: [1.0, 1.0, 1.02], lift: 1.3, rimStrength: 0.2 });
+  const overalls = mesh(bodyGeo.cream, cloth);
+  overalls.receiveShadow = true;
+  upper.add(overalls);
 
-  // face decal: eyes, brows, whiskers on the front of the head
-  const FACE = { yc: 0.474, halfA: 66, halfH: 0.065 };
+  // face decal: eyes, brows, whiskers on the front of the head (tipped back with the head)
+  const FACE = { yc: 0.468, halfA: 74, halfH: 0.082 };
   const R0 = bodyRadiusAt(FACE.yc);
   const face = createDugFace({ arcW: 2 * THREE.MathUtils.degToRad(FACE.halfA) * R0, arcH: 2 * FACE.halfH });
   const decalMat = toonMaterial({ rimStrength: 0, map: face.texture, transparent: true, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 });
-  const faceDecal = mesh(surfacePatch({ yc: FACE.yc, halfA: FACE.halfA, halfH: FACE.halfH, off: 0.0015, p: 10, nu: 16, nv: 4 }), decalMat, false);
+  const faceDecal = mesh(tipHead(surfacePatch({ yc: FACE.yc, halfA: FACE.halfA, halfH: FACE.halfH, off: 0.0015, p: 10, nu: 20, nv: 6 })), decalMat, false);
   faceDecal.receiveShadow = true;
   faceDecal.renderOrder = 2;
   upper.add(faceDecal);
 
-  // helmet (tilted back) with the headlamp on a springy bracket at the front
-  const H = HELMET;
+  // helmet (tilted back with the head) with the headlamp on a springy bracket at the front
   const helmetGroup = new THREE.Group();
-  helmetGroup.position.set(H.x, H.y, 0);
-  helmetGroup.rotation.z = H.tilt;
+  helmetGroup.position.copy(HELMET_POS);
+  helmetGroup.rotation.z = HELMET_ROT;
   const helmet = mesh(helmetGeometry(), gloss);
   helmet.receiveShadow = true;
   helmetGroup.add(helmet);
@@ -599,7 +660,7 @@ export function buildDug(P) { // eslint-disable-line no-unused-vars
     hipL, hipR, legL, legR, footL, footR, antenna, antJoint, bulb, bulbMat, bulbGlow,
     pack, packMesh, gaugeBars, gaugeMat, pipeTip, armL, armR, handL, handR, tool, tools: { axe, pickaxe, club },
     // Dug extras
-    helmet: helmetGroup, lamp: lampHead, faceDecal, packTop,
+    helmet: helmetGroup, lamp: lampHead, faceDecal, packTop, overalls, clothMat: cloth,
   };
 }
 

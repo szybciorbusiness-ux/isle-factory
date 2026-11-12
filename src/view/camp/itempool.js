@@ -1,5 +1,6 @@
 // Instanced item pools: one InstancedMesh per item id holds every camp item of that type (line riders,
 // pile stacks, station input buffers, zone icons, hops in flight). Rebuilt every frame: begin(), push(), end().
+// push(id, matrix, tint?) takes an optional per-instance tint (piles shade their lower, inner items).
 // Geometry and material come from views.items (every camp item has a real model there); a plain rounded cube
 // only if items.js failed to load.
 import * as THREE from 'three';
@@ -31,6 +32,9 @@ export function createItemPools(ctx, parent, { castShadow = true } = {}) {
     mesh.castShadow = castShadow; mesh.receiveShadow = true;
     mesh.frustumCulled = false;
     mesh.name = `camp-items:${id}`;
+    mesh.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(cap * 3).fill(1), 3);
+    mesh.instanceColor.setUsage(THREE.DynamicDrawUsage);
+    mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     mesh.visible = false;
     parent.add(mesh);
     return { mesh, n: 0, cap };
@@ -40,7 +44,7 @@ export function createItemPools(ctx, parent, { castShadow = true } = {}) {
     if (!p) { p = make(id, 64); pools.set(id, p); }
     if (p.n >= p.cap) { // grow (rare): replace the mesh with a bigger one, copying what is already written
       const bigger = make(id, p.cap * 2);
-      for (let i = 0; i < p.n; i++) { p.mesh.getMatrixAt(i, _m); bigger.mesh.setMatrixAt(i, _m); }
+      for (let i = 0; i < p.n; i++) { p.mesh.getMatrixAt(i, _m); bigger.mesh.setMatrixAt(i, _m); p.mesh.getColorAt(i, _c); bigger.mesh.setColorAt(i, _c); }
       bigger.n = p.n;
       p.mesh.removeFromParent(); p.mesh.dispose();
       pools.set(id, bigger);
@@ -48,18 +52,18 @@ export function createItemPools(ctx, parent, { castShadow = true } = {}) {
     }
     return p;
   }
-  const _m = new THREE.Matrix4();
+  const _m = new THREE.Matrix4(), _c = new THREE.Color(), WHITE = new THREE.Color(1, 1, 1);
 
   return {
     geometryFor,
     has: id => !!config.ITEMS[id],
     begin() { for (const p of pools.values()) p.n = 0; },
-    push(id, matrix) { const p = pool(id); p.mesh.setMatrixAt(p.n++, matrix); },
+    push(id, matrix, tint) { const p = pool(id); p.mesh.setColorAt(p.n, tint || WHITE); p.mesh.setMatrixAt(p.n++, matrix); },
     end() {
       for (const p of pools.values()) {
         p.mesh.count = p.n;
         p.mesh.visible = p.n > 0;
-        if (p.n) p.mesh.instanceMatrix.needsUpdate = true;
+        if (p.n) { p.mesh.instanceMatrix.needsUpdate = true; p.mesh.instanceColor.needsUpdate = true; }
       }
     },
     get drawn() { let n = 0; for (const p of pools.values()) n += p.n; return n; },

@@ -37,8 +37,12 @@ const HOLE_TALL = [1.42, 0.9, 1.16];    // portrait (aspect <= 0.6): open sides,
 const LEVEL_CAP = [5.4, 6.8, 9.5, 13, 17, 34];
 const LEVEL_MUL = [0.9, 0.95, 1.0, 1.04, 1.08, 1.12];
 // From level 2 the whole home island stays clear wherever the camera is (the camp is never under cloud);
-// level 1 pulls the clouds back from it a little.
-const HOME_CLEAR = [0, 0.55, 1, 1, 1, 1];
+// level 1 pulls the clouds back from most of it (the first stations, built at level 1, must not stand in the
+// veil), level 2 clears it fully and opens the view wider.
+const HOME_CLEAR = [0, 0.8, 1, 1, 1, 1];
+// The clear area reaches this many tiles past the island's far (north) shore: it is tested at the ground point
+// behind each pixel, and the roofs and signs of the north-row stations project up to ~2 tiles beyond the shore.
+const HOME_FAR = 1.5;
 const LOCK_RES = 2;                // locked-island mask texels per tile
 const LOCK_MARGIN = 4;             // tiles of mask beyond the map
 const LOCK_FEATHER = [0.15, 1.5];  // the veil fades out from this far outside the island's land (tiles)
@@ -392,7 +396,7 @@ export function create(ctx) {
       x0 = Math.min(x0, x); x1 = Math.max(x1, x); z0 = Math.min(z0, z); z1 = Math.max(z1, z);
     }
     if (!Number.isFinite(x0)) return null;
-    shared.uHome.value.set((x0 + x1) / 2, (z0 + z1) / 2, (x1 - x0) / 2 + 0.55, (z1 - z0) / 2 + 0.55);
+    shared.uHome.value.set((x0 + x1) / 2, (z0 + z1 - HOME_FAR) / 2, (x1 - x0) / 2 + 0.55, (z1 - z0 + HOME_FAR) / 2 + 0.55);
     return { x0, x1, z0, z1 };
   })();
 

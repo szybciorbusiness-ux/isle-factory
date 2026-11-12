@@ -92,10 +92,12 @@ export function createArrow(ctx, { scale = 1 } = {}) {
   shineAll.translate(0, tipLift, frontZ + 0.003);
 
   // ---- materials (always transparent so they can fade; drawn after the world, in a fixed order) ----
-  const mBody = new THREE.MeshBasicMaterial({ vertexColors: true, transparent: true, fog: false });
-  const mRim = new THREE.MeshBasicMaterial({ color: CREAM, side: THREE.BackSide, transparent: true, fog: false });
-  const mLine = new THREE.MeshBasicMaterial({ color: LINE, side: THREE.BackSide, transparent: true, fog: false });
-  const mShine = new THREE.MeshBasicMaterial({ color: SHINE, transparent: true, depthWrite: false, fog: false });
+  // No depth test: the arrow is the 'go here' sign, so a station sign, a ghost or a tree in front of the spot
+  // never hides it. The fixed render order (outline, rim, body, shine) paints it like a sticker.
+  const mBody = new THREE.MeshBasicMaterial({ vertexColors: true, transparent: true, depthTest: false, depthWrite: false, fog: false });
+  const mRim = new THREE.MeshBasicMaterial({ color: CREAM, side: THREE.BackSide, transparent: true, depthTest: false, depthWrite: false, fog: false });
+  const mLine = new THREE.MeshBasicMaterial({ color: LINE, side: THREE.BackSide, transparent: true, depthTest: false, depthWrite: false, fog: false });
+  const mShine = new THREE.MeshBasicMaterial({ color: SHINE, transparent: true, depthTest: false, depthWrite: false, fog: false });
   const mats = [mBody, mRim, mLine, mShine];
 
   const root = new THREE.Group();
@@ -142,12 +144,57 @@ export function createArrow(ctx, { scale = 1 } = {}) {
     swap: null,            // { t, x, z, y } scale-out then scale-in at a new spot
     t: 0, groundY: 0, shadowOn: true,
     ringT: -1, ringNext: false,
+    retire: -1,            // >= 0 while saying goodbye (camp complete): s into the farewell; -2 once gone for good
+    fromHidden: false, sparkled: false,
   };
+  const RETIRE_T = 1.3, RETIRE_IN = 0.28;
 
   function snap(x, z, y) { px.set(x); pz.set(z); py.set(y); }
 
+  // Farewell (camp complete): pops in if it was hidden, a happy squash, then it springs up, spins once around its
+  // own axis and shrinks away with a little sparkle. It never comes back.
+  function updateRetire(dt) {
+    st.retire += dt;
+    const T = st.retire;
+    const tIn = st.fromHidden ? RETIRE_IN : 0;
+    const k = clamp((T - tIn) / (RETIRE_T - tIn));
+    if (T >= RETIRE_T) {
+      st.retire = -2; root.visible = false; shadow.visible = false; vis.set(0); st.want = false;
+      updateRing(dt);
+      return;
+    }
+    root.visible = true; shadow.visible = st.shadowOn;
+    const appear = st.fromHidden ? ease.backOut(clamp(T / RETIRE_IN)) : 1;
+    // anticipation (squash) 0..0.2, launch 0.2..1
+    const ant = k < 0.2 ? Math.sin((k / 0.2) * Math.PI) : 0;
+    const up = k < 0.2 ? 0 : ease.cubicOut((k - 0.2) / 0.8);
+    const grow = k < 0.45 ? 1 + 0.12 * ease.quadOut(k / 0.45) : 1.12 * (1 - ease.backIn((k - 0.45) / 0.55, 1.2));
+    const x = px.value, z = pz.value, y = py.value + 1.1 * up;
+    root.position.set(x, y, z);
+    const sy = 1 - 0.22 * ant + 0.12 * (k > 0.2 && k < 0.5 ? Math.sin(((k - 0.2) / 0.3) * Math.PI) : 0);
+    const sxz = 1 / Math.sqrt(sy);
+    const s = scale * st.size * appear * Math.max(0, grow);
+    pivot.scale.set(sxz * s, sy * s, sxz * s);
+    camera.getWorldQuaternion(root.quaternion);
+    sway.rotation.y = Math.PI * 2 * ease.cubicInOut(clamp((k - 0.15) / 0.75));
+    sway.rotation.z = 0;
+    const op = clamp(st.fromHidden ? T / (RETIRE_IN * 0.6) : 1) * (1 - ease.quadIn(clamp((k - 0.7) / 0.3)));
+    for (const m of mats) m.opacity = op;
+    shadow.position.set(x + (st.sdx || 0), st.groundY + 0.025, z + (st.sdz || 0));
+    const ss = 0.7 * scale * st.size * appear * Math.max(0, grow) * (1 - 0.6 * up);
+    shadow.scale.set(ss, 1, ss * 0.8);
+    mShadow.opacity = 0.2 * op * (1 - up);
+    if (!st.sparkled && k > 0.62) {
+      st.sparkled = true;
+      try { views.fx?.sparkle?.(new THREE.Vector3(x, y + 0.45 * scale, z), { count: 8, spread: 0.35 }); } catch { /* optional */ }
+    }
+    updateRing(dt);
+  }
+
   function update(dt) {
     st.t += dt;
+    if (st.retire === -2) { root.visible = false; shadow.visible = false; updateRing(dt); return; }
+    if (st.retire >= 0) { updateRetire(dt); return; }
     // goal swap: shrink away (with a tiny anticipation grow), jump, come back
     if (st.swap) {
       st.swap.t += dt;
@@ -245,14 +292,33 @@ export function createArrow(ctx, { scale = 1 } = {}) {
       if (!glide && vis.value > 0.05) st.swap = { t: 0, x, z, y, moved: false };
       else if (!glide) snap(x, z, y);
     },
-    show(on) { st.want = !!on; },
+    show(on) { if (st.retire === -1) st.want = !!on; },
+    // camp complete: say goodbye (from where it is, or popping up at `at` {x, z, y, gx?, gz?} when it was hidden)
+    // and never return. Hidden with nowhere to pop up: it just stays gone.
+    retire(at = null) {
+      if (st.retire !== -1) return;
+      const hidden = vis.value < 0.3;
+      if (hidden && !at) { st.retire = -2; vis.set(0); st.want = false; root.visible = false; shadow.visible = false; return; }
+      st.fromHidden = hidden;
+      if (hidden) {
+        snap(at.x, at.z, at.y);
+        st.gdx = at.gx != null ? at.gx - at.x : 0; st.gdz = at.gz != null ? at.gz - at.z : 0;
+        st.sdx = st.gdx; st.sdz = st.gdz;
+      }
+      st.swap = null; st.drop = -1; st.retire = 0; st.sparkled = false;
+    },
+    get retired() { return st.retire !== -1; },
+    // the arrow's size in world units at rest (outline included): tip at the place() point, pointing down on
+    // screen; height runs up the screen, halfWidth across it; hop = how far the tip rises on each hop
+    get extent() { return this.extentFor(st.sizeTarget); },
+    extentFor(size = 1) { const k = scale * size; return { height: 1.14 * k, halfWidth: 0.6 * k, hop: st.hopH }; },
     dropIn() { st.drop = 0; vis.set(0); vis.velocity = 4; st.want = true; },
     setHop(period, height) { st.hopT = period; st.hopH = height; },
     setSize(k) { st.sizeTarget = k; },
     setShadow(on) { st.shadowOn = on; },
     update,
-    get visible() { return vis.value > 0.5; },
-    get value() { return vis.value; },
+    get visible() { return st.retire >= 0 || vis.value > 0.5; },
+    get value() { return st.retire >= 0 ? 1 : vis.value; },
     // s the arrow has been fully shown and settled (not dropping in)
     get shownFor() { return st.shownT || 0; },
     get position() { return root.position; },

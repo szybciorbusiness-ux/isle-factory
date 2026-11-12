@@ -8,18 +8,21 @@
 // close). No hover tooltip and no keyboard controls card there.
 //
 // Camp mode (ctx.camp, GAMEPLAY.md): the world is the UI. No hotbar, resource strip, crafting, chest /
-// workshop panels or controls card: camp-hud.js draws the hearth-level pill, the carried-stack pill, the
-// level-up ribbon and the walk hint, camp-toasts.js the news. No keys are taken (Space etc. stay the game's).
+// workshop panels or controls card: camp-hud.js draws the hearth-level pill, the carried-stack sticker and the
+// walk hint, camp-ribbon.js the level-up ribbon, camp-complete.js the "camp complete" card, camp-toasts.js the
+// news. No keys are taken (Space etc. stay the game's; Escape / Enter only close the complete card while it is up).
+// Camp mode on a landscape window >= 1024 px wide keeps the HUD scale at >= 0.9 (CAMP_FLOOR).
 import { h } from './dom.js';
 import { createIcons } from './icons.js';
-import { createHotbar } from './hotbar.js';
-import { createCraft } from './craft.js';
-import { createEntityPanel } from './entity-panel.js';
-import { createToasts } from './toasts.js';
-import { createTooltip } from './tooltip.js';
-import { createHints } from './hints.js';
 import { createCampHud } from './camp-hud.js';
 import { createCampToasts } from './camp-toasts.js';
+
+// The factory sandbox's HUD (hotbar, crafting, chest / workshop panels, tooltip, controls card, its toasts) is
+// only fetched with ?factory: the camp never downloads, parses or builds any of it.
+const loadFactoryParts = () => Promise.all([
+  import('./hotbar.js'), import('./craft.js'), import('./entity-panel.js'),
+  import('./toasts.js'), import('./tooltip.js'), import('./hints.js'),
+]).then(([a, b, c, d, e, f]) => ({ ...a, ...b, ...c, ...d, ...e, ...f }));
 
 // s without news before the counts land anyway: short while fx has never reported an arrival (stub or
 // broken), long once it has (flights can wait for a tree to finish falling).
@@ -30,11 +33,13 @@ const ARRIVAL_TIMEOUT = 3.0;
 const COMPACT_H = 760, COMPACT_W = 1200;
 const TINY_H = 600, TINY_W = 900;
 const viewScale = (w, h) => (h < TINY_H || w < TINY_W ? 0.75 : h < COMPACT_H || w < COMPACT_W ? 0.85 : 1);
+const CAMP_FLOOR = 0.9, CAMP_FLOOR_W = 1024; // camp mode: landscape windows this wide keep the HUD at >= 0.9
 
-export function create(ctx) {
+export async function create(ctx) {
   const { uiRoot, events, ui, sim, config } = ctx;
   const mobile = !!ctx.mobile || document.body.classList.contains('mobile');
   const camp = ctx.camp || null;
+  const factory = camp ? null : await loadFactoryParts();
 
   const layer = h('div', { class: `hud${mobile ? ' is-mobile' : ''}${camp ? ' is-camp' : ''}`, 'data-hud': '' });
   uiRoot.append(layer);
@@ -97,10 +102,14 @@ export function create(ctx) {
   };
 
   function applyScale(w = innerWidth, ht = innerHeight) {
-    const s = mobile ? 1 : viewScale(w, ht); // phones are sized for touch already
-    hud.scale = s;
+    let s = mobile ? 1 : viewScale(w, ht); // phones are sized for touch already
+    // the camp's stickers never drop much below their phone size on a laptop-sized window (1280 x 720 -> 0.9)
+    if (camp && !mobile && w >= CAMP_FLOOR_W) s = Math.max(s, CAMP_FLOOR);
+    // the camp on a big desktop window: the stickers grow with it a little (1.1 at 1600 x 900, 1.2 at 1080p)
+    const up = camp && !mobile && s >= 1 ? Math.min(1.2, Math.max(1, Math.min(ht / 820, w / 1460))) : 1;
+    hud.scale = Math.round(s * up * 100) / 100;
     hud.compact = s < 1;
-    layer.style.setProperty('--ui-s', String(s));
+    layer.style.setProperty('--ui-s', String(hud.scale));
     layer.classList.toggle('is-compact', hud.compact);
   }
   applyScale();
@@ -145,12 +154,12 @@ export function create(ctx) {
     hud.toast = (text, kind = 'info') => hud.campToasts?.show?.({ text, kind });
     hud.bottomLimit = () => innerHeight - (hud.camp?.hudBottom?.() || 16);
   } else {
-    add('hotbar', createHotbar);
-    add('craft', createCraft);
-    add('entityPanel', createEntityPanel);
-    if (!mobile) add('hints', createHints);     // keyboard controls card: desktop only
-    add('toasts', createToasts);
-    if (!mobile) add('tooltip', createTooltip); // no hover on touch
+    add('hotbar', factory.createHotbar);
+    add('craft', factory.createCraft);
+    add('entityPanel', factory.createEntityPanel);
+    if (!mobile) add('hints', factory.createHints);     // keyboard controls card: desktop only
+    add('toasts', factory.createToasts);
+    if (!mobile) add('tooltip', factory.createTooltip); // no hover on touch
     hud.bottomLimit = () => hud.hotbar?.top?.() ?? innerHeight - 16;
   }
 

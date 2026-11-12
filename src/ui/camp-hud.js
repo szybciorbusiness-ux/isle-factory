@@ -1,61 +1,51 @@
 // Camp HUD (GAMEPLAY.md "ui", UI-STYLE.md "sticker" language). The world is the UI, so this stays small:
 //  - top-left: the camp level badge, a round orange sticker with the flame inside a thick progress ring (the
-//    current hearth pad's payment), and a cream tag "Camp 2" ("Light the fire" while the hearth is cold).
-//    Tap it for a little card of what the next level unlocks.
-//  - above the robot: the carried-stack sticker "7 / 10" with the top item's icon breaking out of its left
-//    edge; numbers roll, the icon bumps, "+N" floats up; at capacity it turns into a red "Full" bubble that
-//    wobbles. Projected from the world every frame and clamped to the viewport.
-//  - a level-up ribbon (orange sticker, folded tails, star burst, outlined title, unlock stickers popping in
-//    one by one), toasts for camp news (camp-toasts.js), a desktop walk hint that fades after the first steps.
+//    current hearth pad's payment), and a cream tag "Camp 2" ("Light the fire" while the hearth is cold,
+//    "Camp complete" once the last level is reached and its card was seen). Tap it for what the next level unlocks.
+//  - beside Dug's head: the carried-stack sticker, just the count ("7") with the top item's icon breaking out of
+//    its outer edge; "/20" slides in as the pack nears full; at capacity it turns into a red "Full" bubble that
+//    wobbles (the old face scales out, then the new one springs in). It docks on the side away from the guide's
+//    goal, hides while Dug stands on a pad (the pad's number is the hero there) and fades to ~35% while it would
+//    cover a pad plate or its label, a station's intake / drop zone or a worker.
+//  - the level-up ribbon (camp-ribbon.js), the "camp complete" card (camp-complete.js), toasts for camp news
+//    (camp-toasts.js), a desktop walk hint that fades after the first steps.
 //  - phones: --hud-bottom = safe-bottom + 12 px (the bottom of the screen stays free for the joystick).
 // Every transform / opacity is written from update(dt) (pausing and __game.step freeze it): ease-out
 // cubic-bezier(.23, 1, .32, 1) for enters / exits, springs for bumps and sticker pops, damped values for rings.
 import * as THREE from 'three';
-import { h, setText, setClass, easeOut, reduceMotion } from './dom.js';
+import { h, setText, setClass, setVar, easeOut, reduceMotion, ol, setOl, clamp01, easeIn, tf, op } from './dom.js';
 import { glyph, ROLE_HAT } from './camp-glyphs.js';
-import { STATIONS, UPGRADES, WORKERS, MAX_LEVEL, PADS } from '../sim/camp-data.js';
+import { UPGRADES, WORKERS, MAX_LEVEL } from '../sim/camp-data.js';
+import { ISLAND_NAMES, unlockLabel, unlocksForLevel } from './camp-labels.js';
+import { createRibbon } from './camp-ribbon.js';
+import { createCompleteCard } from './camp-complete.js';
 
-const ISLAND_NAMES = { west: 'Forest', north: 'Meadow', east: 'Copper isle', south: 'Deer glade' };
-const NTH = ['', '', 'Second', 'Third', 'Fourth', 'Fifth'];
+export { unlockLabel, unlocksForLevel };
 
-// level-up ribbon timeline (s)
-const B_IN = 0.42, B_HOLD = 3.1, B_OUT = 0.26, B_CHIP0 = 0.34, B_CHIP_STAGGER = 0.11;
 // level badge: the ring fills, the number flips, the ring empties for the next level (s)
 const L_FILL = 0.36, L_FLIP = 0.34, L_RESET = 0.5;
-// stack sticker anchor when the player can't tell us where its stack ends (world units above the feet)
-const STACK_BASE_Y = 1.15, STACK_STEP_Y = 0.045;
+// level ring extras (UI-STYLE "progress bars"): segment ticks and a shine that sweeps along the fill
+const RING_SEGS_MAX = 10;   // costs up to this many items get one tick per item, bigger ones get 10 segments
+const SHINE_EVERY = 2.6, SHINE_T = 0.8, SHINE_LEN = 14; // s between sweeps, s per sweep, sweep length (% of ring)
+// stack sticker: where Dug's head is (world units above the feet) and how far out its tail tip sits
+const HEAD_Y = 0.74;        // the helmet's middle
+const HEAD_CLEAR = 0.5;     // tail tip from the head's centre line (world units): clear of the helmet and shovels
+const STACK_CLEAR = 0.32;   // ...and clear of the carried stack (it rides on Dug's back, so it swings sideways)
+const TAIL = 9;             // px from the tail tip to the sticker's edge
+const SIDE_HOLD = 0.35;     // s the goal must stay on the sticker's side before it hops over
+const SIDE_OUT = 0.1;       // s, the sticker scales out before it reappears on the other side
+const FACE_OUT = 0.12;      // s, the old face ("7" / "Full") scales out before the new one springs in
+const FADED = 0.35;         // opacity while it would cover a pad, an intake or a worker
+const FADED_FULL = 0.55;    // ...a red "Full" stays a little stronger (it is the one warning the stack gives)
+const COVER_MIN = 0.14;     // ...meaning: at least this share of the sticker sits on one
+const AVOID_EVERY = 0.1;    // s between overlap checks
+const PLATE_TAG = 0.1;      // world units of margin round a pad's plate (pads.plateRect already holds its name tag)
+const CAP_SHOW = 2.2;       // s "/cap" stays after the pack grew
 const ROLL = 0.17;          // s, one odometer roll
 const FLOAT_LIFE = 0.95;    // s, a "+N" floater
 const FLOAT_MERGE = 0.35;   // s, gains this close together grow one floater
 const TIP_LIFE = 4;         // s, the "next level" card closes itself
-
-// Friendly name + glyph for a pad id ('build:hut', 'bridge:west', 'upgrade:pack1', 'hire:hunter#2').
-export function unlockLabel(padId) {
-  const [kind, arg = ''] = String(padId).split(':');
-  const [what, nth] = arg.split('#');
-  if (kind === 'build') return { text: STATIONS[what]?.name || what, icon: what === 'hut' ? 'hut' : 'build' };
-  if (kind === 'bridge') return { text: `${ISLAND_NAMES[what] || what} bridge`, icon: 'bridge' };
-  if (kind === 'upgrade') return { text: UPGRADES[what]?.name || what, icon: UPGRADES[what]?.capacity ? 'pack' : 'axe' };
-  if (kind === 'hire') {
-    const name = WORKERS[what]?.name || what;
-    return { text: nth ? `${NTH[Number(nth)] || 'Another'} ${name.toLowerCase()}` : name, icon: 'worker', args: [ROLE_HAT[what]] };
-  }
-  return null;
-}
-// Pads a hearth level opens (static data, for the "next level" card).
-export const unlocksForLevel = level => PADS.filter(p => !p.id.startsWith('hearth:') && p.requires?.level === level).map(p => p.id);
-
-// Outlined numerals / words (UI-STYLE "numbers are the hero"): a stroked layer under a plain fill layer.
-const ol = (text, cls = '') => h('span', { class: `ol ${cls}`, 'data-t': String(text) }, String(text));
-function setOl(el, text) {
-  const s = String(text);
-  if (el.__t === s) return;
-  el.__t = s; el.textContent = s; el.dataset.t = s;
-}
-const clamp01 = v => (v < 0 ? 0 : v > 1 ? 1 : v);
-const easeIn = t => t * t * t;
-const tf = (el, v) => { if (el.__tf !== v) { el.__tf = v; el.style.transform = v; } };
-const op = (el, v) => { const s = typeof v === 'number' ? v.toFixed(3) : v; if (el.__op !== s) { el.__op = s; el.style.opacity = s; } };
+const nearFull = cap => cap - Math.max(2, Math.round(cap * 0.2)); // "/cap" shows from here (8/10, 16/20, 24/30)
 
 export function createCampHud(hud) {
   const { ctx, layer, icons, mobile } = hud;
@@ -68,18 +58,22 @@ export function createCampHud(hud) {
   // DOM
   // =====================================================================================================
   // ---- level badge + tag ----
-  const ringFill = svgEl('circle', { class: 'lvl-fill', cx: 32, cy: 32, r: 26.5, pathLength: 100 });
+  const ringFill = svgEl('circle', { class: 'lvl-fill', fill: 'none', cx: 32, cy: 32, r: 26.5, pathLength: 100 });
+  const ringFillHi = svgEl('circle', { class: 'lvl-fill-hi', fill: 'none', cx: 32, cy: 32, r: 27.9, pathLength: 100 });
+  const ringTicks = svgEl('circle', { class: 'lvl-ticks', fill: 'none', cx: 32, cy: 32, r: 26.5, pathLength: 100 });
+  const ringShine = svgEl('circle', { class: 'lvl-shine', fill: 'none', cx: 32, cy: 32, r: 26.5, pathLength: 100 });
   const ringSvg = svgEl('svg', { class: 'lvl-ring', viewBox: '0 0 64 64', 'aria-hidden': 'true' },
-    svgEl('circle', { class: 'lvl-ring-ol', cx: 32, cy: 32, r: 26.5 }),
-    svgEl('circle', { class: 'lvl-ring-well', cx: 32, cy: 32, r: 26.5 }),
-    ringFill);
+    svgEl('circle', { class: 'lvl-ring-ol', fill: 'none', cx: 32, cy: 32, r: 26.5 }),
+    svgEl('circle', { class: 'lvl-ring-well', fill: 'none', cx: 32, cy: 32, r: 26.5 }),
+    ringFill, ringFillHi, ringShine, ringTicks);
   const disc = h('span', { class: 'lvl-disc', html: glyph('flameLight') });
   const badge = h('span', { class: 'lvl-badge' }, ringSvg, disc);
   const numA = h('b', { class: 'lvl-num' }, '1');
   const numB = h('b', { class: 'lvl-num' }, '');
   const lvlMain = h('span', { class: 'lvl-main' }, h('span', { class: 'lvl-word' }, 'Camp'), h('span', { class: 'lvl-nums' }, numA, numB));
   const lvlCold = h('span', { class: 'lvl-cold' }, 'Light the fire');
-  const lvlText = h('span', { class: 'lvl-text' }, lvlMain, lvlCold);
+  const lvlDone = h('span', { class: 'lvl-done' }, h('span', { class: 'lvl-done-star', html: glyph('star') }), 'Camp complete');
+  const lvlText = h('span', { class: 'lvl-text' }, lvlMain, lvlCold, lvlDone);
   const tag = h('span', { class: 'lvl-tag' }, lvlText);
   const lvlBtn = h('button', { class: 'lvl hit', type: 'button', tabindex: -1 }, badge, tag);
   const tipTitle = h('div', { class: 'lvl-tip-title' });
@@ -88,28 +82,22 @@ export function createCampHud(hud) {
   const cluster = h('div', { class: 'camp-tl' }, lvlBtn, tip);
   layer.append(cluster);
 
-  // ---- stack sticker (world-anchored above the robot) ----
+  // ---- stack sticker (world-anchored beside Dug's head) ----
   const stkImg = h('span', { class: 'cs-icon', html: glyph('stack') });
   const nA = h('b', { class: 'cs-n' }, '0'), nB = h('b', { class: 'cs-n' }, '');
+  const rollEl = h('span', { class: 'cs-roll' }, nA, nB);
   const capEl = h('span', { class: 'cs-cap' }, String(camp.capacity));
-  const countEl = h('span', { class: 'cs-count' }, h('span', { class: 'cs-roll' }, nA, nB), h('span', { class: 'cs-sep' }, '/'), capEl);
+  const capIn = h('span', { class: 'cs-cap-in' }, h('span', { class: 'cs-sep' }, '/'), capEl);
+  const capWrap = h('span', { class: 'cs-capw' }, capIn);
+  const countEl = h('span', { class: 'cs-count' }, rollEl, capWrap);
   const fullEl = ol('Full', 'cs-full');
-  const bub = h('div', { class: 'cs-bub' }, h('span', { class: 'cs-pulse' }), h('span', { class: 'cs-body' }), stkImg, h('span', { class: 'cs-vals' }, countEl, fullEl), h('span', { class: 'cs-tail' }));
+  const vals = h('span', { class: 'cs-vals' }, countEl, fullEl);
+  // the tail sits on the edge facing Dug: the right edge while docked left of him, the left edge docked right
+  const tailEl = h('span', { class: 'cs-tail' });
+  const bub = h('div', { class: 'cs-bub' }, h('span', { class: 'cs-pulse' }), h('span', { class: 'cs-body' }), tailEl, stkImg, vals);
   const stackAnchor = h('div', { class: 'cs', role: 'status' }, bub);
   stackAnchor.style.visibility = 'hidden';
   layer.append(stackAnchor);
-
-  // ---- level-up ribbon ----
-  const tails = h('span', { class: 'rb-tails', html: ribbonTailsSvg() });
-  const bTitle = ol('Camp level 2', 'rb-title');
-  const bSheen = h('span', { class: 'rb-sheen' });
-  const bFace = h('div', { class: 'rb-face' }, h('span', { class: 'rb-flame', html: glyph('flameLight') }), bTitle, bSheen);
-  const burst = h('span', { class: 'rb-burst', html: burstSvg() });
-  const bRibbon = h('div', { class: 'rb-ribbon' }, tails, bFace);
-  const bChips = h('div', { class: 'rb-chips' });
-  const banner = h('div', { class: 'rb', 'aria-live': 'polite' }, burst, bRibbon, bChips);
-  banner.style.visibility = 'hidden';
-  layer.append(banner);
 
   // ---- desktop walk hint ----
   let hint = null;
@@ -117,7 +105,7 @@ export function createCampHud(hud) {
     const keys = ks => h('span', { class: 'ch-keys' }, ks.map(k => h('kbd', { class: 'ch-key' }, k)));
     hint = h('div', { class: 'camp-hint' },
       keys(['W', 'A', 'S', 'D']), h('span', { class: 'ch-or' }, 'or arrow keys'), h('span', null, 'to walk'),
-      h('i', { class: 'ch-dot' }), h('span', { class: 'ch-soft' }, 'your robot gathers on its own'));
+      h('i', { class: 'ch-dot' }), h('span', { class: 'ch-soft' }, 'Dug gathers on his own'));
     hint.style.opacity = '0';
     layer.append(hint);
   }
@@ -139,8 +127,11 @@ export function createCampHud(hud) {
   let ring = 0, ringAlpha = 1, glow = 0, cold = camp.level <= 0 ? 1 : 0;
   let shownLevel = camp.level;
   let lvlFx = null;         // { t, from, to, flipped, reset }
+  let doneFx = null;        // { t, w0, w1 }: "Camp 5" -> "Camp complete"
+  let done = camp.level >= MAX_LEVEL; // a saved, finished camp opens in its complete state
   let lastAria = '';
-  let textW = { main: 0, cold: 0 };
+  let textW = { main: 0, cold: 0, done: 0 };
+  let ringSegs = -1, shineT = -1, shineWait = 1.2;
 
   const hearthPad = () => camp.pads.find(p => p.id.startsWith('hearth:')) || null;
   function padFrac(pad) {
@@ -149,7 +140,10 @@ export function createCampHud(hud) {
     return { tot, paid, p: tot ? paid / tot : 0 };
   }
   events.on('pad:paid', ({ pad } = {}) => {
-    if (pad?.id?.startsWith('hearth:') && !reduced()) badgeS.velocity = Math.min(badgeS.velocity + 0.9, 2.2);
+    if (pad?.id) lastPaid = { id: pad.id, t: clock };
+    if (!pad?.id?.startsWith('hearth:') || reduced()) return;
+    badgeS.velocity = Math.min(badgeS.velocity + 0.9, 2.2);
+    if (shineT < 0 || shineT > SHINE_T * 0.7) shineWait = Math.min(shineWait, 0.18); // a sweep follows the payment
   });
   events.on('pad:complete', ({ pad } = {}) => {
     if (!pad?.id?.startsWith('hearth:')) return;
@@ -157,24 +151,39 @@ export function createCampHud(hud) {
     closeTip();
   });
 
-  const measureText = () => { textW = { main: lvlMain.offsetWidth, cold: lvlCold.offsetWidth }; };
+  const measureText = () => { textW = { main: lvlMain.offsetWidth, cold: lvlCold.offsetWidth, done: lvlDone.offsetWidth }; };
   function showLayer(el, on) { el.__tf = el.__op = undefined; el.style.transform = ''; el.style.opacity = on ? '' : '0'; el.style.visibility = on ? '' : 'hidden'; }
+  const modeOf = level => (level <= 0 ? 'cold' : level >= MAX_LEVEL && done ? 'done' : 'main');
   function setLevelNow(level) {
     shownLevel = level;
     setText(numA, String(Math.max(1, level)));
     numA.__tf = numA.__op = numB.__tf = numB.__op = undefined;
     numA.style.transform = ''; numA.style.opacity = '';
     numB.style.opacity = '0'; numB.style.transform = '';
-    showLayer(lvlMain, level > 0);
-    showLayer(lvlCold, level <= 0);
+    const mode = modeOf(level);
+    showLayer(lvlMain, mode === 'main');
+    showLayer(lvlCold, mode === 'cold');
+    showLayer(lvlDone, mode === 'done');
     cold = level <= 0 ? 1 : 0;
     measureText();
-    lvlText.style.width = `${level > 0 ? textW.main : textW.cold}px`;
+    lvlText.__w = `${textW[mode]}px`;
+    lvlText.style.width = lvlText.__w;
     setClass(lvlBtn, 'is-max', level >= MAX_LEVEL);
     setClass(lvlBtn, 'is-cold', level <= 0);
+    setClass(lvlBtn, 'is-done', mode === 'done');
   }
   setLevelNow(camp.level);
-  document.fonts?.ready?.then(() => { if (!lvlFx) setLevelNow(shownLevel); }, () => {});
+  // the tag wears "Camp complete" (the card flew into the badge): slide the words like the level number flips
+  function markDone() {
+    if (done) return;
+    done = true;
+    measureText();
+    doneFx = { t: 0, w0: textW.main, w1: textW.done };
+    lvlDone.style.visibility = ''; op(lvlDone, 0);
+    setClass(lvlBtn, 'is-done', true);
+    if (!reduced()) badgeS.velocity += 5;
+    glow = 1;
+  }
 
   function updateLevel(dt) {
     const pad = hearthPad();
@@ -188,8 +197,11 @@ export function createCampHud(hud) {
       glow = damp(glow, f.t < L_FILL + L_FLIP + 0.2 ? 1 : 0, 10, dt);
       if (f.t >= L_FILL && !f.flipped) {
         f.flipped = true;
-        if (lighting) { setText(numA, String(f.to)); lvlMain.style.visibility = ''; measureText(); }
+        const w0 = lighting ? textW.cold : textW.main;
+        if (lighting) { setText(numA, String(f.to)); lvlMain.style.visibility = ''; }
         else setText(numB, String(f.to));
+        measureText(); // digits are proportional: the tag eases to the new number's width (both sit in the grid)
+        f.w0 = w0; f.w1 = textW.main;
         if (!reduced()) badgeS.velocity += 4.4;
       }
       if (f.flipped) {
@@ -197,11 +209,10 @@ export function createCampHud(hud) {
         const [outEl, inEl] = lighting ? [lvlCold, lvlMain] : [numA, numB];
         op(outEl, 1 - k); op(inEl, k);
         if (!reduced()) { tf(outEl, `translateY(${(-k * 100).toFixed(1)}%)`); tf(inEl, `translateY(${((1 - k) * 100).toFixed(1)}%)`); }
-        if (lighting) {
-          cold = 1 - k;
-          const kw = easeOut(clamp01((f.t - L_FILL) / (L_FLIP + 0.1)));
-          lvlText.style.width = `${(textW.cold + (textW.main - textW.cold) * kw).toFixed(1)}px`;
-        }
+        if (lighting) cold = 1 - k;
+        const kw = easeOut(clamp01((f.t - L_FILL) / (L_FLIP + 0.1)));
+        const wpx = `${(f.w0 + (f.w1 - f.w0) * kw).toFixed(1)}px`;
+        if (lvlText.__w !== wpx) { lvlText.__w = wpx; lvlText.style.width = wpx; }
       }
       const r0 = L_FILL + L_FLIP;
       if (f.t >= r0) {
@@ -213,20 +224,59 @@ export function createCampHud(hud) {
         }
         if (k >= 1) { lvlFx = null; ringAlpha = 1; }
       }
+    } else if (doneFx) {
+      const f = doneFx;
+      f.t += dt;
+      const k = easeOut(clamp01(f.t / (L_FLIP + 0.08)));
+      op(lvlMain, 1 - k); op(lvlDone, k);
+      if (!reduced()) { tf(lvlMain, `translateY(${(-k * 100).toFixed(1)}%)`); tf(lvlDone, `translateY(${((1 - k) * 100).toFixed(1)}%)`); }
+      const wpx = `${(f.w0 + (f.w1 - f.w0) * k).toFixed(1)}px`;
+      if (lvlText.__w !== wpx) { lvlText.__w = wpx; lvlText.style.width = wpx; }
+      glow = damp(glow, 0, 4, dt);
+      if (k >= 1) { doneFx = null; setLevelNow(camp.level); }
     } else {
       glow = damp(glow, 0, 10, dt);
-      if (camp.level !== shownLevel) setLevelNow(camp.level); // changed behind the bus (tests)
+      if (camp.level !== shownLevel) { if (camp.level >= MAX_LEVEL && camp.complete && !card.shown && !ribbon.active) done = true; setLevelNow(camp.level); } // changed behind the bus (tests, restore)
     }
     // the ring glides toward the paid fraction, a touch behind the paying stream
     ring = damp(ring, target, lvlFx ? 14 : 7, dt);
     if (Math.abs(ring - target) < 0.0005) ring = target;
     const off = (100 * (1 - ring)).toFixed(2);
-    if (ringFill.__off !== off) { ringFill.__off = off; ringFill.style.strokeDashoffset = off; }
-    op(ringFill, ring < 0.004 ? 0 : ringAlpha);
+    if (ringFill.__off !== off) { ringFill.__off = off; ringFill.style.strokeDashoffset = off; ringFillHi.style.strokeDashoffset = off; }
+    const fillA = ring < 0.004 ? 0 : ringAlpha;
+    op(ringFill, fillA); op(ringFillHi, fillA * 0.9);
+    // segment ticks: one per item for small costs (the logs that light the fire), else tenths
+    const segs = frac && camp.level < MAX_LEVEL ? (frac.tot <= RING_SEGS_MAX ? frac.tot : 10) : 0;
+    if (segs !== ringSegs) {
+      ringSegs = segs;
+      if (segs > 1) {
+        const tw = 1.25, gap = 100 / segs - tw;
+        ringTicks.style.strokeDasharray = `${tw} ${gap.toFixed(3)}`;
+        ringTicks.style.strokeDashoffset = (tw / 2).toFixed(3);
+      }
+    }
+    op(ringTicks, segs > 1 ? (lvlFx ? ringAlpha : 1) : 0);
+    // the shine: a bright band runs from the start of the fill to its end every few seconds (and right after
+    // a payment lands); it never leaves the filled part
+    shineWait -= dt;
+    if (shineT < 0 && shineWait <= 0 && ring > 0.04 && !reduced()) { shineT = 0; shineWait = SHINE_EVERY; }
+    if (shineT >= 0) {
+      shineT += dt;
+      const k = shineT / SHINE_T;
+      const end = ring * 100;
+      const head = easeOut(Math.min(1, k)) * (end + SHINE_LEN);
+      const a = Math.max(0, head - SHINE_LEN), b = Math.min(end, head);
+      if (k >= 1 || b - a < 0.2) { if (k >= 1) shineT = -1; op(ringShine, 0); }
+      else {
+        ringShine.style.strokeDasharray = `${(b - a).toFixed(2)} 200`;
+        ringShine.style.strokeDashoffset = (-a).toFixed(2);
+        op(ringShine, ringAlpha * Math.min(1, (1 - k) * 3));
+      }
+    }
     const s = badgeS.update(dt);
     tf(badge, Math.abs(s - 1) > 0.001 ? `scale(${s.toFixed(4)})` : '');
-    badge.style.setProperty('--glow', glow.toFixed(3));
-    badge.style.setProperty('--cold', cold.toFixed(3));
+    setVar(badge, '--glow', glow.toFixed(3));
+    setVar(badge, '--cold', cold.toFixed(3));
     const aria = camp.level <= 0 ? `The hearth is cold${frac ? `, ${Math.round(frac.p * 100)}% lit` : ''}`
       : camp.level >= MAX_LEVEL ? `Camp level ${camp.level}, complete`
         : frac ? `Camp level ${camp.level}, ${Math.round(frac.p * 100)}% to level ${camp.level + 1}` : `Camp level ${camp.level}`;
@@ -251,7 +301,12 @@ export function createCampHud(hud) {
   }
   function openTip() { fillTip(); tipS.open = true; tipS.t = 0; tipScale.value = 0.9; tipScale.velocity = 0; tipScale.target = 1; tip.setAttribute('aria-hidden', 'false'); }
   function closeTip() { if (!tipS.open) return; tipS.open = false; tip.setAttribute('aria-hidden', 'true'); }
-  lvlBtn.addEventListener('click', e => { e.stopPropagation(); if (tipS.open) closeTip(); else openTip(); if (!reduced()) badgeS.velocity -= 2; });
+  lvlBtn.addEventListener('click', e => {
+    e.stopPropagation();
+    if (!reduced()) badgeS.velocity -= 2;
+    if (done && !doneFx && camp.level >= MAX_LEVEL) { closeTip(); if (!card.shown) card.open(); return; } // the finished camp: its card again
+    if (tipS.open) closeTip(); else openTip();
+  });
   addEventListener('pointerdown', e => { if (tipS.open && !cluster.contains(e.target)) closeTip(); }, true);
   function updateTip(dt) {
     if (tipS.open) { tipS.t += dt; if (tipS.t > TIP_LIFE) closeTip(); }
@@ -264,27 +319,48 @@ export function createCampHud(hud) {
   }
 
   // =====================================================================================================
-  // stack sticker above the robot
+  // stack sticker beside Dug's head
   // =====================================================================================================
   const carry = camp.CARRY_ITEMS || ['wood', 'stone', 'meat', 'cookedMeat', 'plank', 'copperOre', 'copperBar'];
   const iconS = new Spring(1, { stiffness: 360, damping: 14 });
-  const popS = new Spring(0.7, { stiffness: 420, damping: 22 }); // sticker appear / gain bumps
+  const popS = new Spring(0.7, { stiffness: 420, damping: 22 }); // sticker appear / gain bumps / side hops
+  const faceS = new Spring(1, { stiffness: 520, damping: 19 });  // the new face springing in after a swap
   const wob = new Wobble({ freq: 3.2, decay: 2.6 });              // the gentle "Full" wobble
   const shake = new Wobble({ freq: 8, decay: 8 });                // a refusal shake on camp:stackFull
   let shownN = -1, shownCap = -1, topItem;
   let pulseT = 0;
-  let fullK = 0, fullHold = 0, capFlash = 0, lastFullPing = -9, fullSince = 0, wasFull = false;
+  let fullK = 0, fullHold = 0, capFlash = 0, lastFullPing = -9, fullSince = 0;
   let vis = 0, visT = 0, outT = -1;   // vis: 0 hidden / 1 shown; outT >= 0 while leaving
   let roll = null;                    // { k, dir }
-  let anchorY = null, sx = -1, sy = -1, lift = 0;
-  let ghEl = null;
-  let bw = 120, bh = 46;
+  // what the sticker says: 'count' or 'full'. A change is sequential: the old face scales out (faceOut 0 -> 1),
+  // then the new one springs in (faceS) while the body turns red / cream.
+  let face = 'count', faceOut = 0, faceIn = 1;
+  let capK = 0, capShowT = 0;         // "/cap" shown 0..1 (near full, or just after the pack grew)
+  const wd = { num: 16, cap: 30, full: 48, chrome: 40, h: 34, over: 10 }; // measured sizes (px, unscaled)
+  let valsW = -1;
+  // placement: docked left (-1) or right (+1) of Dug's head, away from the guide's goal
+  let side = -1, sideWant = -1, sideHold = 0, sideOut = -1; // sideOut >= 0 while hopping to the other side
+  let stackDx = null;                 // the carried stack's screen offset from the head (px, smoothed)
+  let pushY = 0;                      // pushed down below the guide's hint card (px)
+  let avoidK = 1, avoidHit = false, avoidT = 0;
+  const avoidRects = [], cover = [0, 0]; // share of the box covered docked left / right
+  let padK = 0, onPadT = 0, lastPaid = { id: null, t: -9 };
+  let sx = -1, sy = -1, sS = 1, boxR = null, badgeBottom = -1;
   let lastAriaN = -1, lastAriaCap = -1;
   const floats = [];                  // { el, txt, t, n }
-  const v3 = new THREE.Vector3();
+  const v3 = new THREE.Vector3(), vHead = new THREE.Vector3(), vSide = new THREE.Vector3(), vPack = new THREE.Vector3(), vTmp = new THREE.Vector3();
 
-  const roBub = typeof ResizeObserver === 'function' ? new ResizeObserver(() => { bw = bub.offsetWidth || bw; bh = bub.offsetHeight || bh; }) : null;
-  roBub?.observe(bub);
+  function measureSticker() {
+    wd.num = rollEl.offsetWidth || wd.num;
+    wd.cap = capIn.offsetWidth || wd.cap;
+    wd.full = fullEl.offsetWidth || wd.full;
+    const cs = getComputedStyle(bub);
+    wd.chrome = (parseFloat(cs.paddingLeft) || 0) + (parseFloat(cs.paddingRight) || 0);
+    wd.h = bub.offsetHeight || wd.h;
+    wd.over = Math.max(0, -stkImg.offsetLeft) || wd.over; // the icon breaks out of the outer edge by this much
+  }
+  measureSticker();
+  document.fonts?.ready?.then(() => { measureSticker(); if (!lvlFx && !doneFx) setLevelNow(shownLevel); }, () => {});
 
   events.on('camp:stackFull', () => {
     if (clock - lastFullPing < 0.7) return; // the sim can fire this every swing
@@ -292,7 +368,7 @@ export function createCampHud(hud) {
     fullHold = 1.6;                          // show "Full" even while the last items are still flying in
     if (!reduced()) { shake.hit(3.5); popS.velocity += 1.6; }
   });
-  events.on('capacity:changed', () => { capFlash = 1; if (!reduced()) popS.velocity += 2.6; });
+  events.on('capacity:changed', () => { capFlash = 1; capShowT = CAP_SHOW; if (!reduced()) popS.velocity += 2.6; });
 
   const shownTotal = () => { let n = 0; for (const it of carry) n += hud.shown[it] || 0; return n; };
   function setTopIcon(item) {
@@ -312,69 +388,161 @@ export function createCampHud(hud) {
     floats.push({ el, txt, t: 0, n: delta });
   }
 
-  // The guide's first-time hint bubble (view/guide/hints.js) also sits above the robot: while it shows, the
-  // stack sticker glides up and waits above it instead of overlapping.
-  function guideHintRect() {
+  // The guide's first-time hint bubble (view/guide/hints.js, .guide-layer .gh) sits above Dug: the sticker keeps
+  // below it. Its rect, or null when it is hidden or already fading out.
+  let ghEl = null, ghOp = 0;
+  let ghRect = null; // this frame's hint card rect (readGuideHint, once per frame)
+  function readGuideHint() {
     const gl = views.guide?.el;
     if (!gl) return null;
     if (!ghEl || !ghEl.isConnected) ghEl = gl.querySelector('.gh');
-    if (!ghEl || ghEl.style.visibility !== 'visible' || !(Number(ghEl.style.opacity) > 0.05)) return null;
+    const o = ghEl && ghEl.style.visibility === 'visible' ? Number(ghEl.style.opacity) || 0 : 0;
+    const leaving = o < ghOp - 0.001 && o < 0.9; // fading out: the sticker heads home already, in step with it
+    ghOp = o;
+    if (o <= 0.05 || leaving) return null;
     // .gh is a 0x0 anchor; its first child is the visible card + tail
     const r = (ghEl.firstElementChild || ghEl).getBoundingClientRect();
     return r.height > 0 ? r : null;
   }
 
-  function anchorWorld(n) {
+  // Screen points for this frame: Dug's head (from the smoothed feet, so no walk bob), the carried stack's base
+  // (the pack) and the px per world unit there.
+  const scr = { hx: 0, hy: 0, px: 0, ppu: 40 };
+  const toScr = (v, W, H) => { v.project(ctx.camera); return [(v.x * 0.5 + 0.5) * W, (-v.y * 0.5 + 0.5) * H]; };
+  function projectHead(W, H) {
     const pl = views.player;
-    if (pl?.getStackTop) { const p = pl.getStackTop(v3); if (p) return v3; }
-    const p = pl?.getPosition?.(v3) || v3.set(ctx.sim.player.x, 0, ctx.sim.player.z);
-    v3.y = (p.y || 0) + STACK_BASE_Y + Math.min(n, 30) * STACK_STEP_Y;
-    return v3;
+    const feet = pl?.getPosition?.(vHead) || vHead.set(ctx.sim.player.x, 0, ctx.sim.player.z);
+    const fx = feet.x, fz = feet.z, fy = feet.y || 0;
+    vHead.set(fx, fy + HEAD_Y, fz);
+    vSide.set(fx + 1, fy + HEAD_Y, fz);
+    if (!pl?.getPackPosition?.(vPack)) vPack.set(fx, fy + HEAD_Y, fz);
+    vPack.y = fy + HEAD_Y;
+    [scr.hx, scr.hy] = toScr(vHead, W, H);
+    const [sxp] = toScr(vSide, W, H);
+    [scr.px] = toScr(vPack, W, H);
+    scr.ppu = Math.max(8, Math.abs(sxp - scr.hx));
+    scr.fx = fx; scr.fz = fz;
+    return scr;
+  }
+  function goalScreenX(W, H) {
+    const g = camp.goal || views.guide?.goal;
+    if (!g || !Number.isFinite(g.x) || !Number.isFinite(g.z)) return null;
+    return toScr(vTmp.set(g.x, 0, g.z), W, H)[0];
+  }
+
+  // Things the sticker must not hide (screen rects, refreshed every AVOID_EVERY s): pad plates with their name
+  // tags, station intakes and drop zones, workers. The zone / pad Dug stands in is left out (he's using it).
+  function pushBox(W, H, x0, z0, x1, z1, y0, y1) {
+    let l = Infinity, t = Infinity, r = -Infinity, b = -Infinity;
+    for (let i = 0; i < 8; i++) {
+      const [x, y] = toScr(vTmp.set(i & 1 ? x1 : x0, i & 2 ? y1 : y0, i & 4 ? z1 : z0), W, H);
+      if (x < l) l = x; if (x > r) r = x; if (y < t) t = y; if (y > b) b = y;
+    }
+    if (r > 0 && b > 0 && l < W && t < H) avoidRects.push({ l, t, r, b });
+  }
+  function collectAvoid(W, H) {
+    avoidRects.length = 0;
+    const px = scr.fx, pz = scr.fz;
+    const inR = (zone, m = 0) => camp.inRect?.(zone, px, pz, m);
+    for (const pad of camp.pads) {
+      if (inR(pad.zone)) continue;
+      const r = views.pads?.plateRect?.(pad.id);
+      if (r) pushBox(W, H, r.x - r.hx, r.z - r.hz - PLATE_TAG, r.x + r.hx, r.z + r.hz + PLATE_TAG, 0, 0.05);
+      else { const [x, z, w, d] = pad.zone; pushBox(W, H, x - 0.5, z - 0.5 - PLATE_TAG, x + w - 0.5, z + d - 0.5 + PLATE_TAG, 0, 0.05); }
+    }
+    for (const s of camp.stations.values()) {
+      const zone = s.def?.zone;
+      if (zone && !inR(zone)) { const [x, z, w, d] = zone; pushBox(W, H, x - 0.5, z - 0.5, x + w - 0.5, z + d - 0.5, 0, 0.05); }
+      if (zone || s.def?.accepts) {
+        const p = views.campview?.intakePoint?.(s.id, v3);
+        if (p && Number.isFinite(p.x)) pushBox(W, H, p.x - 0.4, p.z - 0.4, p.x + 0.4, p.z + 0.4, Math.max(0, p.y - 0.25), p.y + 0.45);
+      }
+    }
+    for (const w of camp.workers.values()) {
+      let top = 1.25;
+      const st = views.creatures?.workerStackTop?.(w.id, v3);
+      if (st && Number.isFinite(st.y)) top = Math.max(top, st.y + 0.15);
+      pushBox(W, H, w.x - 0.36, w.z - 0.3, w.x + 0.36, w.z + 0.3, 0, top);
+    }
+  }
+  // share of the sticker's box that covers something (overlaps are summed, so two things count twice)
+  function covered(a, list) {
+    if (!a) return 0;
+    const area = Math.max(1, (a.r - a.l) * (a.b - a.t));
+    let s = 0;
+    for (const r of list) s += Math.max(0, Math.min(a.r, r.r) - Math.max(a.l, r.l)) * Math.max(0, Math.min(a.b, r.b) - Math.max(a.t, r.t));
+    return s / area;
   }
 
   function updateStack(dt) {
     const n = shownTotal();
     const cap = camp.capacity;
+    const red = reduced();
+    let measureNow = false;
     if (n !== shownN) {
       const prev = shownN;
       shownN = n;
-      if (prev >= 0 && vis > 0 && !reduced()) {
+      if (prev >= 0 && vis > 0 && !red) {
         roll = { k: roll ? Math.min(roll.k, 0.35) : 0, dir: n > prev ? 1 : -1 };
         setText(nA, String(prev)); setText(nB, String(n));
-      } else { setText(nA, String(n)); roll = null; tf(nA, ''); op(nA, 1); op(nB, 0); }
-      if (prev >= 0 && n > prev && !reduced()) { iconS.velocity += 3.2; popS.velocity += 0.9; floater(n - prev); }
+      } else { setText(nA, String(n)); setText(nB, ''); roll = null; tf(nA, ''); op(nA, 1); op(nB, 0); }
+      if (prev >= 0 && n > prev && !red) { iconS.velocity += 3.2; popS.velocity += 0.9; floater(n - prev); }
       if (n > 0) setTopIcon(camp.stack[camp.stack.length - 1]);
+      measureNow = true;
     }
-    if (cap !== shownCap) { shownCap = cap; setText(capEl, String(cap)); }
+    if (cap !== shownCap) { shownCap = cap; setText(capEl, String(cap)); measureNow = true; }
     // odometer roll
     if (roll) {
       roll.k = Math.min(1, roll.k + dt / ROLL);
       const k = easeOut(roll.k);
       tf(nA, `translateY(${(-roll.dir * k * 100).toFixed(1)}%)`); op(nA, 1 - k);
       tf(nB, `translateY(${(roll.dir * (1 - k) * 100).toFixed(1)}%)`); op(nB, k);
-      if (roll.k >= 1) { roll = null; setText(nA, String(shownN)); tf(nA, ''); op(nA, 1); op(nB, 0); }
+      if (roll.k >= 1) { roll = null; setText(nA, String(shownN)); setText(nB, ''); tf(nA, ''); op(nA, 1); op(nB, 0); measureNow = true; }
     }
+    if (measureNow) { wd.num = rollEl.offsetWidth || wd.num; wd.cap = capIn.offsetWidth || wd.cap; }
 
-    // full: the sticker turns red and reads "Full", with a soft wobble now and then
+    // ---- full: the face swaps in sequence (old scales out, then the new springs in), the body turns red ----
     const full = n >= cap || (fullHold > 0 && camp.free() <= 0);
     fullHold = Math.max(0, fullHold - dt);
-    if (full && !wasFull && !reduced()) { wob.hit(1); popS.velocity += 2.2; }
-    wasFull = full;
-    fullK = damp(fullK, full ? 1 : 0, 12, dt);
-    fullSince = full ? fullSince + dt : 0;
-    if (full && fullSince > 2.4 && !reduced()) { fullSince = 0; wob.hit(0.8); }
+    const want = full ? 'full' : 'count';
+    if (want !== face) {
+      // the count lands first ("10/10" rolls in), then the old face scales out ("Full" leaves at once: the stack
+      // is draining and its count keeps rolling)
+      if (!roll || face === 'full') faceOut = red ? 1 : Math.min(1, faceOut + dt / FACE_OUT);
+      if (faceOut >= 1) {
+        face = want; faceOut = 0; faceIn = 0;
+        faceS.value = red ? 1 : 0.55; faceS.velocity = 0; faceS.target = 1;
+        setClass(bub, 'is-full', full);
+        if (full && !red) { wob.hit(1); popS.velocity += 2.2; }
+      }
+    } else faceOut = Math.max(0, faceOut - dt / FACE_OUT);
+    faceIn = Math.min(1, faceIn + dt / 0.09);
+    fullK = damp(fullK, face === 'full' ? 1 : 0, 22, dt);
+    fullSince = face === 'full' ? fullSince + dt : 0;
+    if (face === 'full' && fullSince > 2.4 && !red) { fullSince = 0; wob.hit(0.8); }
+    const fs = (red ? 1 : faceS.update(dt)) * (1 - 0.45 * easeIn(faceOut));
+    const fa = faceIn * (1 - easeIn(faceOut));
+    const [onEl, offEl] = face === 'full' ? [fullEl, countEl] : [countEl, fullEl];
+    op(onEl, fa); op(offEl, 0);
+    tf(onEl, `translate(-50%, -50%) scale(${fs.toFixed(4)})`);
     // a soft red pulse ring breathes out of the outline every 1.3 s while full
-    pulseT = full ? pulseT + dt : 0;
-    bub.style.setProperty('--pk', (full && !reduced() ? easeOut((pulseT % 1.3) / 1.3) : 0).toFixed(3));
-    bub.style.setProperty('--full', fullK.toFixed(3));
-    const kf = easeOut(fullK);
-    op(countEl, 1 - kf);
-    op(fullEl, kf);
-    tf(countEl, `scale(${(1 - 0.2 * kf).toFixed(4)})`);
-    tf(fullEl, `scale(${(0.8 + 0.2 * kf).toFixed(4)})`);
-    setClass(bub, 'is-full', full);
+    pulseT = face === 'full' ? pulseT + dt : 0;
+    setVar(bub, '--pk', (face === 'full' && !red ? easeOut((pulseT % 1.3) / 1.3) : 0).toFixed(3));
+    setVar(bub, '--full', fullK.toFixed(3));
     capFlash = Math.max(0, capFlash - dt / 1.1);
-    bub.style.setProperty('--flash', capFlash.toFixed(3));
+    setVar(bub, '--flash', capFlash.toFixed(3));
+    // "/cap" slides in as the pack nears full (and for a moment after it grew)
+    capShowT = Math.max(0, capShowT - dt);
+    capK = damp(capK, face === 'count' && (n >= nearFull(cap) || capShowT > 0) ? 1 : 0, 14, dt);
+    if (capK < 0.002) capK = 0; else if (capK > 0.998) capK = 1;
+    const cw = `${(wd.cap * capK).toFixed(2)}px`;
+    if (capWrap.__w !== cw) { capWrap.__w = cw; capWrap.style.width = cw; }
+    op(capWrap, capK);
+    // the sticker's width eases to the face it shows
+    const wantW = face === 'full' ? wd.full : wd.num + wd.cap * capK;
+    valsW = valsW < 0 ? wantW : damp(valsW, wantW, 20, dt);
+    const vw = `${valsW.toFixed(2)}px`;
+    if (vals.__w !== vw) { vals.__w = vw; vals.style.width = vw; }
 
     // shown while carrying; leaves with a tiny grow then a shrink (DESIGN: nothing pops)
     if (n > 0) {
@@ -386,54 +554,123 @@ export function createCampHud(hud) {
       if (outT > 0.3) { vis = 0; outT = -1; }
     }
     stackAnchor.style.visibility = vis > 0 ? 'visible' : 'hidden';
-    if (vis <= 0) return;
+    if (vis <= 0) { boxR = null; return; }
 
-    // project the anchor; vertical changes (the stack growing) are smoothed, horizontal follows the robot
-    const w = anchorWorld(Math.max(n, 0));
-    ctx.camera.updateMatrixWorld();
-    w.project(ctx.camera);
+    // ---- placement: beside the head, on the side away from the goal ----
     const W = innerWidth, H = innerHeight;
-    let x = (w.x * 0.5 + 0.5) * W, y = (-w.y * 0.5 + 0.5) * H;
-    anchorY = anchorY == null ? y : anchorY + (y - anchorY) * (1 - Math.exp(-14 * dt));
-    y = anchorY;
-    const gh = guideHintRect();
-    const want = gh && Math.abs((gh.left + gh.right) / 2 - x) < (gh.width + bw) / 2 && gh.bottom > y - bh - 14 ? Math.max(0, y - (gh.top - 6)) : 0;
-    lift = damp(lift, want, 12, dt);
-    y -= lift;
-    const pad = 10, top = (mobile ? 64 : 8) + bh + pad;
-    x = Math.min(W - bw / 2 - pad, Math.max(bw / 2 + pad, x));
-    y = Math.min(H - pad, Math.max(top, y));
-    if (Math.abs(x - sx) > 0.05 || Math.abs(y - sy) > 0.05) { sx = x; sy = y; tf(stackAnchor, `translate3d(${x.toFixed(2)}px, ${y.toFixed(2)}px, 0)`); }
+    ctx.camera.updateMatrixWorld();
+    const P = projectHead(W, H);
+    const S = hud.scale || 1;
+    const bw = wd.chrome + valsW, bh = wd.h;
+    stackDx = stackDx == null || visT <= dt ? P.px - P.hx : damp(stackDx, P.px - P.hx, 12, dt);
+    const tipFor = sd => (sd < 0
+      ? Math.min(P.hx - P.ppu * HEAD_CLEAR, P.hx + stackDx - P.ppu * STACK_CLEAR)
+      : Math.max(P.hx + P.ppu * HEAD_CLEAR, P.hx + stackDx + P.ppu * STACK_CLEAR));
+    const room = sd => (sd < 0 ? tipFor(-1) - S * (bw + TAIL) : W - tipFor(1) - S * (bw + TAIL)) - 8;
+    // the box the sticker covers docked on side sd, its icon's overhang on the outer edge included
+    const boxFor = sd => {
+      const tx = tipFor(sd), l = sd < 0 ? tx - S * (bw + TAIL) : tx + S * TAIL, ov = S * wd.over;
+      return { l: l - (sd < 0 ? ov : 0), r: l + S * bw + (sd > 0 ? ov : 0), t: P.hy - (S * bh) / 2 - ov * 0.5, b: P.hy + (S * bh) / 2 };
+    };
+    if ((avoidT -= dt) <= 0) {
+      avoidT = AVOID_EVERY;
+      collectAvoid(W, H);
+      cover[0] = covered(boxFor(-1), avoidRects); cover[1] = covered(boxFor(1), avoidRects);
+    }
+    const gx = goalScreenX(W, H);
+    let wantSide = sideWant;
+    if (gx != null && Math.abs(gx - P.hx) > 24) wantSide = gx > P.hx ? -1 : 1;
+    // the goal is straight up or down the screen: take the side that hides less
+    else if (cover[wantSide > 0 ? 1 : 0] > COVER_MIN && cover[wantSide > 0 ? 0 : 1] < COVER_MIN * 0.5) wantSide = -wantSide;
+    if (room(wantSide) < 0 && room(-wantSide) >= 0) wantSide = -wantSide; // no room there: the other side
+    sideWant = wantSide;
+    if (sideOut < 0) {
+      sideHold = wantSide !== side ? sideHold + dt : 0;
+      const forced = room(side) < 0 && room(-side) >= 0;
+      if (sideHold > SIDE_HOLD || (forced && sideHold > 0)) { sideOut = 0; sideHold = 0; }
+      if (visT <= dt) { side = wantSide; sideHold = 0; } // first frame shown: start on the right side
+    }
+    if (sideOut >= 0) {
+      sideOut += dt;
+      if (sideOut >= SIDE_OUT || red) {
+        side = sideWant; sideOut = -1;
+        popS.value = red ? 1 : 0.6; popS.velocity = 0;
+      }
+    }
+    setClass(bub, 'is-r', side > 0);
+    const tipX = tipFor(side), tipY = P.hy;
+    // the sticker box relative to the tail tip, in its own (unscaled) px: beside it, vertically centred
+    const bx = side < 0 ? -bw - TAIL : TAIL, by = -bh / 2;
+    // keep clear of the guide's hint card (above or below Dug): slide up or down, whichever is shorter
+    let wantPush = 0;
+    if (ghRect) {
+      const l = tipX + S * bx, r = l + S * bw, top = tipY + S * by, bot = top + S * bh;
+      if (ghRect.left < r + 6 && ghRect.right > l - 6 && ghRect.bottom + 4 > top && ghRect.top - 4 < bot) {
+        const down = ghRect.bottom + 4 - top, up = bot - (ghRect.top - 4);
+        wantPush = (ghRect.top + ghRect.bottom) / 2 < (top + bot) / 2 ? down : -up;
+        if (Math.abs(wantPush) > 0.6 * (S * bh + ghRect.height)) wantPush = 0; // can't step out of it: stay put
+      }
+    }
+    pushY = damp(pushY, wantPush, 12, dt);
+    // keep the whole sticker on screen (below the level badge on phones)
+    if (badgeBottom < 0) badgeBottom = cluster.getBoundingClientRect().bottom;
+    const pad = 10, top = mobile ? badgeBottom + 6 : 8;
+    const x = Math.min(W - pad - S * (bx + bw), Math.max(pad - S * bx, tipX));
+    const y = Math.min(H - pad - S * (by + bh), Math.max(top - S * by, tipY + pushY));
+    if (Math.abs(x - sx) > 0.05 || Math.abs(y - sy) > 0.05 || S !== sS) {
+      sx = x; sy = y; sS = S;
+      tf(stackAnchor, `translate3d(${x.toFixed(2)}px, ${y.toFixed(2)}px, 0)${S !== 1 ? ` scale(${S.toFixed(3)})` : ''}`);
+    }
+    boxR = { l: x + S * bx, t: y + S * by, r: x + S * (bx + bw), b: y + S * (by + bh) };
 
-    // sticker motion: spring scale, the Full wobble (a gentle rock), the refusal shake
+    // ---- hide on a pad (its number is the hero); fade over plates, intakes and workers ----
+    const onPad = camp.pads.find(p => camp.inRect?.(p.zone, P.fx, P.fz, padK > 0.5 ? 0.06 : 0));
+    const still = (views.player?.speed ?? 0) < 0.6;
+    onPadT = onPad && (still || (lastPaid.id === onPad.id && clock - lastPaid.t < 0.5)) ? onPadT + dt : 0;
+    // ...and whenever the pads view has lifted a pad's countdown into its sticker (Dug stands on that pad)
+    const hideOnPad = !!views.pads?.lifted || (!!onPad && (onPadT > 0.1 || (lastPaid.id === onPad.id && clock - lastPaid.t < 0.5)));
+    padK = damp(padK, hideOnPad ? 1 : 0, 16, dt);
+    avoidHit = cover[side > 0 ? 1 : 0] > COVER_MIN && sideOut < 0;
+    avoidK = damp(avoidK, avoidHit ? (face === 'full' ? FADED_FULL : FADED) : 1, 10, dt);
+
+    // sticker motion: spring scale, the Full wobble (a gentle rock), the refusal shake, the side hop
     popS.target = 1;
-    let s = reduced() ? 1 : popS.update(dt);
+    let s = red ? 1 : popS.update(dt);
     let a = 1;
     if (outT >= 0) {
       const k = outT / 0.3;
-      s = reduced() ? 1 : k < 0.3 ? 1 + 0.08 * easeOut(k / 0.3) : 1.08 * (1 - easeIn((k - 0.3) / 0.7) * 0.4);
+      s = red ? 1 : k < 0.3 ? 1 + 0.08 * easeOut(k / 0.3) : 1.08 * (1 - easeIn((k - 0.3) / 0.7) * 0.4);
       a = 1 - easeIn(clamp01((k - 0.3) / 0.7));
     } else if (visT < 0.18) a = easeOut(visT / 0.18);
+    if (sideOut >= 0) { const k = easeIn(clamp01(sideOut / SIDE_OUT)); s *= 1 - 0.4 * k; a *= 1 - k; }
+    s *= 1 - 0.18 * padK;
+    a *= (1 - padK) * avoidK;
     wob.update(dt); shake.update(dt);
-    const rot = reduced() ? 0 : wob.value * 5;
-    const sh = reduced() ? 0 : shake.value;
-    tf(bub, `translateX(${sh.toFixed(2)}px) rotate(${rot.toFixed(2)}deg) scale(${s.toFixed(4)})`);
+    const rot = red ? 0 : wob.value * 5;
+    const shk = red ? 0 : shake.value;
+    // scale / rock about the tail tip
+    const origin = `${(-bx).toFixed(1)}px ${(-by).toFixed(1)}px`;
+    if (bub.__org !== origin) { bub.__org = origin; bub.style.transformOrigin = origin; }
+    tf(bub, `translate3d(${(bx + shk).toFixed(2)}px, ${by.toFixed(2)}px, 0) rotate(${rot.toFixed(2)}deg) scale(${s.toFixed(4)})`);
     op(bub, a);
     const is = iconS.update(dt);
-    tf(stkImg, Math.abs(is - 1) > 0.001 ? `scale(${is.toFixed(4)}) rotate(${((is - 1) * -30).toFixed(2)}deg)` : '');
+    tf(stkImg, Math.abs(is - 1) > 0.001 ? `scale(${is.toFixed(4)}) rotate(${((is - 1) * (side > 0 ? 30 : -30)).toFixed(2)}deg)` : '');
 
-    // "+N" floaters rise from the counter with a little arc and fade in the last third
+    // "+N" floaters rise from the count with a little arc and fade in the last third
     for (let i = floats.length - 1; i >= 0; i--) {
       const f = floats[i];
       f.t += dt;
       const k = f.t / FLOAT_LIFE;
-      if (k >= 1 || fullK > 0.6) { f.el.remove(); floats.splice(i, 1); continue; }
+      // they bow out once "Full" shows, on a pad, or when they would rise into the guide's hint card
+      const intoHint = ghRect && boxR && ghRect.left < boxR.r && ghRect.right > boxR.l && ghRect.bottom > boxR.t - 44 && ghRect.top < boxR.t ? 1 : 0;
+      const fade = clamp01(1 - Math.max(fullK, padK, intoHint) * 1.8) * avoidK;
+      if (k >= 1 || fade <= 0) { f.el.remove(); floats.splice(i, 1); continue; }
       const ky = easeOut(k);
-      const fx = bw / 2 - 12 + 12 * Math.sin(k * Math.PI * 0.6);
-      const fy = -bh - 10 - 34 * ky;
-      const fs = k < 0.15 ? 0.8 + 0.2 * easeOut(k / 0.15) : 1;
-      tf(f.el, `translate3d(${fx.toFixed(2)}px, ${fy.toFixed(2)}px, 0) scale(${fs.toFixed(3)})`);
-      op(f.el, k < 0.12 ? k / 0.12 : k > 0.66 ? 1 - (k - 0.66) / 0.34 : 1);
+      const fx = bx + bw * (side < 0 ? 0.62 : 0.38) + (side < 0 ? 10 : -10) * Math.sin(k * Math.PI * 0.6);
+      const fy = by - 4 - 30 * ky;
+      const fsc = k < 0.15 ? 0.8 + 0.2 * easeOut(k / 0.15) : 1;
+      tf(f.el, `translate3d(${fx.toFixed(2)}px, ${fy.toFixed(2)}px, 0) scale(${fsc.toFixed(3)})`);
+      op(f.el, (k < 0.12 ? k / 0.12 : k > 0.66 ? 1 - (k - 0.66) / 0.34 : 1) * fade);
     }
     if (n !== lastAriaN || cap !== lastAriaCap) {
       lastAriaN = n; lastAriaCap = cap;
@@ -442,81 +679,16 @@ export function createCampHud(hud) {
   }
 
   // =====================================================================================================
-  // level-up ribbon
+  // level-up ribbon, the "camp complete" card
   // =====================================================================================================
-  let bState = null; // { t, level, unlocks, collecting, complete, chips: [{ el, s }] }
-  events.on('hearth:level', ({ level } = {}) => {
-    const L = level ?? camp.level;
-    bState = { t: 0, level: L, unlocks: [], collecting: true, complete: L >= MAX_LEVEL, chips: [] };
-    hud.campToasts?.block?.(true);
-  });
-  events.on('pad:shown', ({ pad } = {}) => {
-    if (bState?.collecting && pad && !pad.id.startsWith('hearth:')) bState.unlocks.push(pad.id);
-  });
-
-  function fillBanner(st) {
-    setOl(bTitle, st.level <= 1 ? 'The fire is lit' : `Camp level ${st.level}`); // level 1 = the cold hearth was lit
-    setClass(banner, 'is-max', st.complete);
-    bChips.textContent = '';
-    const chip = (iconHtml, text, cls = '') => {
-      const el = h('span', { class: `rb-chip ${cls}` }, iconHtml ? h('span', { class: 'rb-chip-icon', html: iconHtml }) : null, text);
-      el.style.opacity = '0';
-      bChips.append(el);
-      st.chips.push({ el, s: new Spring(0.6, { stiffness: 440, damping: 21 }) });
-    };
-    if (st.complete) { chip(glyph('star'), 'Your camp is complete', 'rb-chip-gold'); return; }
-    const labels = st.unlocks.map(unlockLabel).filter(Boolean);
-    const max = 3; // UI-STYLE: 1-3 unlocked things
-    const shownL = labels.slice(0, max);
-    for (const l of shownL) chip(glyph(l.icon, ...(l.args || [])), l.text);
-    if (labels.length > shownL.length) chip(null, `+${labels.length - shownL.length}`, 'rb-more');
-  }
-
-  function updateBanner(dt) {
-    const st = bState;
-    if (!st) return;
-    if (st.collecting) { st.collecting = false; fillBanner(st); banner.style.visibility = 'visible'; op(banner, 0); return; }
-    st.t += dt;
-    const t = st.t;
-    if (t >= B_HOLD + B_OUT) {
-      bState = null;
-      banner.style.visibility = 'hidden';
-      hud.campToasts?.block?.(false);
-      if (st.complete) hud.campToasts?.show?.({ text: 'Camp complete! ', strong: 'The isle runs itself', kind: 'celebrate', icon: 'star' });
-      return;
-    }
-    const red = reduced();
-    const kIn = easeOut(clamp01(t / B_IN));
-    const kOut = t > B_HOLD ? easeOut(clamp01((t - B_HOLD) / B_OUT)) : 0;
-    op(banner, clamp01(t / 0.16) * (1 - kOut));
-    const y = red ? 0 : (1 - kIn) * -24 + kOut * -14;
-    const s = red ? 1 : (0.9 + 0.1 * kIn) * (1 - 0.04 * kOut);
-    tf(banner, `translate3d(-50%, ${y.toFixed(2)}px, 0) scale(${s.toFixed(4)})`);
-    // tails unfold sideways from behind the face
-    const kTail = easeOut(clamp01((t - 0.05) / 0.38));
-    tails.style.setProperty('--tail', (red ? 1 : 0.3 + 0.7 * kTail).toFixed(4));
-    // the title lands with a bump
-    const kp = clamp01((t - 0.18) / 0.34);
-    const bump = red || kp <= 0 || kp >= 1 ? 1 : 1 + 0.16 * Math.sin(Math.PI * kp) * (1 - kp * 0.4);
-    tf(bTitle, `scale(${bump.toFixed(4)})`);
-    // star burst: grows behind, turns slowly, fades with the ribbon
-    const kb = easeOut(clamp01((t - 0.08) / 0.5));
-    op(burst, kb * (1 - kOut) * 0.75);
-    tf(burst, `translate(-50%, -50%) rotate(${(red ? 0 : t * 14).toFixed(2)}deg) scale(${(red ? 1 : 0.6 + 0.4 * kb).toFixed(4)})`);
-    // one sheen across the face
-    const ks = clamp01((t - 0.45) / 0.75);
-    op(bSheen, ks > 0 && ks < 1 && !red ? 1 : 0);
-    tf(bSheen, `translateX(${(-130 + 360 * easeOut(ks)).toFixed(1)}%) skewX(-18deg)`);
-    // unlock stickers pop in one by one; they leave together a beat before the ribbon
-    const kChipOut = t > B_HOLD - 0.08 ? easeOut(clamp01((t - B_HOLD + 0.08) / B_OUT)) : 0;
-    st.chips.forEach((c, i) => {
-      const t0 = B_CHIP0 + i * B_CHIP_STAGGER;
-      if (t < t0) { op(c.el, 0); return; }
-      c.s.target = 1;
-      const cs = red ? 1 : c.s.update(dt);
-      op(c.el, clamp01((t - t0) / 0.12) * (1 - kChipOut));
-      tf(c.el, `translateY(${(kChipOut * -6).toFixed(2)}px) scale(${(cs * (1 - 0.06 * kChipOut)).toFixed(4)})`);
-    });
+  const ribbon = createRibbon(hud, { cluster });
+  let cardPending = false;
+  const card = createCompleteCard(hud, { badgeEl: badge, onClosed: markDone });
+  events.on('camp:complete', () => { cardPending = true; });
+  function updateComplete(dt) {
+    // the card follows the level-5 ribbon (it waits for it to fold away), then shrinks into the badge
+    if (cardPending && (!ribbon.active || ribbon.t > ribbon.end - 0.5)) { cardPending = false; card.open(); }
+    card.update(dt);
   }
 
   // =====================================================================================================
@@ -525,7 +697,7 @@ export function createCampHud(hud) {
   const toast = o => hud.campToasts?.show?.(o);
   events.on('upgrade', ({ id, upgrade } = {}) => {
     const u = upgrade || UPGRADES[id] || {};
-    if (u.capacity) toast({ text: `${u.name || 'Bigger pack'}: `, strong: `carry ${u.capacity}`, kind: 'good', icon: 'pack' });
+    if (u.capacity) toast({ text: `${u.name || 'Bigger pack'}: `, strong: 'carry ', num: u.capacity, kind: 'good', icon: 'pack' });
     else if (u.gatherSpeed) toast({ text: `${u.name || 'New tools'}: `, strong: 'gather faster', kind: 'good', icon: 'axe' });
     else toast({ text: u.name || 'Upgrade done', kind: 'good', icon: 'build' });
   });
@@ -543,7 +715,7 @@ export function createCampHud(hud) {
   events.on('worker:hungry', () => {
     if (clock - lastHungry < 45) return;
     lastHungry = clock;
-    toast({ text: 'Workers are hungry: ', strong: 'cook some meat', kind: 'warn', icon: 'bowl' });
+    toast({ text: 'Workers are hungry: ', strong: 'cook meat', kind: 'warn', icon: 'bowl' });
   });
 
   // =====================================================================================================
@@ -568,20 +740,35 @@ export function createCampHud(hud) {
       clock += dt;
       updateLevel(dt);
       updateTip(dt);
+      ghRect = readGuideHint();
       updateStack(dt);
-      updateBanner(dt);
+      ribbon.update(dt);
+      updateComplete(dt);
       updateHint(dt);
     },
-    resize() { measure(); sx = sy = -1; },
+    resize() { measure(); measureSticker(); ribbon.resize(); sx = sy = -1; badgeBottom = -1; },
     hudBottom: () => hudBottom,
     // test hooks
-    showBanner(level = camp.level, unlocks = []) {
-      bState = { t: 0, level, unlocks: [...unlocks], collecting: true, complete: level >= MAX_LEVEL, chips: [] };
-      hud.campToasts?.block?.(true);
-    },
+    showBanner(level = camp.level, unlocks = []) { ribbon.show(level, unlocks); },
+    showComplete() { card.open(); },
+    closeComplete() { card.close(); },
     openTip, closeTip,
-    get bannerT() { return bState ? bState.t : -1; },
-    get stackScreen() { return { x: sx, y: sy, visible: vis > 0 }; },
+    get bannerT() { return ribbon.t; },
+    get stackScreen() { return { x: sx, y: sy, visible: vis > 0, side, faded: +avoidK.toFixed(3), hidden: +padK.toFixed(3), face, box: boxR }; },
+    get completeOpen() { return card.isOpen; },
+    _avoid: () => ({ rects: avoidRects.map(r => [r.l, r.t, r.r, r.b].map(Math.round)), cover: [...cover] }),
+    // Screen rects the HUD covers right now (the badge, its "next level" card, toasts, the ribbon, the
+    // completion card), so floating things such as the guide's off-screen chip can keep clear.
+    rects() {
+      const out = [];
+      const add = el => { if (!el || el.style.visibility === 'hidden') return; const r = el.getBoundingClientRect(); if (r.width > 0 && r.height > 0) out.push(r); };
+      add(lvlBtn);
+      if (tipS.k > 0) add(tip);
+      for (const row of hud.campToasts?.rows?.() || []) add(row.firstElementChild);
+      out.push(...ribbon.rects());
+      const cr = card.rect(); if (cr) out.push(cr);
+      return out;
+    },
     el: cluster,
   };
 }
@@ -591,32 +778,4 @@ function svgEl(tag, attrs, ...kids) {
   for (const [k, v] of Object.entries(attrs || {})) el.setAttribute(k, String(v));
   for (const c of kids) el.append(c);
   return el;
-}
-
-// Folded ribbon ends: a notched strip with an outline, and a darker fold where it tucks under the face.
-// Drawn once; the CSS hangs one off each side of the face and unfolds them with --tail.
-function ribbonTailsSvg() {
-  const ink = '#5b3a21';
-  const tail = flip => `<svg class="rb-tail ${flip ? 'rb-tail-r' : 'rb-tail-l'}" viewBox="0 0 64 56" aria-hidden="true">`
-    + `<g${flip ? ' transform="translate(64 0) scale(-1 1)"' : ''}>`
-    + `<path d="M62 10H6.5c-1.6 0-2.4 1.9-1.3 3L18 27 5.2 41c-1.1 1.1-.3 3 1.3 3H62z" class="t-body" stroke="${ink}" stroke-width="3" stroke-linejoin="round"/>`
-    + '<path class="t-hi" d="M60 13.5H11" fill="none" stroke-width="2" stroke-linecap="round" opacity=".85"/>'
-    + `<path class="t-fold" d="M46 44l16 9.5V44z" stroke="${ink}" stroke-width="3" stroke-linejoin="round"/>`
-    + '</g></svg>';
-  return tail(false) + tail(true);
-}
-
-// A soft star burst for behind the ribbon: 14 cream rays fading out radially.
-function burstSvg() {
-  let rays = '';
-  const n = 14;
-  for (let i = 0; i < n; i++) {
-    const a0 = (i / n) * Math.PI * 2, a1 = a0 + ((Math.PI * 2) / n) * 0.5;
-    const p = (a, r) => `${(100 + Math.cos(a) * r).toFixed(1)} ${(100 + Math.sin(a) * r).toFixed(1)}`;
-    rays += `<path d="M100 100L${p(a0, 100)}L${p(a1, 100)}Z"/>`;
-  }
-  return '<svg viewBox="0 0 200 200" aria-hidden="true"><defs>'
-    + '<radialGradient id="rbFade" cx="50%" cy="50%" r="50%"><stop offset="0" stop-color="#fff6d8" stop-opacity=".95"/>'
-    + '<stop offset=".55" stop-color="#ffe7a6" stop-opacity=".5"/><stop offset="1" stop-color="#ffe7a6" stop-opacity="0"/></radialGradient>'
-    + `</defs><g fill="url(#rbFade)">${rays}</g><circle cx="100" cy="100" r="46" fill="url(#rbFade)" opacity=".7"/></svg>`;
 }

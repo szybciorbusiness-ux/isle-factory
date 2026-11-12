@@ -285,7 +285,7 @@ export function createCamp(sim, { playerPos = null, seed = 11 } = {}) {
     const key = kind + ':' + id;
     if (dwell.key !== key) { dwell.key = key; dwell.t = 0; }
     dwell.t += dt;
-    if (isGoalTarget(kind, id)) return dwell.t >= 0.05;
+    if (isGoalTarget(kind, id) || kind === 'zone') return dwell.t >= 0.05;   // raw only ever goes to its station
     return dwell.t >= DWELL && motionState.speed < STILL;
   }
   function updatePlayerTransfers(dt, p) {
@@ -307,7 +307,8 @@ export function createCamp(sim, { playerPos = null, seed = 11 } = {}) {
       if (!inRect(pad.zone, p.x, p.z)) continue;
       if (!camp.stack.some(it => (pad.paid[it] ?? Infinity) < pad.cost[it])) continue;
       inside = true;
-      if (!intends('pad', pad.id, dt)) return null;
+      if (!intends('pad', pad.id, dt)) { camp.exchanging = null; return null; }
+      camp.exchanging = 'pad:' + pad.id;
       transferTick(`pad:${pad.id}`, dt, () => {
         const item = takeFromStack(it => (pad.paid[it] ?? Infinity) < pad.cost[it]);
         if (!item) return false;
@@ -322,7 +323,8 @@ export function createCamp(sim, { playerPos = null, seed = 11 } = {}) {
       if (!s.def.zone || !inRect(s.def.zone, p.x, p.z)) continue;
       if (!camp.stack.some(it => accepts(s, it))) continue;
       inside = true;
-      if (!intends('zone', s.id, dt)) return null;
+      if (!intends('zone', s.id, dt)) { camp.exchanging = null; return null; }
+      camp.exchanging = 'zone:' + s.id;
       transferTick(`zone:${s.id}`, dt, () => {
         const item = takeFromStack(it => accepts(s, it));
         if (!item) return false;
@@ -335,7 +337,8 @@ export function createCamp(sim, { playerPos = null, seed = 11 } = {}) {
       if (!s.pile || !inRect([s.pile.tile[0], s.pile.tile[1], 1, 1], p.x, p.z, 0.1)) continue;
       if (!s.pile.count || camp.free() <= 0 || stillNeeded(s.pile.item) <= 0) continue;
       inside = true;
-      if (!intends('pile', s.id, dt)) return null;
+      if (!intends('pile', s.id, dt)) { camp.exchanging = null; return null; }
+      camp.exchanging = 'pile:' + s.id;
       transferTick(`pile:${s.id}`, dt, () => {
         if (!s.pile.count || camp.free() <= 0 || stillNeeded(s.pile.item) <= 0) return false;
         s.pile.count--;
@@ -347,6 +350,7 @@ export function createCamp(sim, { playerPos = null, seed = 11 } = {}) {
       return 'pile';
     }
     xfer.key = null;
+    camp.exchanging = null;
     if (!inside) { dwell.key = null; dwell.t = 0; }
     return null;
   }
@@ -378,12 +382,33 @@ export function createCamp(sim, { playerPos = null, seed = 11 } = {}) {
   function scheduleRespawn(kind, x, z, info, delay) {
     if (x == null) return;
     schedule(delay, function retry() {
-      if (sim.at(x, z) || blockers.has(map.idx(x, z)) || near(getPlayer(), x, z, 1.2)) { schedule(5, retry); return; }
+      if (sim.at(x, z) || blockers.has(map.idx(x, z)) || near(getPlayer(), x, z, 1.2) || !keepsConnected(x, z)) { schedule(5, retry); return; }
       const e = sim.spawnResource?.(kind, x, z, { variant: info?.variant, rot: info?.rot, scale: info?.scale, grow: true });
       if (e) events.emit('camp:regrow', { entity: e });
     });
   }
   const near = (p, x, z, r) => Math.hypot(p.x - x, p.z - z) < r;
+  // Would blocking (x, z) split the walkable map? Its walkable 4-neighbours must still reach each other around it,
+  // else a regrown tree or rock could seal the player (or a worker) inside a tunnel they chopped (pacing bot: boxed
+  // in on the south isle with the sawmill full, so wood wasn't wanted and auto-gather couldn't chop out).
+  const DIRS4 = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+  function keepsConnected(x, z) {
+    const nbs = DIRS4.map(([dx, dz]) => [x + dx, z + dz]).filter(([a, b]) => sim.isWalkable(a, b));
+    if (nbs.length <= 1) return true;
+    const targets = new Set(nbs.slice(1).map(([a, b]) => map.idx(a, b)));
+    const seen = new Set([map.idx(x, z), map.idx(nbs[0][0], nbs[0][1])]);
+    const q = [nbs[0]];
+    for (let i = 0; i < q.length && i < 1200; i++) {
+      const [a, b] = q[i];
+      for (const [dx, dz] of DIRS4) {
+        const na = a + dx, nb = b + dz, k = map.idx(na, nb);
+        if (seen.has(k) || !sim.isWalkable(na, nb)) continue;
+        if (targets.has(k)) { targets.delete(k); if (!targets.size) return true; }
+        seen.add(k); q.push([na, nb]);
+      }
+    }
+    return false;
+  }
 
   function nearestResource(px, pz, radius) {
     let best = null, bestD = Infinity;
@@ -423,22 +448,32 @@ export function createCamp(sim, { playerPos = null, seed = 11 } = {}) {
   }
   camp.useful = useful;
   const KIND_ITEM = { tree: 'wood', stump: 'wood', rock: 'stone' };
+  // Auto-gather takes the guide's current item freely; anything else only while it's useful AND the pack holds
+  // less than a quarter of it, so walking past deer on the way to a plank pad never fills the pack with raw meat.
+  const sideCap = () => Math.max(3, Math.ceil(camp.capacity * 0.25));
+  function wanted(item) {
+    if (!item || !useful(item)) return false;
+    const g = camp.goal;
+    if (g && (g.item === item || g.raw === item)) return true;
+    return camp.stack.filter(i => i === item).length < sideCap();
+  }
+  camp.wanted = wanted;
   const swing = { cooldown: 0 };
   function updatePlayerGather(dt, p, inZone) {
     swing.cooldown -= dt;
     if (swing.cooldown > 0 || inZone || camp.free() <= 0) return;
-    const animal = useful('meat') ? nearestAnimal(p.x, p.z, CAMP.huntRadius, false) : null;
+    const animal = wanted('meat') ? nearestAnimal(p.x, p.z, CAMP.huntRadius, false) : null;
     let res = null;
     if (!animal) {
       const near = nearestResource(p.x, p.z, CAMP.gatherRadius);
-      if (near && useful(KIND_ITEM[near.kind])) res = near;
+      if (near && wanted(KIND_ITEM[near.kind])) res = near;
       else if (near) {
         // the nearest is not useful (a rock): look for a useful one in reach instead
         let best = null, bd = Infinity;
         const tx = Math.round(p.x), tz = Math.round(p.z);
         for (let dz = -2; dz <= 2; dz++) for (let dx = -2; dx <= 2; dx++) {
           const e = sim.at(tx + dx, tz + dz);
-          if (!e?.resource || reserved.has(e.id) || !useful(KIND_ITEM[e.kind])) continue;
+          if (!e?.resource || reserved.has(e.id) || !wanted(KIND_ITEM[e.kind])) continue;
           const d = Math.hypot(e.x - p.x, e.z - p.z);
           if (d <= CAMP.gatherRadius && d < bd) { best = e; bd = d; }
         }
@@ -737,6 +772,7 @@ export function createCamp(sim, { playerPos = null, seed = 11 } = {}) {
   // ---------- main update ----------
   let goalTimer = 0;
   camp.goal = null;
+  camp.exchanging = null;   // "pad:<id>" | "zone:<id>" | "pile:<id>" while the player is actually exchanging
   camp.update = dt => {
     camp.time += dt;
     for (let i = later.length - 1; i >= 0; i--) if (later[i].t <= camp.time) { const { fn } = later[i]; later.splice(i, 1); fn(); }
@@ -836,8 +872,13 @@ export function createCamp(sim, { playerPos = null, seed = 11 } = {}) {
           if (carried(raw) > 0 && accepts(st, raw) && (carried(raw) >= rawWanted || free <= 0 || !reach(RAW_SOURCE[raw]))) {
             return at(rectCenter(st.def.zone), { kind: 'drop', stationId: st.id, item: raw });
           }
-          // still more to make: go get raw
-          if (rawWanted > carried(raw) && free > 0 && RAW_SOURCE[raw]) {
+          // the pile already holds a full load (or all we need): take it before making more
+          if (st.pile && free > 0 && st.pile.count >= Math.min(want, free)) {
+            return at({ x: st.pile.tile[0], z: st.pile.tile[1] }, { kind: 'pickup', stationId: st.id, item });
+          }
+          // still more to make: go get raw (only while the station can take it: a full input + full pile means
+          // the line is backed up, and auto-gather won't pick up raw nobody can use)
+          if (rawWanted > carried(raw) && free > 0 && RAW_SOURCE[raw] && accepts(st, raw)) {
             const t = reach(RAW_SOURCE[raw]);
             if (t) return { kind: RAW_SOURCE[raw] === 'animal' ? 'hunt' : 'gather', item: raw, ...t };
           }
@@ -864,7 +905,59 @@ export function createCamp(sim, { playerPos = null, seed = 11 } = {}) {
       }
       return null;
     }
+    // Sticky: while the player stands in the goal's pad / drop zone / pile and the exchange can go on, keep that
+    // goal until it's spent, so the arrow never jumps to a tree mid-payment (verify critic: the goal flipped after
+    // the first item landed, and late game turned into 2-3-item ferry trips).
+    const prev = camp.goal;
+    if (prev?.kind === 'pay') {
+      const pad = camp.pads.find(q => q.id === prev.padId);
+      if (pad && inRect(pad.zone, p.x, p.z, 0.15)) {
+        const item = Object.keys(pad.cost).find(k => pad.paid[k] < pad.cost[k] && carried(k) > 0);
+        if (item) return at(rectCenter(pad.zone), { kind: 'pay', padId: pad.id, item });
+      }
+    } else if (prev?.kind === 'drop') {
+      const st = camp.stations.get(prev.stationId);
+      if (st?.def.zone && inRect(st.def.zone, p.x, p.z, 0.15)) {
+        const item = camp.stack.find(it => accepts(st, it));
+        if (item) return at(rectCenter(st.def.zone), { kind: 'drop', stationId: st.id, item });
+      }
+    } else if (prev?.kind === 'pickup') {
+      const st = camp.stations.get(prev.stationId);
+      if (st?.pile?.count > 0 && free > 0 && stillNeeded(st.pile.item) > 0 && inRect([st.pile.tile[0], st.pile.tile[1], 1, 1], p.x, p.z, 0.1)) {
+        return at({ x: st.pile.tile[0], z: st.pile.tile[1] }, { kind: 'pickup', stationId: st.id, item: st.pile.item });
+      }
+    }
     const order = PADS.map(d => camp.pads.find(q => q.id === d.id)).filter(Boolean);
+    const mainNeed0 = order.length ? needOf(order[0]) : {};
+    // Dead weight: raw the main pad's plan doesn't use, holding more than a quarter of the pack -> unload it at its
+    // station now (verify critic: 8-16 raw meat clogged a 30-slot pack for 6 minutes and froze auto-gather).
+    {
+      const mainRaw = new Set(Object.keys(mainNeed0).flatMap(k => [k, rawOf(k)]).filter(Boolean));
+      for (const it of new Set(camp.stack)) {
+        if (mainRaw.has(it) || carried(it) < sideCap() + 2) continue;
+        const s = stationFor(it);
+        if (s && accepts(s, it)) return at(rectCenter(s.def.zone), { kind: 'drop', stationId: s.id, item: it });
+      }
+    }
+    // A cheap boost (hire / upgrade) whose whole remaining cost sits in the pack or on a nearby pile: take it now,
+    // between deliveries, rather than leave a full pile idle beside an unpaid pad (verify critic: Hunter 2).
+    if (order.length && Object.entries(mainNeed0).every(([k]) => carried(k) === 0)) {
+      for (const q of order.slice(1)) {
+        if (!/^(hire|upgrade):/.test(q.id)) continue;
+        const need = needOf(q);
+        const c = rectCenter(q.zone);
+        if (Math.hypot(c.x - p.x, c.z - p.z) > 10) continue;
+        let toTake = 0;
+        const ok = Object.entries(need).every(([k, n]) => {
+          const st = producerOf(k), short = Math.max(0, n - carried(k));
+          toTake += short;
+          return short === 0 || (st?.pile && st.pile.count >= short && Math.hypot(st.pile.tile[0] - p.x, st.pile.tile[1] - p.z) <= 10);
+        });
+        if (!ok || toTake > free) continue;
+        const g = planFor(q);
+        if (g && (g.kind === 'pay' || g.kind === 'pickup')) return g;
+      }
+    }
     // pack nearly full of things only a non-main pad wants: pay there first (nearest)
     if (free <= 2 && order.length) {
       const mainNeed = needOf(order[0]);
@@ -882,6 +975,12 @@ export function createCamp(sim, { playerPos = null, seed = 11 } = {}) {
     for (const item of new Set(camp.stack)) { const s = stationFor(item); if (s && accepts(s, item)) return at(rectCenter(s.def.zone), { kind: 'drop', stationId: s.id, item }); }
     for (const q of order) { const item = Object.keys(q.cost).find(k => q.paid[k] < q.cost[k] && carried(k) > 0); if (item) return at(rectCenter(q.zone), { kind: 'pay', padId: q.id, item }); }
     for (const s of camp.stations.values()) if (s.pile && making(s)) return { kind: 'wait', stationId: s.id, item: s.pile.item, x: s.pile.tile[0], z: s.pile.tile[1] };
+    // still nothing (e.g. no deer on the isle yet): wait by the pile the main pad's item will come from, so the
+    // guide shows its calm ring instead of nothing
+    for (const k of Object.keys(mainNeed0)) {
+      const st = producerOf(k);
+      if (st?.pile) return { kind: 'wait', stationId: st.id, item: k, x: st.pile.tile[0], z: st.pile.tile[1] };
+    }
     return null;
   };
 

@@ -4,9 +4,14 @@
 // zones breathe on the ground and light up when you stand in them, and every converting station wears a little
 // wooden sign (input icon -> output icon) so it explains itself (FIRST-20.md).
 //
+// The hearth keeps growing with the camp: a bigger, taller flame and a wider pool of light every level, a spark
+// column and lit lanterns at level 4, a bonfire with a crown of sparks at level 5 (camp/stations.js, camp/fire.js).
+// Pickup piles are heaps that grow taller and spill past their pallet, bump on every arrival and part around Dug
+// while he wades in to take from them (camp/piles.js + drawPile here).
+//
 // Draw calls (everything built): ~7 station bodies + ~10 moving parts + 3 line shapes + 1 pallets +
-// 3 fire systems + up to 7 item pools + 1 zone/ring mesh + <= 4 sign meshes (<= 45). All motion is driven from
-// update(dt).
+// 3 fire systems + 1 hearth lamps + up to 7 item pools + 1 zone/ring mesh + <= 4 sign meshes (<= 46). All motion
+// is driven from update(dt).
 //
 // API (views.campview): { object, stationObject(id), pileTop(id), pileCrest(id), zoneCenter(id), intakePoint(id),
 //   inputPoint(id) (alias of intakePoint), lineEnd(id), stationTop(id), signPoint(id), coveredTiles(id),
@@ -17,7 +22,7 @@ import { CAMP, STATIONS } from '../sim/camp-data.js';
 import { createItemPools } from './camp/itempool.js';
 import { createFireSystem } from './camp/fire.js';
 import { createLines, lineLayout, RIDE_Y } from './camp/lines.js';
-import { pileSlot, pileLayout, pileCrest } from './camp/piles.js';
+import { pileSlot, pileLayout, pileCrest, PALLET_TOP } from './camp/piles.js';
 import { createZones } from './camp/zones.js';
 import { buildStationRig } from './camp/stations.js';
 import { createSlots, popScale } from './camp/slots.js';
@@ -49,7 +54,11 @@ function palletGeometry() {
   for (let i = 0; i < 5; i++) p.add(rbox(0.15, 0.03, 0.84, 0.012), i % 2 ? C.wood : C.woodLight, { p: [-0.34 + i * 0.17, 0.045, 0], jitter: 0.03, seed: i + 3 });
   return p.merge();
 }
-const PALLET_TOP = 0.06;
+// (PALLET_TOP comes from piles.js) Dug wading into a heap pushes the items within PART.radius of him aside
+const PART = { reach: 0.62, radius: 0.36 };
+// heap shading: items at the foot of a heap get `low`, those `height` up and above get `high` (untinted)
+const HEAP_SHADE = { low: new THREE.Color(0.7, 0.64, 0.6), high: new THREE.Color(1, 1, 1), height: 0.42 };
+const _tint = new THREE.Color();
 
 export function create(ctx) {
   const { scene, camp, events, views } = ctx;
@@ -244,20 +253,29 @@ export function create(ctx) {
     sv.pile.last = n;
   });
   // pads.js plays the shockwave / light rays / camera kick; the hearth itself flares, sheds embers and grows decor
+  // (the hearth rig ducks the flame for a beat, then whooshes it up into its bigger size: see stations.js)
   on('hearth:level', ({ level }) => {
     const sv = svs.get('hearth');
     if (!sv) return;
     sv.rig.levelUp?.(level);
     sv.squash.kick(level <= 1 ? -2 : -3);
-    flash = 1;
+    if (level <= 1) flash = 1;
   });
+  // the crowning moment (level 5): after the whoosh, a second roar with a fountain of sparks and confetti
   on('camp:complete', () => {
     const sv = svs.get('hearth');
     if (!sv) return;
-    sv.rig.fire?.flare?.(2.4);
-    fire.burst(sv.rig.fire, 40);
-    fx()?.confetti?.(new THREE.Vector3(sv.center.x, 1.2, sv.center.z), { count: 40 });
+    later(0.55, () => {
+      sv.rig.fire?.flare?.(1.6);
+      sv.squash.kick(-2.4);
+      fire.burst(sv.rig.fire, 34);
+      fire.burstColumn?.(sv.rig.fire, 36);
+      fx()?.confetti?.(new THREE.Vector3(sv.center.x, 1.6, sv.center.z), { count: 40 });
+      fx()?.sparkle?.(new THREE.Vector3(sv.center.x, 2.0, sv.center.z), { count: 18, spread: 1.0, size: 0.14, color: '#ffe27a' });
+    });
   });
+  const timers = [];
+  const later = (t, fn) => timers.push({ t, fn });
   on('worker:hired', () => svs.get('hut')?.rig.openDoor?.());
 
   function intakeWobble(sv) {
@@ -367,11 +385,37 @@ export function create(ctx) {
     const sxz = 1 / Math.sqrt(Math.max(0.3, B));
     const staticN = total - P.hops.length;
     const slot = P.slot || (P.slot = {});
+    // the heap parts around Dug while he wades in to take from it (items slide aside and settle back after)
+    let plx = 0, plz = 0, inPile = false;
+    if (hasPlayer()) {
+      views.player.getPosition(playerPos);
+      plx = playerPos.x - tx; plz = playerPos.z - tz;
+      inPile = Math.abs(plx) < PART.reach && Math.abs(plz) < PART.reach;
+    }
+    P.part = THREE.MathUtils.damp(P.part || 0, inPile ? 1 : 0, inPile ? 9 : 4, dt);
+    if (inPile) { P.plx = plx; P.plz = plz; }
+    const part = P.part > 0.01 ? P.part : 0;
+    // each arrival knocks a little ripple through the items around where it landed
+    const R = P.ripple;
+    if (R) { R.t += dt; if (R.t > 0.6) P.ripple = null; }
+    const rip = R ? 0.045 * Math.exp(-R.t * 7) * Math.sin(R.t * 26) : 0;
+    _e.order = 'ZXY';     // slot tilts (rx, rz) are world-space tips applied after the item's own yaw
     for (let i = 0; i < staticN; i++) {
       pileSlot(P.item, i, slot);
       const s = slot.s;
-      _m.compose(_p.set(tx + slot.x * sxz, PALLET_TOP + slot.y * B, tz + slot.z * sxz), _q.setFromEuler(_e.set(slot.rx, slot.ry, slot.rz)), _s.set(s * sxz, s * B, s * sxz));
-      pools.push(P.item, _m);
+      let x = slot.x, y = slot.y, z = slot.z;
+      if (R) { const d = Math.hypot(x - R.x, z - R.z); if (d < 0.42) y -= rip * (1 - d / 0.42); }
+      if (part) {
+        const dx = x - P.plx, dz = z - P.plz, d = Math.hypot(dx, dz) || 1e-3;
+        const push = Math.max(0, PART.radius - d) * part;
+        if (push > 0) { x += (dx / d) * push * 0.9; z += (dz / d) * push * 0.9; y = Math.max(-PALLET_TOP, y - push * 0.7); }
+      }
+      _m.compose(_p.set(tx + x * sxz, PALLET_TOP + y * B, tz + z * sxz), _q.setFromEuler(_e.set(slot.rx, slot.ry, slot.rz)), _s.set(s * sxz, s * B, s * sxz));
+      // soft occlusion: the lower an item sits in the heap, the warmer and darker it is, so the mound reads as a
+      // mound from the high camera
+      const k = clamp((slot.y + PALLET_TOP) / HEAP_SHADE.height);
+      _tint.copy(HEAP_SHADE.low).lerp(HEAP_SHADE.high, Math.sqrt(k));
+      pools.push(P.item, _m, _tint);
     }
     // arrivals hop from the line end to their slot
     for (let j = 0; j < P.hops.length; j++) {
@@ -381,25 +425,29 @@ export function create(ctx) {
       pileSlot(P.item, staticN + j, slot);
       const to = _v.set(tx + slot.x, PALLET_TOP + slot.y, tz + slot.z);
       const x = THREE.MathUtils.lerp(h.from.x, to.x, k), z = THREE.MathUtils.lerp(h.from.z, to.z, k);
-      const y = THREE.MathUtils.lerp(h.from.y, to.y, k) + Math.sin(k * Math.PI) * (0.32 + slot.y * 0.3);
+      const y = THREE.MathUtils.lerp(h.from.y, to.y, k) + Math.sin(k * Math.PI) * (0.32 + Math.max(0, slot.y) * 0.3);
       const ke = ease.cubicOut(k);
       const yaw = h.yaw + (slot.ry - h.yaw) * ke;
-      const s = slot.s * (k > 0.85 ? 1 + 0.12 * Math.sin((k - 0.85) / 0.15 * Math.PI) : 1);
+      const s = slot.s * (k > 0.85 ? 1 + 0.14 * Math.sin((k - 0.85) / 0.15 * Math.PI) : 1);
       _m.compose(_p.set(x, y, z), _q.setFromEuler(_e.set(slot.rx * ke, yaw, slot.rz * ke)), _s.set(s, s, s));
       pools.push(P.item, _m);
     }
-    // landed hops become part of the stack (the oldest lands first)
-    while (P.hops.length && P.hops[0].t >= P.hops[0].dur) { P.hops.shift(); P.bounce.kick(-1.1); }
+    _e.order = 'XYZ';
+    // landed hops become part of the heap (the oldest lands first): the heap bumps, a ripple runs through it, and
+    // an item that slid off onto the grass kicks up a little dust
+    while (P.hops.length && P.hops[0].t >= P.hops[0].dur) {
+      P.hops.shift();
+      P.bounce.kick(-2.1);
+      pileSlot(P.item, staticN, slot);
+      P.ripple = { x: slot.x, z: slot.z, t: 0 };
+      if (slot.spill > 0.5 && !mobile) fx()?.puff?.(_v.set(tx + slot.x * 1.1, 0.04, tz + slot.z * 1.1), { count: 2, size: 0.07, spread: 0.12, up: 0.15, color: '#f6efdf' });
+    }
 
     // pickup ring: faint at rest, warm while the player stands on it, flashing as items leave
     P.takeT += dt;
     if (P.ring) {
       if (sv.lineT >= 100 || lt > 0.1) P.ring.appear = total > 0 || P.hops.length ? 0.55 : 0.35;
-      let on = false;
-      if (hasPlayer()) {
-        views.player.getPosition(playerPos);
-        on = Math.abs(playerPos.x - tx) < 0.6 && Math.abs(playerPos.z - tz) < 0.6;
-      }
+      const on = hasPlayer() && Math.abs(plx) < 0.6 && Math.abs(plz) < 0.6;
       const taking = P.takeT < 0.3;
       P.ring.hi = taking ? 1 : on && total > 0 ? 0.45 : 0;
       if (taking || (on && total > 0)) P.ring.appear = 1;
@@ -495,6 +543,11 @@ export function create(ctx) {
 
   function update(dt, t) {
     time += dt;
+    for (let i = timers.length - 1; i >= 0; i--) {
+      if ((timers[i].t -= dt) > 0) continue;
+      const { fn } = timers.splice(i, 1)[0];
+      try { fn(); } catch (e) { console.error('[campview] timer', e); }
+    }
     pools.begin();
     lines.begin();
     signs?.begin(dt);
@@ -521,15 +574,17 @@ export function create(ctx) {
     pallets.count = palletN; pallets.visible = palletN > 0;
     if (palletN) pallets.instanceMatrix.needsUpdate = true;
 
-    // hearth light: warm, flickering, grows with the camp level, flashes on level up
+    // hearth light: warm, flickering, rides the flame's height, reaches further every level, flashes on a level-up
     if (hearthLight) {
       const sv = svs.get('hearth');
-      const lv = Math.max(1, camp.level || 0), heat = sv.rig.fire?.heatNow ?? 1;
-      flash = Math.max(0, flash - dt * 1.6);
+      const hf = sv.rig.fire;
+      const lv = Math.max(1, camp.level || 0), heat = hf?.heatNow ?? 1;
+      flash = Math.max(0, flash - dt * 1.6, hf?.glowFlash || 0);
+      const reach = hf?.glowS ? hf.glowS.value / 1.6 : 1;   // follows the ground glow's spring (it pulses on level-up)
       const fl = 1 + 0.07 * Math.sin(time * 9.7) + 0.05 * Math.sin(time * 15.1 + 1.3) + 0.03 * Math.sin(time * 23.3);
-      hearthLight.position.set(sv.center.x, 0.95 + 0.08 * lv, sv.center.z + 0.15);
-      hearthLight.intensity = heat * (0.9 + 0.32 * lv) * fl * (1 + flash * 1.6);
-      hearthLight.distance = 4.6 + 0.6 * lv;
+      hearthLight.position.set(sv.center.x, 0.45 + 0.55 * Math.max(0.6, hf?.height || 0.9), sv.center.z + 0.15);
+      hearthLight.intensity = heat * (0.75 + 0.38 * lv) * fl * (1 + flash * 1.4);
+      hearthLight.distance = 3.4 + 2.2 * reach;
     }
   }
 

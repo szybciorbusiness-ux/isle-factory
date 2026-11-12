@@ -1,13 +1,13 @@
 // One canvas atlas for everything printed on the floor plates (FIRST-20.md "Pads are floor plates", UI-STYLE.md
 // sticker language): outlined numerals, item icons and the little name tags. Drawn once (digits + every pad's
-// tag up front, icons when the HUD's rendered icons arrive), so a ticking number never re-uploads a texture:
-// numbers are laid out per digit by glyphs.js as instanced quads.
+// tag up front, icons when the HUD's rendered icons arrive), so a ticking number never redraws anything:
+// ink.js lays numbers out per digit, blitting cells of this canvas onto the screen-space overlay.
 //
 // Digits come in two layers so neighbouring outlines never cut into a fill: 'b' (brown outline + 2 px-style lip)
-// and 'f' (white fill). glyphs.js draws every back layer of a number before its fronts. Colours follow the HUD's
+// and 'f' (white fill). Every back layer of a number is drawn before its fronts. Colours follow the HUD's
 // `.ol` numerals: white fill, 3 px brown outline, brown lip under the glyph.
 //
-// The texture is premultiplied (no dark fringes in the mips), sRGB, mipmapped + anisotropic for the oblique view.
+// `texture` (premultiplied, sRGB, mipmapped) is kept for any WebGL consumer; the overlay reads `canvas`.
 import * as THREE from 'three';
 
 export const INK = '#5b3a21', INK2 = '#8a6644', CREAM = '#fff7e6', CREAM_LIP = '#e3c99a';
@@ -244,7 +244,7 @@ export function createAtlas({ renderer, config, iconUrl }) {
   } catch { /* no font loading API */ }
 
   return {
-    texture,
+    texture, canvas,
     DH, O, LIP, TH,
     glyph: ch => glyphs.get(ch) || glyphs.get('0'),
     icon: id => iconCell(id),

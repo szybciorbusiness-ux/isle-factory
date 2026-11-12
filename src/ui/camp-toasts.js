@@ -22,7 +22,8 @@ export function createCampToasts(hud) {
   let blocked = false;
   let wait = 0;
 
-  // o: { text, strong?, kind? 'info'|'good'|'warn'|'celebrate', icon? (glyph name), iconArgs?, img? (item id) }
+  // o: { text, strong?, num? (an outlined numeral after the text), kind? 'info'|'good'|'warn'|'celebrate',
+  //      icon? (glyph name), iconArgs?, img? (item id) }
   function make(o) {
     const kind = o.kind || 'info';
     const iconHtml = o.icon ? glyph(o.icon, ...(o.iconArgs || [])) : null;
@@ -30,12 +31,14 @@ export function createCampToasts(hud) {
       ? h('span', { class: 'ct-icon ct-icon-img' }, hud.icons.img(o.img))
       : iconHtml ? h('span', { class: 'ct-icon', html: iconHtml }) : h('span', { class: 'ct-dot' });
     const badge = h('span', { class: 'ct-n' });
-    const pill = h('div', { class: `ct ct-${kind}${o.img || iconHtml ? ' has-icon' : ''}` }, icon, h('span', { class: 'ct-text' }, o.text, o.strong ? h('b', null, o.strong) : null), badge);
+    // a number in the news ("carry 20") is a hero numeral, outlined, like every count in the HUD
+    const num = o.num != null ? h('span', { class: 'ol ct-num', 'data-t': String(o.num) }, String(o.num)) : null;
+    const pill = h('div', { class: `ct ct-${kind}${o.img || iconHtml ? ' has-icon' : ''}` }, icon, h('span', { class: 'ct-text' }, o.text, o.strong ? h('b', null, o.strong) : null), num, badge);
     const el = h('div', { class: 'ct-row' }, pill);
     el.style.opacity = '0';
     box.append(el);
     const t = {
-      el, badge, key: `${o.text}|${o.strong || ''}`, kind, t: 0, life: LIFE[kind] ?? LIFE.info, n: 1, y: null,
+      el, badge, key: `${o.text}|${o.strong || ''}|${o.num ?? ''}`, kind, t: 0, life: LIFE[kind] ?? LIFE.info, n: 1, y: null,
       ht: el.offsetHeight || 46, out: false, outT: 0, s: new anim.Spring(0.9, { stiffness: 420, damping: 24, target: 1 }),
     };
     live.push(t);
@@ -47,7 +50,7 @@ export function createCampToasts(hud) {
 
   function show(o = {}) {
     if (!o.text) return null;
-    const key = `${o.text}|${o.strong || ''}`;
+    const key = `${o.text}|${o.strong || ''}|${o.num ?? ''}`;
     const same = live.find(x => x.key === key && !x.out);
     if (same) {
       same.n++; same.t = Math.min(same.t, ENTER);
@@ -56,7 +59,11 @@ export function createCampToasts(hud) {
       same.badge.classList.add('is-on');
       return same;
     }
-    if ((blocked || queue.length) && o.kind !== 'warn') { queue.push(o); return null; }
+    // while the level-up ribbon is up everything waits (it owns the top of the screen; a warning can wait 3 s)
+    if (blocked || queue.length) {
+      if (queue.length < 6 && !queue.some(q => `${q.text}|${q.strong || ''}|${q.num ?? ''}` === key)) queue.push(o);
+      return null;
+    }
     return make(o);
   }
 
@@ -70,11 +77,12 @@ export function createCampToasts(hud) {
 
     const reduced = reduceMotion();
     let y = 0;
-    for (const t of [...live]) {
+    for (let i = 0; i < live.length; i++) {
+      const t = live[i];
       t.t += dt;
       if (!t.out && t.t >= t.life) leave(t);
       if (t.out) t.outT += dt;
-      if (t.out && t.outT >= EXIT) { t.el.remove(); live.splice(live.indexOf(t), 1); continue; }
+      if (t.out && t.outT >= EXIT) { t.el.remove(); live.splice(i--, 1); continue; }
       const kIn = easeOut(Math.min(1, t.t / ENTER));
       const kOut = t.out ? easeOut(Math.min(1, t.outT / EXIT)) : 0;
       // slot: rows below a leaving one close the gap while it fades
@@ -82,8 +90,10 @@ export function createCampToasts(hud) {
       y += (t.ht + GAP) * (1 - kOut);
       const slide = reduced ? 0 : (1 - kIn) * -26 + kOut * -8;
       const s = reduced ? 1 : t.s.update(dt) * (1 - 0.06 * kOut);
-      t.el.style.opacity = (Math.min(1, t.t / 0.12) * (1 - kOut)).toFixed(3);
-      t.el.style.transform = `translate3d(-50%, ${(t.y + slide).toFixed(2)}px, 0) scale(${s.toFixed(4)})`;
+      const o = (Math.min(1, t.t / 0.12) * (1 - kOut)).toFixed(3);
+      const tr = `translate3d(-50%, ${(t.y + slide).toFixed(2)}px, 0) scale(${s.toFixed(4)})`;
+      if (t.o !== o) { t.o = o; t.el.style.opacity = o; }
+      if (t.tr !== tr) { t.tr = tr; t.el.style.transform = tr; }
     }
   }
 
@@ -93,9 +103,10 @@ export function createCampToasts(hud) {
     // the level-up ribbon owns the top while it plays: toasts on screen bow out, new ones wait their turn
     block(on) {
       blocked = !!on;
-      if (on) for (const t of live) if (t.kind !== 'warn') leave(t);
+      if (on) for (const t of live) leave(t);
       else wait = Math.min(wait, 0.12);
     },
     get count() { return live.length; },
+    rows: () => live.filter(t => !t.out).map(t => t.el),
   };
 }

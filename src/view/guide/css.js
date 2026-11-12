@@ -28,9 +28,9 @@ body.mobile .ge-face img { width: 41px; height: 41px; }
 body.mobile .ge-face canvas { width: 35px; height: 35px; }
 body.mobile .ge-ptr svg { left: 15px; top: -17px; width: 27px; height: 34px; }
 
-/* ---------- first-time hint bubble (above the robot) ---------- */
-.gh { position: absolute; left: 0; top: 0; width: max-content; display: flex; flex-direction: column; align-items: center;
-  transform-origin: 50% 100%; will-change: transform, opacity; opacity: 0; visibility: hidden; padding-top: 6px; }
+/* ---------- first-time hint bubble (beside Dug, away from the goal; JS places the card and its tail) ---------- */
+.gh { position: absolute; left: 0; top: 0; width: max-content; display: block;
+  transform-origin: 50% 100%; will-change: transform, opacity; opacity: 0; visibility: hidden; }
 .gh-card { position: relative; display: flex; align-items: center; height: 46px; padding: 0 18px 2px 50px; border-radius: 999px;
   background: #fff7e6; border: 3px solid #5b3a21; white-space: nowrap;
   box-shadow: inset 0 1.5px 0 rgba(255,255,255,.85), inset 0 -4px 0 #e3c99a, 0 8px 16px -8px rgba(60,40,20,.45);
@@ -39,7 +39,7 @@ body.mobile .ge-ptr svg { left: 15px; top: -17px; width: 27px; height: 34px; }
 .gh-icon { position: absolute; left: -12px; top: 50%; width: 56px; height: 56px; margin-top: -30px; display: grid; place-items: center; }
 .gh-icon img { width: 56px; height: 56px; display: block; filter: drop-shadow(0 2px 0 rgba(91,58,33,.28)); }
 .gh-icon canvas { width: 46px; height: 46px; display: block; }
-.gh-tail { display: block; width: 24px; height: 14px; margin-top: -3.5px; overflow: visible; }
+.gh-tail { position: absolute; left: 0; top: 0; display: block; width: 24px; height: 14px; overflow: visible; transform-origin: 12px 0; }
 body.mobile .gh-card { height: 42px; font-size: 16.5px; padding: 0 16px 2px 45px; }
 body.mobile .gh-card.no-icon { padding-left: 16px; }
 body.mobile .gh-icon { width: 50px; height: 50px; margin-top: -27px; left: -11px; }

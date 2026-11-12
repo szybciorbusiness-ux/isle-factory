@@ -1,4 +1,4 @@
-// Player: a little robot engineer with free, smooth 8-direction movement.
+// Player: Dug the mole miner (player/dug.js; ?robot brings back the old robot) with free, smooth 8-direction movement.
 //
 // Movement (src/view/player/motion.js): key STATE (WASD / arrows by e.code, cleared on blur and when the tab is
 // hidden) plus the analog stick in ctx.input.move. Velocity eases toward the wanted velocity (90% in 0.1 s, at
@@ -32,8 +32,8 @@ const MOVE_KEYS = {
 };
 
 // ---- tuning ----
-const SCALE = 1.3;               // model units -> world (~0.9 tiles tall, like the reference character)
-const SCALE_MOBILE = 1.5;        // a touch bigger on phones, where the camera sits farther out
+const SCALE = 1.5;               // model units -> world (Dug: ~1.1 tiles tall to the lamp; was 1.3, x1.15 for readability)
+const SCALE_MOBILE = 1.72;       // a touch bigger on phones, where the camera sits farther out (was 1.5)
 const STRIDE = [0.5, 1.0];        // world distance per full gait cycle (two steps), slow .. full speed
 const DUTY = [0.55, 0.3];         // fraction of a cycle each foot is planted: walk (overlap) .. trot (flight)
 const LIFT = 0.075;              // foot lift (model units)

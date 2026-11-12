@@ -216,3 +216,45 @@ test('save / load: a camp restored from its snapshot matches the original', () =
   // and it keeps running
   b.step(10, 1 / 20);
 });
+
+// A bot that always does camp.nextGoal() at the robot's walking speed (same rules as tools/pace.mjs).
+// Guards the whole guidance loop: sticky pay/drop goals, dead-weight unloading, backed-up lines, regrowth that
+// must never seal the player in, and an arrow that never dies.
+test('a bot following the guide finishes the camp, never boxed in and never without a goal for long', () => {
+  const { map, sim, camp, pos } = setup();
+  const SPEED = 4.2, dt = 1 / 20;
+  camp.events.on('player:eject', ({ x, z }) => { pos.x = x; pos.z = z; path = null; });
+  let path = null, pi = 0, goal = null, think = 0, noGoal = 0, worstNoGoal = 0, stuck = 0, worstStuck = 0;
+  const levels = {};
+  camp.events.on('hearth:level', ({ level }) => { levels[level] = camp.time; });
+  function plan() {
+    goal = camp.nextGoal();
+    if (!goal) { path = null; return; }
+    const tx = Math.round(goal.x), tz = Math.round(goal.z);
+    const around = goal.kind === 'gather' || goal.kind === 'hunt';
+    path = camp.bfs(Math.round(pos.x), Math.round(pos.z), (x, z) => around ? Math.max(Math.abs(x - tx), Math.abs(z - tz)) <= 1 && !(x === tx && z === tz) : x === tx && z === tz);
+    pi = 1;
+  }
+  function step(ux, uz, t) {
+    const nx = pos.x + ux * SPEED * t, nz = pos.z + uz * SPEED * t;
+    if (sim.isWalkable(Math.round(nx), Math.round(nz))) { pos.x = nx; pos.z = nz; sim.setPlayer(Math.round(nx), Math.round(nz)); }
+  }
+  for (let t = 0; t < 25 * 60 && camp.level < 5; t += dt) {
+    if ((think -= dt) <= 0) { think = 0.5; plan(); }
+    noGoal = goal ? 0 : noGoal + dt; worstNoGoal = Math.max(worstNoGoal, noGoal);
+    stuck = goal && goal.kind !== 'wait' && !path ? stuck + dt : 0; worstStuck = Math.max(worstStuck, stuck);
+    if (path && pi < path.length) {
+      const [tx, tz] = path[pi], dx = tx - pos.x, dz = tz - pos.z, d = Math.hypot(dx, dz);
+      if (d < 0.05) pi++; else step(dx / d, dz / d, Math.min(dt, d / SPEED));
+    } else if (goal) {
+      let tx = goal.x, tz = goal.z, near = goal.kind === 'gather' ? 1.0 : 0.15;
+      if (goal.kind === 'hunt') { const a = camp.animals.get(goal.animalId); if (a && !a.dead) { tx = a.x; tz = a.z; } near = 0.9; }
+      const dx = tx - pos.x, dz = tz - pos.z, d = Math.hypot(dx, dz);
+      if (d > near) step(dx / d, dz / d, dt);
+    }
+    sim.update(dt); camp.update(dt);
+  }
+  assert.equal(camp.level, 5, `camp level ${camp.level} after 25 min; levels ${JSON.stringify(levels)}; pads left ${camp.pads.map(p => p.id)}`);
+  assert.ok(worstNoGoal <= 3, `no goal for ${worstNoGoal.toFixed(1)} s in a row`);
+  assert.ok(worstStuck <= 6, `no path to the goal for ${worstStuck.toFixed(1)} s in a row`);
+});

@@ -6,6 +6,10 @@ import { Parts, rbox, jitter, rng } from './buildings/geom.js';
 import { miniModel } from './buildings/models.js';
 
 const ITEM_HEIGHT = 0.2;
+// Items are drawn by the hundred (full piles hold 40 each, stacks, belts, flights) and are small on screen, so they
+// stay light: bodies are 1-segment rounded boxes, painted details (grill marks, grain, stamps) plain boxes.
+const body = (w, h, d, r) => rbox(w, h, d, r, 1);
+const mark = (w, h, d) => new THREE.BoxGeometry(w, h, d);
 
 // ---------- camp food + bars ----------
 // Cartoon drumstick lying along x: a plump faceted bulb of meat (fat end toward -x) tapering into a cream bone
@@ -29,13 +33,13 @@ function drumstick(p, raw) {
   if (raw) {
     // fat collar where the meat meets the bone + two streaks of marbling on top
     p.add(new THREE.TorusGeometry(0.03, 0.012, 5, 10), col.collar, { p: [x0 + L - 0.012, ay, 0], r: [0, Math.PI / 2, 0], flat: true, ao: false });
-    p.add(rbox(0.06, 0.006, 0.013, 0.003), col.mark, { p: [x0 + 0.08, ay + 0.066, -0.016], r: [0, 0.45, 0.04], ao: false });
-    p.add(rbox(0.04, 0.006, 0.011, 0.003), col.mark, { p: [x0 + 0.125, ay + 0.058, 0.02], r: [0, -0.3, 0.1], ao: false });
+    p.add(mark(0.06, 0.006, 0.013), col.mark, { p: [x0 + 0.08, ay + 0.066, -0.016], r: [0, 0.45, 0.04], ao: false });
+    p.add(mark(0.04, 0.006, 0.011), col.mark, { p: [x0 + 0.125, ay + 0.058, 0.02], r: [0, -0.3, 0.1], ao: false });
   } else {
     // crispy collar, grill marks pressed into the top, a glossy highlight
     p.add(new THREE.TorusGeometry(0.029, 0.011, 5, 10), col.collar, { p: [x0 + L - 0.012, ay, 0], r: [0, Math.PI / 2, 0], flat: true, ao: false });
-    for (const [x, y] of [[0.055, 0.061], [0.095, 0.066], [0.135, 0.057]]) p.add(rbox(0.011, 0.006, 0.07, 0.003), col.mark, { p: [x0 + x, ay + y, 0.004], r: [0, 0.42, 0], ao: false });
-    p.add(rbox(0.045, 0.005, 0.016, 0.0025), '#f7cf93', { p: [x0 + 0.075, ay + 0.064, -0.034], r: [0, 0.42, 0], ao: false });
+    for (const [x, y] of [[0.055, 0.061], [0.095, 0.066], [0.135, 0.057]]) p.add(mark(0.011, 0.006, 0.07), col.mark, { p: [x0 + x, ay + y, 0.004], r: [0, 0.42, 0], ao: false });
+    p.add(mark(0.045, 0.005, 0.016), '#f7cf93', { p: [x0 + 0.075, ay + 0.064, -0.034], r: [0, 0.42, 0], ao: false });
   }
   // bone: shaft tipped up a little, two knuckles at the end
   const tip = 0.16;
@@ -54,9 +58,9 @@ function ingot(p) {
     p: [0, 0.0425, 0], s: [1.42, 1, 0.8], flat: true,
     faceColor: (cx, cy, cz, nx, ny, nz) => (ny > 0.9 ? '#f6aa6c' : ny < -0.9 ? '#c26a3a' : Math.abs(nx) > Math.abs(nz) ? '#cf7440' : null),
   });
-  p.add(rbox(0.15, 0.01, 0.07, 0.005), '#fbc995', { p: [0, 0.088, 0], ao: false });
-  p.add(rbox(0.11, 0.004, 0.012, 0.002), '#e08a52', { p: [0, 0.094, -0.012], ao: false });
-  p.add(rbox(0.07, 0.004, 0.012, 0.002), '#e08a52', { p: [-0.02, 0.094, 0.014], ao: false });
+  p.add(mark(0.15, 0.01, 0.07), '#fbc995', { p: [0, 0.088, 0], ao: false });
+  p.add(mark(0.11, 0.004, 0.012), '#e08a52', { p: [0, 0.094, -0.012], ao: false });
+  p.add(mark(0.07, 0.004, 0.012), '#e08a52', { p: [-0.02, 0.094, 0.014], ao: false });
 }
 
 function buildGeometry(id, config) {
@@ -100,18 +104,18 @@ function buildGeometry(id, config) {
     }
     case 'plank': {
       // two light boards, slightly crossed, with a grain line
-      p.add(rbox(0.3, 0.05, 0.12, 0.016), config.ITEMS.plank.color, { p: [0, 0.025, 0], r: [0, 0.12, 0] });
-      p.add(rbox(0.3, 0.05, 0.12, 0.016), '#e8bd86', { p: [0.01, 0.075, 0.005], r: [0, -0.1, 0] });
-      for (const [z, y, ry] of [[-0.025, 0.1005, -0.1], [0.03, 0.1005, -0.1]]) p.add(rbox(0.22, 0.004, 0.008, 0.002), '#c99560', { p: [0.01, y, z + 0.005], r: [0, ry, 0], ao: false });
+      p.add(body(0.3, 0.05, 0.12, 0.016), config.ITEMS.plank.color, { p: [0, 0.025, 0], r: [0, 0.12, 0] });
+      p.add(body(0.3, 0.05, 0.12, 0.016), '#e8bd86', { p: [0.01, 0.075, 0.005], r: [0, -0.1, 0] });
+      for (const [z, y, ry] of [[-0.025, 0.1005, -0.1], [0.03, 0.1005, -0.1]]) p.add(mark(0.22, 0.004, 0.008), '#c99560', { p: [0.01, y, z + 0.005], r: [0, ry, 0], ao: false });
       break;
     }
     case 'meat': { p.ao = { y0: 0, y1: 0.12, min: 0.82 }; drumstick(p, true); break; }
     case 'cookedMeat': { p.ao = { y0: 0, y1: 0.12, min: 0.82 }; drumstick(p, false); break; }
     case 'copperBar': { p.ao = { y0: 0, y1: 0.08, min: 0.85 }; ingot(p); break; }
     case 'copperPlate': {
-      p.add(rbox(0.21, 0.05, 0.21, 0.016), P.copperDark, { p: [0, 0.025, 0] });
-      p.add(rbox(0.2, 0.045, 0.2, 0.014), config.ITEMS.copperPlate.color, { p: [0, 0.042, 0] });
-      p.add(rbox(0.14, 0.02, 0.14, 0.008), '#ffbf8a', { p: [0, 0.065, 0], ao: false });
+      p.add(body(0.21, 0.05, 0.21, 0.016), P.copperDark, { p: [0, 0.025, 0] });
+      p.add(body(0.2, 0.045, 0.2, 0.014), config.ITEMS.copperPlate.color, { p: [0, 0.042, 0] });
+      p.add(mark(0.14, 0.02, 0.14), '#ffbf8a', { p: [0, 0.065, 0], ao: false });
       break;
     }
     default: {

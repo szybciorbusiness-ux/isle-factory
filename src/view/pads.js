@@ -1,16 +1,26 @@
 // Build pads as FLOOR PLATES (FIRST-20.md "Pads are floor plates", UI-STYLE.md sticker language).
 //
 // Each pad is a flat rounded slab lying on the ground over its zone: cream top, darker lip on the near edge,
-// 3 px brown outline, gently breathing. On the plate: the cost item icon(s) and ONE big outlined number per item
-// (what's still owed), which ticks down with a pop as each paid item lands. The plate fills with green from the
-// near edge as it's paid. A small sticker name tag ("Sawmill", "Camp level 2", "Bridge to Forest", "Lumberjack")
-// sits on the plate's near edge. Over / beside the plate floats the ghost of what it builds: the real station
-// model (views.campview.createModel) for stations, the plank path for bridges, emblems for upgrades and hires,
-// a ghost flame in the cold hearth for the first fire.
+// 3 px brown outline, gently breathing. One layout for every pad:
+//   - the HERO: one item icon and ONE big outlined number, centred on the plate. It is the cost the player can
+//     pay now (an item on the stack the pad still needs), else the first unpaid one. It ticks down with a pop as
+//     each paid item lands.
+//   - the LIP ROW, straddling the plate's near edge: the sticker name tag ("Sawmill", "Camp level 3",
+//     "Bridge to Forest", "Lumberjack") followed, on multi-cost pads, by a small pip per other cost (its icon and
+//     count, or a tick once it is paid).
+// While the player stands on the plate the hero lifts off it into a billboarded sticker (with a tail) over the
+// plate's far edge, above Dug's helmet, so the countdown is never under him; it glides back down after.
+// The plate fills with green from the near edge as it's paid. Over / beside the plate floats the ghost of what
+// it builds: the real station model (views.campview.createModel) for stations, the plank path for bridges,
+// emblems for upgrades and hires, a ghost flame in the cold hearth for the first fire.
+//
+// The printed layer (icons, numbers, tags, pips, the sticker) is NOT scene geometry: pads/ink.js draws it on a
+// screen-space canvas over the 3D and under the HUD, projected with the frame's final camera, so the tilt-shift
+// blur and the cold grade never soften it and trees / Dug never hide it. The slabs stay in the world.
 //
 //   pad:shown      -> the plate scales in (0.6 -> 1, backOut), its content pops in a beat later, then the ghost
-//   (standing on)  -> the slab presses down (its lip shrinks), a warm halo hugs it
-//   pad:paid       -> an item arcs from the top of the stack into the pad (instanced); when it lands the number
+//   (standing on)  -> the slab presses down (its lip shrinks), a warm halo hugs it, the hero lifts into a sticker
+//   pad:paid       -> an item arcs from the top of the stack into the hero (or its pip); when it lands the number
 //                     ticks down with a pop and the icon bumps; the green fill rises
 //   pad:complete   -> in-flight items hurry in, every number flips to a check, the plate flashes green and sinks
 //                     away as the station rises (camp view brings the rise's own dust ring + sparkles)
@@ -18,15 +28,15 @@
 //   hearth:level   -> shockwave ring riding the world's warm wave (views.lighting.mood.wave), light rays, confetti
 //   locked bridges -> a very faint dashed plank outline on the water where each future bridge goes
 //
-// Draw calls: plates 1 + printed content 1 (atlas glyphs) + bridge hints 1 + 1-2 per ghost + 1 per item type in
-// flight + 1 per built bridge (5 while one assembles) + 2 during a level-up burst. No DOM.
+// Draw calls: plates 1 + bridge hints 1 + 1-2 per ghost + 1 per item type in flight + 1 per built bridge (5 while
+// one assembles) + 2 during a level-up burst + 1 empty render hook. Plus one 2D canvas layer (pads/ink.js).
 // All motion runs from update(dt).
 import * as THREE from 'three';
 import { ease, clamp, lerp, damp, arc, Spring } from '../util/anim.js';
 import { STATIONS, UPGRADES, WORKERS, PADS, ISLAND_NAMES as CAMP_ISLAND_NAMES } from '../sim/camp-data.js';
 import { createAtlas } from './pads/atlas.js';
 import { createPlates } from './pads/plate.js';
-import { createGlyphs } from './pads/glyphs.js';
+import { createInk } from './pads/ink.js';
 import { createBridgeHints } from './pads/hint.js';
 import { buildGhost, ghostMaterial, ghostDepth, bridgeLayout, bridgeFrame } from './pads/ghosts.js';
 import { createBridges } from './pads/bridge.js';
@@ -36,16 +46,27 @@ import { createBurst } from './pads/burst.js';
 const PLATE_Y = 0.03;
 const INSET = 0.07;        // smallest plate: the zone minus this on each side
 const GROW = 0.42;         // a plate may grow this far past its zone (to fit its content) where there's room
+const PLATE_GAP = 0.1;     // the least grass left between two plates (diagonal neighbours both grow into a corner)
 const CORNER = 0.2;
 const LIP = 0.13;          // slab lip seen on the near edge (the HUD stickers' 4 px lip)
 const LIP_PRESSED = 0.045;
 const DIGIT_T = 0.4;       // digit ink height at content scale 1
 const ICON_T = 0.62;       // icon quad size
 const ICON_INK = 0.82;     // share of the icon quad the picture fills across (for spacing)
-const COL_GAP = 0.16, ROW_GAP = 0.05;
-const PAD_X = 0.13, PAD_N = 0.11, PAD_S = 0.25;  // plate padding around the content (south keeps room for the tag)
+const PAD_X = 0.12, PAD_N = 0.08;                 // plate padding around the hero (the lip row brings its own)
 const MIN_CS = 0.6, MAX_CS = 1.18;
-const TAG_PX = { mobile: 17, desktop: 23 };       // name tag pill height in CSS px (kept readable at any zoom)
+// The lip row (name tag + cost pips), in CSS px so it reads at any zoom: tag pill height, pip pill height (with
+// its lip), pip icon, pip count font, gap. Tag text is 0.576 x the pill: 13.2 px on the phone, 14.4 on desktop.
+const ROW = {
+  mobile: { tag: 23, pip: 21, icon: 30, font: 13, gap: 5 },
+  desktop: { tag: 25, pip: 22, icon: 32, font: 14, gap: 6 },
+};
+const ROW_ON = 0.7;        // share of the row's depth lying on the plate (the rest hangs over the edge)
+// The lifted countdown sticker (standing on the plate)
+const LIFT_Y = 1.36;       // its tail tip: this high over the plate's far edge (Dug's helmet tops out ~1.26)
+const LIFT_SCALE = 1.1;    // a touch bigger than the print
+const LIFT_DWELL = 0.16;   // a pad that isn't the guide's target lifts once the player has stood on it this long
+const STICKER = { pad: 6, lip: 4, tail: 9 };      // CSS px: padding around the hero, sticker lip, tail length
 // ---- timing ----
 const APPEAR_T = 0.5;
 const CONTENT_DELAY = 0.1, TAG_DELAY = 0.2, GHOST_DELAY = 0.12;
@@ -73,9 +94,22 @@ export function create(ctx) {
     iconUrl: id => views.ui?.iconUrl?.(id) || views.ui?.icons?.get?.(id) || null,
   });
   const plates = createPlates({ cap: 24 });
-  const glyphs = createGlyphs({ texture: atlas.texture, cap: 384 });
+  // The guide's 3D arrow sits under the ink: wherever it shows, the other pads' print turns see-through.
+  let arrowRoot = null, arrowLook = 0;
+  function guideArrow() {
+    if (arrowRoot?.parent) return arrowRoot;
+    if (time < arrowLook) return null;
+    arrowLook = time + 1;
+    arrowRoot = scene.getObjectByName('guide-arrow') || null;
+    return arrowRoot;
+  }
+  const ink = createInk({
+    scene, camera, renderer, atlas, maxDpr: 2, frameScale: () => ctx.quality?.frameScale || 1,
+    veil: () => { const object = guideArrow(); return object ? { object, keep: [camp.goal?.padId, api.lifted] } : null; },
+  }) || nullInk();
   const hints = createBridgeHints({ waterY: config.WATER_Y ?? -0.32 });
-  scene.add(plates.mesh, glyphs.mesh, hints.mesh);
+  scene.add(plates.mesh, hints.mesh);
+  const RS = mobile ? ROW.mobile : ROW.desktop;
   const bridges = createBridges(ctx, { quality: ctx.quality });
   const burst = createBurst(ctx);
 
@@ -102,7 +136,7 @@ export function create(ctx) {
   // ---------------- screen scale (anamorphic stretch + tag size) ----------------
   // Text lying on the ground is foreshortened by the camera pitch; quads are stretched along z by the ratio of a
   // tile's screen width to its screen depth so the print reads upright. Tags keep a readable pixel size.
-  const view = { zs: 1.2, pxZ: 40, outline: 3 };
+  const view = { zs: 1.2, pxX: 48, pxZ: 40, pxY: 26, outline: 3 };
   const _a = new THREE.Vector3(), _b = new THREE.Vector3();
   function measureView() {
     const tx = views.camera?.target?.x ?? sim.player.x, tz = views.camera?.target?.z ?? sim.player.z;
@@ -111,12 +145,16 @@ export function create(ctx) {
     const pxX = Math.abs(_b.x - _a.x) * 0.5 * innerWidth;
     _b.set(tx, 0, tz + 1).project(camera);
     const pxZ = Math.abs(_b.y - _a.y) * 0.5 * innerHeight;
-    if (pxX > 1 && pxZ > 1) { view.zs = clamp(pxX / pxZ, 1, 1.4); view.pxZ = pxZ; }
+    _b.set(tx, 1, tz).project(camera);
+    const pxY = Math.abs(_b.y - _a.y) * 0.5 * innerHeight;
+    if (pxX > 1 && pxZ > 1) { view.zs = clamp(pxX / pxZ, 1, 1.4); view.pxZ = pxZ; view.pxX = pxX; }
+    if (pxY > 1) view.pxY = pxY;
     const rtW = views.post?.rtScene?.width || renderer.domElement?.width || innerWidth;
     view.outline = 3.4 * (rtW / Math.max(1, innerWidth));
   }
   measureView();
-  const tagDepth = () => clamp((mobile ? TAG_PX.mobile : TAG_PX.desktop) / Math.max(8, view.pxZ), 0.24, 0.56);
+  // the lip row's depth on the ground (world tiles) at its CSS px height
+  const rowDepth = () => clamp(RS.tag / Math.max(8, view.pxZ), 0.16, 0.62);
 
   // ---------------- what's around a zone (how far a plate may grow) ----------------
   function stationTiles() {
@@ -167,54 +205,115 @@ export function create(ctx) {
   }
   const ICON_GAP = 0.05;
   const pairWidth = numW => ICON_T * ICON_INK + ICON_GAP + atlas.O * K() * 1.2 + numW;
+  const heroDepth = () => Math.max(ICON_T * 0.9, DIGIT_T + atlas.O * K() * 2) * view.zs;
+  // how much of the plate's depth the lip row takes (world tiles, not scaled with the content)
+  const rowOn = () => rowDepth() * ROW_ON + 0.03;
+  // One layout for every pad: the hero (icon + the widest cost any of its entries can show, so a swap or a
+  // ticking number never resizes the plate) above the lip row.
   function layout(v) {
     const blocked = stationTiles();
     const room = growthRoom(v, blocked);
     const [x0, z0, w, h] = v.zone;
     const zl = x0 - 0.5, zr = x0 + w - 0.5, zt = z0 - 0.5, zb = z0 + h - 0.5;
-    const L = zl + INSET - Math.max(0, room[0]) , R = zr - INSET + Math.max(0, room[1]);
+    const L = zl + INSET - Math.max(0, room[0]), R = zr - INSET + Math.max(0, room[1]);
     const T = zt + INSET - Math.max(0, room[2]), B = zb - INSET + Math.max(0, room[3]);
     const maxW = R - L, maxD = B - T;
-    const n = v.entries.length;
     const pairW = Math.max(...v.entries.map(e => pairWidth(numberWidth(String(e.cost)))));
-    const pairD = Math.max(ICON_T * 0.9, DIGIT_T + atlas.O * K() * 2) * view.zs;
-    let best = null;
-    for (let cols = 1; cols <= n; cols++) {
-      const rows = Math.ceil(n / cols);
-      const pw = cols * pairW + (cols - 1) * COL_GAP + PAD_X * 2;
-      const pd = rows * pairD + (rows - 1) * ROW_GAP + PAD_N + PAD_S;
-      const s = Math.min(MAX_CS, maxW / pw, maxD / pd);
-      const score = s + (rows === 1 ? 0.03 : 0);
-      if (!best || score > best.score) best = { cols, rows, pw, pd, s, score };
-    }
-    const cs = clamp(best.s, MIN_CS, MAX_CS);
+    const pairD = heroDepth();
+    const fixedD = rowOn() + LIP;
+    const s = Math.min(MAX_CS, maxW / (pairW + PAD_X * 2), Math.max(0.01, maxD - fixedD) / (pairD + PAD_N * 2));
+    const cs = clamp(s, MIN_CS, MAX_CS);
     const minW = w - INSET * 2, minD = h - INSET * 2;
-    const pw = clamp(best.pw * cs, minW, Math.max(minW, maxW)), pd = clamp(best.pd * cs, minD, Math.max(minD, maxD));
+    const pw = clamp((pairW + PAD_X * 2) * cs, minW, Math.max(minW, maxW));
+    const pd = clamp((pairD + PAD_N * 2) * cs + fixedD, minD, Math.max(minD, maxD));
     const zcx = (zl + zr) / 2, zcz = (zt + zb) / 2;
     const cx = clamp(zcx, L + pw / 2, Math.max(L + pw / 2, R - pw / 2));
     const cz = clamp(zcz, T + pd / 2, Math.max(T + pd / 2, B - pd / 2));
     const keepSide = v.target?.tagSide ?? null;
-    v.target = { cx, cz, hx: pw / 2, hz: pd / 2, cs, cols: best.cols, rows: best.rows, pairW, pairD, tagSide: keepSide };
+    v.target = { cx, cz, hx: pw / 2, hz: pd / 2, cs, pairW, pairD, tagSide: keepSide, zl, zr, zt, zb };
     if (!v.plate) v.plate = { ...v.target, fresh: true };
-    v.coverWanted = coverTilesFor(v);
   }
-  // Name tags sit on the plate's near (south) edge unless that would hide them (a tree right in front) or run
-  // them into a neighbouring plate / tag: then the far edge. Decided for all plates together.
-  function tagRect(v, side) {
-    const T = v.target, tg = atlas.tag(v.name);
-    const d = tagDepth() * view.zs, w = tagDepth() * (tg.w / tg.h);
-    const z = T.cz + (T.hz - d * 0.18) * side;
+  // ---- plates never overlap: diagonal neighbours (axe [24,17] / hunter [25,16], pack [18,18] / hut [16,16]) may
+  // both grow into the corner between them. Pull the facing edges back (never inside a plate's own zone) along
+  // whichever axis needs less, then refit the hero's scale to what's left.
+  function shrinkEdge(T, axis, side, amount) {
+    const c = axis === 'x' ? 'cx' : 'cz', hk = axis === 'x' ? 'hx' : 'hz';
+    const zoneEdge = axis === 'x' ? (side > 0 ? T.zr - INSET : T.zl + INSET) : (side > 0 ? T.zb - INSET : T.zt + INSET);
+    const lo = T[c] - T[hk], hi = T[c] + T[hk];
+    const edge = side > 0 ? hi : lo;
+    const give = Math.max(0, Math.min(amount, (edge - zoneEdge) * side));
+    if (give <= 0) return 0;
+    const nlo = side < 0 ? lo + give : lo, nhi = side > 0 ? hi - give : hi;
+    T[c] = (nlo + nhi) / 2; T[hk] = (nhi - nlo) / 2;
+    return give;
+  }
+  // rows = true: a second pass once the lip rows have their edges; a row's overhang past its plate counts too
+  // (pulling the plate's edge back slides its row in with it).
+  function separate(list, rows = false) {
+    const oh = rows ? rowDepth() * (1 - ROW_ON) : 0;
+    const north = T => T.cz - T.hz - (T.tagSide < 0 ? oh : 0), south = T => T.cz + T.hz + (T.tagSide > 0 ? oh : 0);
+    for (let it = 0; it < 4; it++) {
+      let moved = false;
+      for (let i = 0; i < list.length; i++) {
+        for (let j = i + 1; j < list.length; j++) {
+          const a = list[i].target, b = list[j].target;
+          const ox = Math.min(a.cx + a.hx, b.cx + b.hx) - Math.max(a.cx - a.hx, b.cx - b.hx) + PLATE_GAP;
+          const oz = Math.min(south(a), south(b)) - Math.max(north(a), north(b)) + PLATE_GAP;
+          if (ox <= 1e-4 || oz <= 1e-4) continue;
+          const axis = ox <= oz ? 'x' : 'z', need = Math.min(ox, oz), c = axis === 'x' ? 'cx' : 'cz';
+          const aFirst = a[c] <= b[c];
+          let got = shrinkEdge(a, axis, aFirst ? 1 : -1, need / 2);
+          got += shrinkEdge(b, axis, aFirst ? -1 : 1, need - got);
+          if (got < need - 1e-4) got += shrinkEdge(a, axis, aFirst ? 1 : -1, need - got);
+          moved = moved || got > 1e-4;
+        }
+      }
+      if (!moved) break;
+    }
+    for (const v of list) {
+      const T = v.target;
+      const fit = Math.min((T.hx * 2) / (T.pairW + PAD_X * 2), Math.max(0.01, T.hz * 2 - rowOn() - LIP) / (T.pairD + PAD_N * 2));
+      T.cs = clamp(Math.min(T.cs, fit), MIN_CS, MAX_CS);
+    }
+  }
+
+  // ---- the lip row (name tag + cost pips) ----
+  // Pips: every cost but the hero's, on multi-cost pads. Sizes in CSS px.
+  const pipSpec = { h: RS.pip, icon: RS.icon, fontPx: RS.font };
+  const pipText = e => (e.done ? '' : String(Math.max(0, e.shown)));
+  function rowItems(v) {
+    const tg = atlas.tag(v.name);
+    const out = v.rowBuf || (v.rowBuf = []);
+    out.length = 0;
+    out.push({ kind: 'tag', w: RS.tag * (tg.w / tg.h), a: 1, e: null });
+    if (v.entries.length > 1) {
+      for (const e of v.entries) {
+        if (e.pipA == null) e.pipA = e === v.hero ? 0 : 1;
+        if (e.pipA < 0.01) continue;
+        out.push({ kind: 'pip', w: ink.pipWidth(pipText(e), { ...pipSpec, done: e.done }), a: e.pipA, e });
+      }
+    }
+    return out;
+  }
+  // full row width in CSS px (pips sliding in / out count by their alpha, so the row glides)
+  function rowWidthPx(items) {
+    let w = 0;
+    items.forEach((it, i) => { w += it.w * it.a + (i ? RS.gap * it.a : 0); });
+    return w;
+  }
+  // row centre z for a plate: mostly on the plate, its outer edge hanging (1 - ROW_ON) past the plate's edge
+  const rowCentreZ = (cz, hz, d, side) => cz + (hz - d * (ROW_ON - 0.5)) * side;
+  // The row straddles the plate's near (south) edge unless that would run it into a neighbouring plate / row /
+  // floating emblem: then the far edge. Decided for all plates together. (Trees and Dug no longer matter: the
+  // ink is drawn over them.)
+  function rowRect(v, side) {
+    const T = v.target;
+    const d = rowDepth(), w = rowWidthPx(rowItems(v)) / Math.max(8, view.pxX);
+    const z = rowCentreZ(T.cz, T.hz, d, side);
     return { l: T.cx - w / 2, r: T.cx + w / 2, t: z - d / 2, b: z + d / 2 };
   }
   const overlap = (a, b) => Math.max(0, Math.min(a.r, b.r) - Math.max(a.l, b.l)) * Math.max(0, Math.min(a.b, b.b) - Math.max(a.t, b.t));
   const plateBox = (T, grow = 0) => ({ l: T.cx - T.hx - grow, r: T.cx + T.hx + grow, t: T.cz - T.hz - grow, b: T.cz + T.hz + grow });
-  function tallTiles() {
-    const set = new Set();
-    const add = r => { if (r) for (let j = 0; j < r[3]; j++) for (let i = 0; i < r[2]; i++) set.add(`${r[0] + i},${r[1] + j}`); };
-    add(STATIONS.hearth?.footprint);
-    for (const st of camp.stations?.values?.() || []) add((st.def || STATIONS[st.id])?.footprint);
-    return set;
-  }
   // where a floating emblem shows on screen, as a ground-equivalent box (height h projects ~0.68 h north)
   function emblemBox(v, side) {
     const g = v.ghost;
@@ -223,33 +322,23 @@ export function create(ctx) {
     return { l: T.cx - 0.36, r: T.cx + 0.36, t: ez - (y0 + h) * 0.68, b: ez - y0 * 0.68 + 0.12 };
   }
   function placeTags(list) {
-    const tall = tallTiles();
     for (const v of list) if (v.target.tagSide == null) v.target.tagSide = 1;
-    // two passes: the second sees every neighbour's choice (its tag, and its emblem's height)
+    // two passes: the second sees every neighbour's choice (its row, and its emblem's height)
     for (let pass = 0; pass < 2; pass++) {
       for (const v of list) {
         let best = 1, bestCost = Infinity;
         for (const side of [1, -1]) {
-          const r = tagRect(v, side);
-          let cost = side < 0 ? 0.02 : 0;
+          const r = rowRect(v, side);
+          let cost = side < 0 ? 0.04 : 0;
           for (const o of list) {
             if (o === v) continue;
             cost += overlap(r, plateBox(o.target, 0.04)) * 4;
-            if (pass) cost += overlap(r, tagRect(o, o.target.tagSide)) * 6;
+            if (pass) cost += overlap(r, rowRect(o, o.target.tagSide)) * 6;
             const eb = emblemBox(o, o.target.tagSide);
             if (eb) cost += overlap(r, eb) * 3;
           }
-          // a tree or a building standing just in front (one or two rows nearer the camera) hides the tag
-          for (let row = 1; row <= 2; row++) {
-            const z = Math.round(r.b - 0.15 + row);
-            for (let x = Math.round(r.l - 0.2); x <= Math.round(r.r + 0.2); x++) {   // canopies are wider than a tile
-              const e = sim.at?.(x, z);
-              if (e?.resource && e.kind !== 'stump') cost += row === 1 ? 0.35 : 0.3;
-              if (tall.has(`${x},${z}`)) cost += row === 1 ? 0.3 : 0.15;
-            }
-          }
-          if (side < 0 && v.ghost?.info?.float) cost += 0.2; // the floating emblem hovers over the far edge (it rises clear)
-          // a tag hanging out over the water reads as floating
+          if (side < 0 && v.ghost?.info?.float) cost += 0.2; // the floating emblem hovers over the far edge
+          // a row hanging out over the water reads as floating
           const mz = Math.round((r.t + r.b) / 2), mx = Math.round((r.l + r.r) / 2);
           if (!(map.isLand?.(mx, mz) ?? true)) cost += 0.3;
           if (cost < bestCost - 1e-6) { bestCost = cost; best = side; }
@@ -261,8 +350,13 @@ export function create(ctx) {
   function relayoutAll() {
     const list = [...pads.values()].filter(v => v.phase !== 'out');
     for (const v of list) layout(v);
+    separate(list);
     placeTags(list);
-    for (const v of list) if (v.plate.fresh) { v.plate.fresh = false; v.plate.tagSide = v.target.tagSide; }
+    separate(list, true);
+    for (const v of list) {
+      v.coverWanted = coverTilesFor(v);
+      if (v.plate.fresh) { v.plate.fresh = false; Object.assign(v.plate, v.target); }
+    }
     applyCover();
   }
 
@@ -375,18 +469,24 @@ export function create(ctx) {
       entries: Object.keys(pad.cost).map(item => ({
         item, cost: pad.cost[item], shown: pad.cost[item] - (pad.paid?.[item] || 0), done: false,
         numW: 0, pop: new Spring(0, { stiffness: 430, damping: 17 }), bump: new Spring(0, { stiffness: 320, damping: 14 }),
+        pipA: null, wx: NaN, wy: 0, wz: NaN,   // pip fade; where its paid items land (world)
       })),
       ghost: null,
       phase: 'in', t: -dl, outT: 0, doneT: -1,
       on: 0, press: 0, flash: 0, fillShown: 0, green: 0,
       landed: Object.fromEntries(Object.keys(pad.cost).map(k => [k, pad.paid?.[k] || 0])),
       inFlight: 0,
+      flying: {},                // item -> items of it in the air toward this pad
+      // the hero (the one big number) and its swap; the lift into the sticker while the player stands on it
+      hero: null, heroPrev: null, heroK: 1, heroHold: 0,
+      lift: new Spring(0, { stiffness: 260, damping: 21 }), onT: 0, heroAt: new THREE.Vector3(NaN, 0, 0),
       bob: new Spring(0, { stiffness: 170, damping: 9 }),
       thump: new Spring(0, { stiffness: 380, damping: 15 }),
       phaseOff: (pads.size * 1.7) % 6.28,
       fxDone: false,
     };
     for (const e of v.entries) { e.done = e.shown <= 0; e.numW = numberWidth(e.done ? '✓' : String(e.shown)); }
+    chooseHero(v, 0);
     pads.set(pad.id, v);
     try { v.ghost = makeGhost(pad); } catch (e) { console.error('[pads] ghost', pad.id, e); }
     relayoutAll();
@@ -401,6 +501,44 @@ export function create(ctx) {
     const done = n <= 0;
     if (done !== e.done) e.done = done;
     if (kick) { const k = reduced ? 0.3 : 1; e.pop.kick((done ? 7 : 5.2) * k); e.bump.kick((done ? 5 : 3.6) * k); }
+  }
+
+  // The hero: the cost the player can pay now (an item on the stack this pad still needs; for the guide's target
+  // the item the guide asks for, else the stack's top-most one, which is what the stream sends next), else the
+  // first unpaid cost. It sticks while it is still being paid or nothing else can be, and holds at least 0.45 s,
+  // so a mixed stack never makes it flicker. Pads away from the player (and not the guide's target) only
+  // re-pick once their hero is paid off: paying the hearth doesn't make every plate on screen swap.
+  function chooseHero(v, dt, player = null) {
+    const pad = v.pad;
+    v.heroHold = Math.max(0, v.heroHold - dt);
+    const unpaid = v.entries.filter(e => e.shown > 0);
+    const cur = v.hero && v.hero.shown > 0 ? v.hero : null;
+    const goal = camp.goal?.padId === v.id ? camp.goal : null;
+    const P = v.plate;
+    const near = !player || !P || (Math.abs(player.x - P.cx) < P.hx + 2.2 && Math.abs(player.z - P.cz) < P.hz + 2.2);
+    // while items stream in, the hero is what is landing (the stream takes the stack's top-most match)
+    const flowing = v.inFlight > 0 ? unpaid.find(e => e.item === v.lastItem) || null : null;
+    let want;
+    if (!unpaid.length) want = v.hero || v.entries[0];
+    else if (flowing) want = cur && (v.flying[cur.item] || 0) > 0 ? cur : flowing;
+    else if (cur && !goal && !near) want = cur;
+    else {
+      const stack = camp.stack || [];
+      const can = e => (pad.paid?.[e.item] ?? 0) < pad.cost[e.item] && stack.includes(e.item);
+      const asked = goal?.item ? unpaid.find(e => e.item === goal.item) : null;
+      if (cur && ((v.flying[cur.item] || 0) > 0 || (can(cur) && !(asked && can(asked))) || !unpaid.some(can))) want = cur;
+      else if (asked && can(asked)) want = asked;
+      else {
+        want = null;
+        for (let i = stack.length - 1; i >= 0 && !want; i--) want = unpaid.find(e => e.item === stack[i] && can(e)) || null;
+        want = want || asked || unpaid[0];
+      }
+    }
+    if (!v.hero) { v.hero = want; for (const e of v.entries) e.pipA = e === want ? 0 : 1; return; }
+    if (want !== v.hero && v.heroHold <= 0) {
+      v.heroPrev = v.hero; v.hero = want; v.heroK = 0; v.heroHold = 0.45;
+      want.bump.kick(reduced ? 1 : 3);
+    }
   }
 
   function destroy(v) {
@@ -442,17 +580,19 @@ export function create(ctx) {
     return out.set(sim.player.x, 0.65, sim.player.z);
   }
   let flightSeq = 0;
-  // Where a paid item lands: onto the printed number it pays for (the number ticks with a pop as it lands), so
-  // the cause and the effect sit on the same spot and the player standing on the plate never hides it. The
-  // hearth takes its wood / food straight into the fire.
+  // Where a paid item lands: into the number it pays for (the number ticks with a pop as it lands), so cause and
+  // effect sit on the same spot: the hero (on the plate, or up in its sticker while the player stands on the
+  // plate) or that cost's pip on the lip. Re-aimed every frame, so a sticker lifting mid-flight still catches it.
+  // The hearth takes its wood / food straight into the fire.
   function flightTarget(v, item, ang, rr, out) {
     if (v.kind === 'hearth') {
       const hc = camp.stationCenter?.('hearth');
       if (hc) return out.set(hc.x + Math.cos(ang) * rr * 0.8, 0.32, hc.z + Math.sin(ang) * rr * 0.8);
     }
-    const e = v.entries.find(x => x.item === item);
     const j = 0.05;
-    if (e && Number.isFinite(e.wx)) return out.set(e.wx + Math.cos(ang) * j, PLATE_Y + 0.06, e.wz + Math.sin(ang) * j * 0.6);
+    const e = v.entries.find(x => x.item === item);
+    if (e && e === v.hero && Number.isFinite(v.heroAt.x)) return out.set(v.heroAt.x + Math.cos(ang) * j, v.heroAt.y, v.heroAt.z + Math.sin(ang) * j * 0.6);
+    if (e && Number.isFinite(e.wx)) return out.set(e.wx + Math.cos(ang) * j, e.wy, e.wz + Math.sin(ang) * j * 0.6);
     const P = v.plate || v.target;
     return out.set(P.cx + Math.cos(ang) * rr * 0.4, PLATE_Y + 0.06, P.cz + Math.sin(ang) * rr * 0.3);
   }
@@ -468,25 +608,28 @@ export function create(ctx) {
     const to = flightTarget(v, item, ang, rr, new THREE.Vector3());
     const dist = Math.hypot(to.x - from.x, to.z - from.z);
     flights.push({
-      v, item, from, to,
+      v, item, from, to, ang, rr,
       k: 0, rate: 1 / (clamp(FLIGHT_MIN + dist * 0.035, FLIGHT_MIN, FLIGHT_MAX) * (1 - 0.3 * fast)),
       h: (0.42 + Math.min(dist, 5) * 0.07) * (1 - 0.2 * fast),
       spin: 7 * (k % 2 ? 1 : -1), yaw0: ang,
     });
     v.inFlight++;
+    v.flying[item] = (v.flying[item] || 0) + 1;
+    v.lastItem = item;
   }
   function landFlight(f) {
     const v = f.v;
     v.inFlight = Math.max(0, v.inFlight - 1);
+    if (f.to) v.flying[f.item] = Math.max(0, (v.flying[f.item] || 0) - 1);
     v.landed[f.item] = Math.min(v.pad.cost[f.item] ?? Infinity, (v.landed[f.item] || 0) + 1);
     // the number ticks as the item lands (cause -> effect), with a pop
     const e = v.entries.find(x => x.item === f.item);
     if (e && v.doneT < 0) setShown(v, e, v.pad.cost[f.item] - v.landed[f.item]);
     v.thump.velocity = Math.max(v.thump.velocity - 2.2, -7);
     v.flash = Math.min(1, v.flash + 0.12);
-    // a tiny dust tick every few items so a fast stream reads as one continuous pour
+    // a tiny dust tick every few items so a fast stream reads as one continuous pour (on the ground only)
     const n = totalLanded(v);
-    if (n % 3 === 1 && f.to) views.fx?.puff?.({ x: f.to.x, y: f.to.y + 0.02, z: f.to.z }, { count: 2, size: 0.07, spread: 0.12, up: 0.3, color: '#fffaf0' });
+    if (n % 3 === 1 && f.to && f.to.y < 0.4) views.fx?.puff?.({ x: f.to.x, y: f.to.y + 0.02, z: f.to.z }, { count: 2, size: 0.07, spread: 0.12, up: 0.3, color: '#fffaf0' });
     try { events.emit('pads:landed', { pad: v.pad, item: f.item }); } catch { /* listeners are someone else's */ }
   }
   function updateFlights(dt) {
@@ -495,6 +638,7 @@ export function create(ctx) {
       const f = flights[i];
       f.k = Math.min(1, f.k + dt * f.rate);
       if (f.k >= 1) { flights.splice(i, 1); landFlight(f); }
+      else flightTarget(f.v, f.item, f.ang, f.rr, f.to);
     }
     for (const f of flights) {
       const m = flyMesh(f.item);
@@ -599,7 +743,7 @@ export function create(ctx) {
   }
   const P4 = [0, 0, 0, 0], R4 = [0, 0, 0, 0], S4 = [0, 0, 0, 0], E4 = [0, 0, 0, 0];
 
-  function updatePad(v, dt, player, tagD) {
+  function updatePad(v, dt, player) {
     v.t += dt;
     const pad = v.pad;
     const out = v.phase === 'out';
@@ -618,13 +762,23 @@ export function create(ctx) {
     let scale = ka > 0 ? lerp(0.6, 1, ease.backOut(ka, 1.6)) : 0;
     let alpha = ease.quadOut(clamp(ka / 0.3));
 
-    // ---- standing on it: the slab presses down ----
+    // ---- standing on it: the slab presses down; the hero lifts into a sticker over the far edge ----
     const onPad = !out && live && camp.inRect?.(v.zone, player.x, player.z);
     v.on = damp(v.on, onPad ? 1 : 0, onPad ? 12 : 6, dt);
     v.press = damp(v.press, onPad ? 1 : 0, 18, dt);
+    v.onT = onPad ? v.onT + dt : 0;
+    if (!out) {
+      // the guide's target lifts at once (it starts paying at once); any other pad only once the sim actually starts
+      // exchanging with it (camp.exchanging: the player stood still on it), so walking across never pops a sticker
+      const want = onPad && (camp.goal?.padId === v.id || v.inFlight > 0 || (camp.exchanging !== undefined ? camp.exchanging === 'pad:' + v.id : v.onT >= LIFT_DWELL));
+      const L = v.lift;
+      L.target = want ? 1 : 0;
+      if (want) { L.stiffness = 260; L.damping = reduced ? 34 : 21; }   // up: a quick pop with a little overshoot
+      else { L.stiffness = 150; L.damping = 25; }                       // down: a calm glide, no bounce
+    }
+    v.lift.update(dt);
     // breathing (calmer while pressed)
     if (!reduced) scale *= 1 + 0.012 * Math.sin(time * 2.1 + v.phaseOff) * (1 - v.on * 0.7);
-
     // ---- springs ----
     v.bob.update(dt); v.thump.update(dt);
     v.flash = Math.max(0, v.flash - dt * 3.2);
@@ -670,22 +824,22 @@ export function create(ctx) {
       plates.push(P4, R4, S4, E4);
     }
 
-    // ---- printed content: icons + numbers, then the name tag ----
+    // ---- printed content (pads/ink.js): the hero, then the lip row (name tag + cost pips) ----
+    if (v.doneT < 0) chooseHero(v, dt, player);
+    v.heroK = Math.min(1, v.heroK + dt / 0.24);
+    const multi = v.entries.length > 1;
+    for (const e of v.entries) {
+      e.pop.update(dt); e.bump.update(dt);
+      const wantW = numberWidth(e.done ? '✓' : String(Math.max(0, e.shown)));
+      e.numW = e.numW ? damp(e.numW, wantW, 18, dt) : wantW;
+      e.pipA = damp(e.pipA ?? 1, multi && e !== v.hero ? 1 : 0, 16, dt);
+    }
     const ca = alpha * contentA;
     const kc = live ? clamp((v.t - CONTENT_DELAY) / 0.4) : 0;
     const cScale = kc > 0 ? lerp(0.5, 1, ease.backOut(kc, 2)) : 0;
-    if (ca * kc > 0.003) pushContent(v, scale, cScale, ca * ease.quadOut(clamp(kc / 0.4)), lipNow, dt);
-    else for (const e of v.entries) { e.pop.update(dt); e.bump.update(dt); }
+    if (ca * kc > 0.003) pushHero(v, scale, cScale, ca * ease.quadOut(clamp(kc / 0.4)), lipNow);
     const kt = live ? clamp((v.t - TAG_DELAY) / 0.4) : 0;
-    if (alpha * kt > 0.003) {
-      const tg = atlas.tag(v.name);
-      const s = scale * (kt > 0 ? lerp(0.6, 1, ease.backOut(kt, 2.2)) : 0);
-      const d = tagD * view.zs, w = tagD * (tg.w / tg.h);
-      // a tag switching edges fades through the middle instead of sliding visibly over the numbers
-      const sideA = Math.pow(clamp(Math.abs(P.tagSide)), 3);
-      glyphs.push(P.cx, P.cz + (P.hz - d * 0.18) * P.tagSide * scale - (P.tagSide < 0 ? lipNow * 0.5 * scale : 0), w * s, d * s, tg.uv, PLATE_Y + 0.004, alpha * sideA * ease.quadOut(clamp(kt / 0.4)));
-    }
-
+    if (alpha * kt > 0.003) pushRow(v, scale, scale * lerp(0.6, 1, ease.backOut(kt, 2.2)), alpha * ease.quadOut(clamp(kt / 0.4)));
     // ---- ghost ----
     const g = v.ghost;
     if (g) {
@@ -739,55 +893,102 @@ export function create(ctx) {
     if (out && v.outT >= OUT_T && v.inFlight === 0) destroy(v);
   }
 
-  // icons + numbers on the top face (plate-local layout, scaled about the plate centre)
-  function pushContent(v, scale, cScale, a, lipNow, dt) {
-    const P = v.plate, T = v.target;
-    const cs = P.cs;
-    const zs = view.zs;
-    const k = K();
-    const n = v.entries.length, cols = Math.min(T.cols, n), rows = Math.ceil(n / cols);
-    const pairD = T.pairD * cs;
-    const cz0 = -lipNow * 0.5 + (PAD_N - PAD_S) * 0.5 * cs * P.tagSide;   // block centre (top face, clear of the tag)
-    const y = PLATE_Y + 0.003;
+  // ---- the hero: one icon + ONE big number, printed on the plate or lifted into its sticker ----
+  // Laid out in plate-local tiles around the hero's centre (z stretched by view.zs so it reads upright); ink.js
+  // glides the whole block between the ground print (k = 0) and the billboard sticker (k = 1).
+  const liftY = () => LIFT_Y;
+  function pushHero(v, scale, cScale, a, lipNow) {
+    const P = v.plate, cs = P.cs, zs = view.zs;
+    const kl = Math.max(0, v.lift.value);
+    const ro = rowOn();
+    // centre of the top face the lip row leaves free (the top face spans -hz .. hz - lip)
+    const cz0 = (-lipNow - ro * P.tagSide) / 2;
+    const gx = P.cx, gz = P.cz + cz0 * scale;
+    const lx = P.cx, lz = P.cz - P.hz * scale, ly = liftY(v);
     const S = scale * cScale;
-    for (let i = 0; i < n; i++) {
-      const e = v.entries[i];
-      const pop = e.pop.update(dt), bump = e.bump.update(dt);
-      const row = Math.floor(i / cols), inRow = Math.min(cols, n - row * cols), col = i - row * cols;
-      const str = e.done ? '✓' : String(Math.max(0, e.shown));
-      const wantW = numberWidth(str);
-      e.numW = e.numW ? damp(e.numW, wantW, 18, dt) : wantW;
-      const pairW = pairWidth(e.numW) * cs;
-      const px = (col - (inRow - 1) / 2) * (T.pairW + COL_GAP) * cs;
-      const pz = cz0 + (row - (rows - 1) / 2) * (pairD + ROW_GAP * cs);
-      const left = px - pairW / 2;
-      // icon (bumps on each landing)
-      const ic = atlas.icon(e.item);
-      const iw = ICON_T * cs * (1 + clamp(bump, -0.2, 0.3) * 0.3);
-      const icx = left + ICON_T * ICON_INK * cs / 2;
-      glyphs.push(P.cx + icx * S, P.cz + pz * S, iw * S, iw * zs * S, ic.uv, y, a, e.done ? 1 : 0);
-      // number: backs (outline + lip) of every digit first, then the white fills
-      const ps = 1 + clamp(pop, -0.2, 0.42);
-      const numL = left + (ICON_T * ICON_INK + ICON_GAP + atlas.O * k * 1.2) * cs;
-      const numC = numL + e.numW * cs / 2;
-      e.wx = P.cx + numC * scale; e.wz = P.cz + pz * scale;   // where paid items land (flightTarget)
-      const inkH = DIGIT_T * cs * zs;
-      for (let pass = 0; pass < 2; pass++) {
-        let pen = numL;
-        for (let j = 0; j < str.length; j++) {
-          const gph = atlas.glyph(str[j]);
-          const gw = gph.w * k * cs, gd = gph.h * k * cs * zs;
-          const qx = pen - gph.ox * k * cs + gw / 2;
-          const qz = pz - inkH / 2 - gph.oy * k * cs * zs + gd / 2;
-          // pop about the number's centre
-          const wx = numC + (qx - numC) * ps, wz = pz + (qz - pz) * ps;
-          glyphs.push(P.cx + wx * S, P.cz + wz * S, gw * ps * S, gd * ps * S, pass ? gph.f : gph.b, y + 0.0005 * pass, a);
-          pen += (gph.adv + atlas.O * 0.9) * k * cs;
-        }
+    const blk = ink.block({
+      id: v.id, gx, gy: PLATE_Y, gz, k: kl, lx, ly, lz, ls: LIFT_SCALE, zs, a,
+      stickerA: ease.quadOut(clamp((kl - 0.04) / 0.45)), padPx: STICKER.pad, lipPx: STICKER.lip, tailPx: STICKER.tail,
+    });
+    const box = v.box || (v.box = { l: 0, r: 0, t: 0, b: 0, numC: 0 });
+    // a swap: the outgoing hero shrinks away while the new one pops in
+    const hk = v.heroK;
+    if (v.heroPrev && hk < 1) heroQuads(blk, v.heroPrev, cs, S * lerp(1, 0.55, ease.quadIn(hk)), 1 - ease.quadOut(clamp(hk * 1.4)), null);
+    if (v.hero) heroQuads(blk, v.hero, cs, S * (hk < 1 ? lerp(0.6, 1, ease.backOut(hk, 2.2)) : 1), hk < 1 ? ease.quadOut(clamp(hk * 1.8)) : 1, box);
+    blk.box = box;
+    // where the hero's paid items land: its number on the plate, or up in the sticker (the anchor plus the
+    // sticker's own height, CSS px -> world via the projected scale of one vertical unit)
+    const sPx = view.pxX * LIFT_SCALE;
+    const upPx = STICKER.tail + STICKER.lip + STICKER.pad + ((box.b - box.t) * sPx / zs) / 2;
+    const kv = clamp(kl);
+    v.heroAt.set(
+      lerp(gx + box.numC, lx + (box.numC - (box.l + box.r) / 2) * LIFT_SCALE, kv),
+      lerp(PLATE_Y + 0.06, ly + upPx / Math.max(1, view.pxY), kv),
+      lerp(gz, lz, kv),
+    );
+  }
+  function heroQuads(b, e, cs, S, qa, box) {
+    const zs = view.zs, k = K();
+    const str = e.done ? '✓' : String(Math.max(0, e.shown));
+    const pairW = pairWidth(e.numW) * cs;
+    const left = -pairW / 2;
+    // icon (bumps on each landing)
+    const ic = atlas.icon(e.item);
+    const iw = ICON_T * cs * (1 + clamp(e.bump.value, -0.2, 0.3) * 0.3);
+    const icx = left + ICON_T * ICON_INK * cs / 2;
+    ink.quadTo(b, icx * S, 0, iw * S, iw * zs * S, ic.uv, qa);
+    // number: backs (outline + lip) of every digit first, then the white fills; it pops about its centre
+    const ps = 1 + clamp(e.pop.value, -0.2, 0.42);
+    const numL = left + (ICON_T * ICON_INK + ICON_GAP + atlas.O * k * 1.2) * cs;
+    const numC = numL + e.numW * cs / 2;
+    const inkH = DIGIT_T * cs * zs;
+    for (let pass = 0; pass < 2; pass++) {
+      let pen = numL;
+      for (let j = 0; j < str.length; j++) {
+        const gph = atlas.glyph(str[j]);
+        const gw = gph.w * k * cs, gd = gph.h * k * cs * zs;
+        const qx = pen - gph.ox * k * cs + gw / 2;
+        const qz = -inkH / 2 - gph.oy * k * cs * zs + gd / 2;
+        ink.quadTo(b, (numC + (qx - numC) * ps) * S, qz * ps * S, gw * ps * S, gd * ps * S, pass ? gph.f : gph.b, qa);
+        pen += (gph.adv + atlas.O * 0.9) * k * cs;
       }
     }
+    if (box) {
+      // the sticker hugs the number; the icon breaks out of its left edge (UI-STYLE "icons break out")
+      const o = atlas.O * k * cs;
+      box.l = (left + ICON_T * ICON_INK * cs * 0.52) * S; box.r = (numL + e.numW * cs + o * 1.2) * S;
+      box.t = (-inkH / 2 - o * zs * 1.1) * S; box.b = (inkH / 2 + (o + atlas.LIP * k * cs) * zs * 0.9) * S;
+      box.numC = numC * S;
+    }
   }
-
+  // ---- the lip row: the name tag, then a pip per other cost (multi-cost pads), straddling the plate's edge ----
+  function pushRow(v, scale, s, a) {
+    const P = v.plate;
+    const items = rowItems(v);
+    const total = rowWidthPx(items);
+    const side = P.tagSide;
+    const sideA = Math.pow(clamp(Math.abs(side)), 3);   // a row switching edges fades through the middle
+    const wx = P.cx, wz = P.cz + (P.hz - rowDepth() * (ROW_ON - 0.5)) * side * scale;
+    let x = -total / 2;
+    items.forEach((it, i) => {
+      if (i) x += RS.gap * it.a;
+      const w = it.w * it.a, dx = (x + w / 2) * s;
+      x += w;
+      if (it.kind === 'tag') {
+        const tg = atlas.tag(v.name);
+        ink.tag(wx, PLATE_Y, wz, tg.uv, it.w, RS.tag, { dx, s, a: a * sideA, id: v.id });
+      } else {
+        const e = it.e;
+        ink.pip(wx, PLATE_Y, wz, {
+          iconUv: atlas.icon(e.item).uv, text: pipText(e), done: e.done, w: it.w, h: RS.pip, icon: RS.icon, fontPx: RS.font,
+          dx, s: s * lerp(0.6, 1, ease.backOut(it.a, 2)), a: a * sideA * ease.quadOut(it.a),
+          pop: clamp(e.pop.value, -0.2, 0.42), bump: clamp(e.bump.value, -0.2, 0.3), id: v.id,
+        });
+        // a paid pip's items land on it
+        e.wx = wx + dx / Math.max(8, view.pxX); e.wy = PLATE_Y + 0.06; e.wz = wz;
+      }
+    });
+  }
   function updateHints(dt) {
     hints.begin();
     for (const h of lockHints) {
@@ -807,13 +1008,12 @@ export function create(ctx) {
     for (const pad of camp.pads) if (!pads.has(pad.id)) ensure(pad);
     updateFlights(dt);
     const player = playerXZ();
-    const tagD = tagDepth();
-    plates.begin(); glyphs.begin();
+    plates.begin(); ink.begin(dt);
     for (const v of [...pads.values()]) {
-      try { updatePad(v, dt, player, tagD); } catch (e) { console.error('[pads] update', v.id, e); destroy(v); }
+      try { updatePad(v, dt, player); } catch (e) { console.error('[pads] update', v.id, e); destroy(v); }
     }
     plates.commit(time, view.outline);
-    glyphs.commit();
+    ink.commit();
     // the HUD renders its 3D item icons a moment after load: pick them up (a string compare per icon)
     if ((iconCheck -= dt) <= 0) { iconCheck = time < 12 ? 1 : 6; atlas.refreshIcons(); }
     atlas.commit();
@@ -836,12 +1036,24 @@ export function create(ctx) {
       if (!v?.plate) return null;
       return { x: v.plate.cx, z: v.plate.cz, hx: v.plate.hx, hz: v.plate.hz };
     },
+    // Everything printed for a pad on the ground (the plate plus its lip row, which may hang past the plate's
+    // sides or edge), as { x, z, hx, hz } in world tiles, or null. Use it to keep pointers / bubbles off the print.
+    printRect(id) {
+      const v = pads.get(id);
+      if (!v?.plate) return null;
+      const P = v.plate, d = rowDepth(), side = P.tagSide >= 0 ? 1 : -1;
+      const hw = Math.max(P.hx, rowWidthPx(rowItems(v)) / Math.max(8, view.pxX) / 2);
+      const zr = P.cz + (P.hz - d * (ROW_ON - 0.5)) * side;
+      const t = Math.min(P.cz - P.hz, zr - d / 2), b = Math.max(P.cz + P.hz, zr + d / 2);
+      return { x: P.cx, z: (t + b) / 2, hx: hw, hz: (b - t) / 2 };
+    },
     // World point where a pointer (the guide's arrow) can hover over a pad without hiding its printed number:
-    // above the emblem, above the ghost station, or over the plate's far edge.
+    // above the lifted sticker, above the emblem, above the ghost station, or over the plate's far edge.
     padTop(id, out = _out) {
       const v = pads.get(id);
       if (!v) return null;
       const g = v.ghost, P = v.plate;
+      if (v.lift.value > 0.5 && Number.isFinite(v.heroAt.x)) return out.set(v.heroAt.x, v.heroAt.y + 0.5, v.heroAt.z);
       if (g?.info.float) return out.set(g.holder.position.x, g.holder.position.y + g.info.height, g.holder.position.z);
       if (g?.type === 'model') return out.set(g.holder.position.x, (g.info.height || 1) + 0.1, g.holder.position.z);
       return out.set(P.cx, 0.45, P.cz - P.hz * 0.9);
@@ -851,15 +1063,27 @@ export function create(ctx) {
     get flights() { return flights.length; },
     get assemblingBridges() { return bridges.assembling; },
     get pads() { return [...pads.keys()]; },
+    // The pad whose countdown is lifted into its sticker right now (the player stands on it), or null. The HUD
+    // may hide its stack counter meanwhile: the pad's number is the hero.
+    get lifted() { for (const v of pads.values()) if (v.lift.value > 0.5 && v.phase !== 'out') return v.id; return null; },
+    // World point of a pad's big number (where its paid items land), or null.
+    heroPoint(id, out = new THREE.Vector3()) { const v = pads.get(id); return v && Number.isFinite(v.heroAt.x) ? out.copy(v.heroAt) : null; },
     // test hooks
     _views: pads, _atlas: atlas,
-    stats() { return { plates: pads.size, glyphs: glyphs.count, flights: flights.length, coveredTiles: coverApplied.size }; },
+    stats() { return { plates: pads.size, ink: ink.count, flights: flights.length, coveredTiles: coverApplied.size }; },
     update,
     dispose() {
       offs.forEach(off => off?.());
       for (const v of pads.values()) disposeGhost(v.ghost);
       atlas.dispose();
+      ink.dispose();
     },
   };
   return api;
+}
+
+// No 2D canvas (never expected in a browser): the plates still work, they just print nothing.
+function nullInk() {
+  const nop = () => {};
+  return { canvas: null, begin: nop, block: () => ({ quads: [] }), quadTo: nop, tag: nop, pip: nop, pipWidth: () => 40, commit: nop, count: 0, dispose: nop };
 }

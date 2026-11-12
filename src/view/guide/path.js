@@ -42,17 +42,23 @@ function los(walk, ax, az, bx, bz) {
 export function buildPolyline(walk, from, tiles, target) {
   if (!tiles || !tiles.length) return null;
   // end point: on the target (pad / zone / pile) or stop short of it along the last approach
-  const last = tiles[tiles.length - 1];
+  let tl = tiles;
+  // a target you stand on (a pile) but stop short of: approach from the tile before it
+  if (target.stop > 0 && target.onTile && tl.length > 1) {
+    const e = tl[tl.length - 1];
+    if (Math.round(target.x) === e[0] && Math.round(target.z) === e[1]) tl = tl.slice(0, -1);
+  }
+  const last = tl[tl.length - 1];
   let ex = target.x, ez = target.z;
   if (target.stop > 0) {
-    const ax = tiles.length > 1 ? tiles[tiles.length - 1][0] : from.x, az = tiles.length > 1 ? tiles[tiles.length - 1][1] : from.z;
+    const ax = tl.length > 1 ? last[0] : from.x, az = tl.length > 1 ? last[1] : from.z;
     let dx = ax - target.x, dz = az - target.z;
     const l = Math.hypot(dx, dz) || 1; dx /= l; dz /= l;
     ex = target.x + dx * target.stop; ez = target.z + dz * target.stop;
     // never further out than the last walkable tile
     if (Math.hypot(ex - target.x, ez - target.z) > Math.hypot(last[0] - target.x, last[1] - target.z)) { ex = last[0]; ez = last[1]; }
   }
-  const raw = [[from.x, from.z], ...tiles.slice(1), [ex, ez]];
+  const raw = [[from.x, from.z], ...tl.slice(1), [ex, ez]];
   // string pulling: from each anchor jump to the furthest point still in sight
   const out = [raw[0]];
   let i = 0;

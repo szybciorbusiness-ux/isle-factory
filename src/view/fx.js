@@ -607,13 +607,21 @@ export function create(ctx) {
       // continue an ongoing stream from the same place instead of overlapping it
       base = Math.max(base, (streamT.get(key) ?? -1) - clock + STREAM);
       let left = delta, at = base;
-      events.emit('fx:flightsQueued', { item, count: delta, x, z, eta: base + (n - 1) * STREAM + POP + 0.56 });
+      const froms = [];
+      for (let i = 0; i < n; i++) {
+        let from = null;
+        try { from = views.props?.flightOrigin?.(x, z, i, n) || pileOrigin(x, z) || null; } catch { from = null; }
+        froms.push(from || new THREE.Vector3(x + R(-0.15, 0.15), 0.25, z + R(-0.15, 0.15)));
+      }
+      // eta of the last arrival: its delay + hop + the homing flight (as stepFlight sizes it, from where the pack
+      // is now; a little margin for the player walking on)
+      const pk = playerPos(), lf = froms[n - 1];
+      const flyEst = clamp(0.28 + Math.hypot(pk.x - lf.x, pk.z - lf.z) * 0.045, 0.3, 0.56) + 0.04;
+      events.emit('fx:flightsQueued', { item, count: delta, x, z, eta: base + (n - 1) * STREAM + POP + flyEst });
       for (let i = 0; i < n; i++) {
         const share = i === n - 1 ? left : Math.floor(delta / n);
         left -= share;
-        let from = null;
-        try { from = views.props?.flightOrigin?.(x, z, i, n) || pileOrigin(x, z) || null; } catch { from = null; }
-        from = from || new THREE.Vector3(x + R(-0.15, 0.15), 0.25, z + R(-0.15, 0.15));
+        const from = froms[i];
         flyItem(item, from, playerPos, {
           delay: at,
           onArrive: () => { events.emit('fx:itemArrived', { item, count: share }); views.player?.gulp?.(); },
