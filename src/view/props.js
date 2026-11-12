@@ -1,0 +1,1015 @@
+// Resource props: trees, rocks, stumps + deposit nuggets. All instanced (one InstancedMesh per variant);
+// animated props write their own instance matrix every frame while they move, then go back to rest.
+// Reactions: resource:hit (wobble / jolt / shiver), resource:depleted (tree fall, rock crumble,
+// stump pop), deposit:mined (nugget jiggle). Hover highlight via setHover(id). See DESIGN.md "props".
+//
+// Per-instance shader data lives in one vec3 attribute `aFx` = (leaf shiver, highlight glow, wind sway).
+import * as THREE from 'three';
+import { buildTree, buildRock, buildStump, buildNugget } from './props/geo.js';
+import { Spring, Wobble, ease, clamp, lerp, arc } from '../util/anim.js';
+import { hash2, mulberry32 } from '../util/noise.js';
+
+const TREE_VARIANTS = 4, ROCK_VARIANTS = 4;
+
+// Tree fall timeline (seconds) for a fall onto open ground
+// pop: after landing on open ground the log swells and bursts into the logs that fly to the pack (arcade pace:
+// the drops leave ~0.75 s after the final blow instead of waiting for the log to settle)
+const FALL = { antic: 0.1, fall: 0.46, b1: 0.2, b2: 0.12, rest: 0.12, grow: 0.08, shrink: 0.28, lean: 0.075, land: 1.36, bounce1: 0.15, bounce2: 0.05, pop: 0.16, popWater: 0.32, popLean: 0.42 };
+FALL.tLand = FALL.antic + FALL.fall;
+FALL.tVanish = FALL.tLand + FALL.b1 + FALL.b2 + FALL.rest;
+const WATER_LAND = 1.64;   // a crown over water sinks past the ground angle until it rests on the surface
+const LEAN_MIN = 0.3;      // a tree caught by a neighbour leans at least this much (~73 degrees above ground)
+const LEAN_MAX = FALL.land - 0.16;
+// rough shapes of buildings a felled tree can lean on: [height, half width]
+const BUILD_SHAPE = { drill: [1.0, 0.4], chest: [0.66, 0.38], workshop: [1.08, 0.44], belt: [0.12, 0.48] };
+
+// Hover highlight
+const HOVER = { in: 0.16, out: 0.24, scale: 0.05, pulseHz: 1.15 };
+
+// Gather juice (FIRST-20.md "Feel"): every hit freezes the target in its struck pose for a couple of frames
+// (hit-stop), flashes it white and throws chips / leaves; the final blow freezes longer, bursts bigger and
+// gives the camera one small shake (player hits only).
+const HIT = { stop: 0.03, stopFinal: 0.05, white: 1, whiteDecay: 14, shake: 0.03 };
+
+// Regrowth (camp): a sapling sprouts with a little leaf burst, holds a beat, then grows to full size with a
+// springy overshoot (~1.2 s); the stump it replaces sinks and shrinks away under it. Rocks rise out of a dust puff.
+const GROW = { delay: 0.12, sprout: 0.18, hold: 0.14, grow: 0.88, sap: 0.26, sapStretch: 1.32 };
+GROW.total = GROW.sprout + GROW.hold + GROW.grow;
+const SINK = { grow: 0.06, shrink: 0.34, depth: 0.1 };
+const RISE = { lead: 0.05, dur: 0.5, from: 0.72, scale0: 0.7 };
+
+// "Not now": brushing a rock while stone has no use yet gives a tiny wobble, never a hit.
+const BRUSH = { dist: 0.9, release: 1.02, cooldown: 0.7, wobble: 0.03 };
+
+const _m = new THREE.Matrix4(), _m2 = new THREE.Matrix4(), _q = new THREE.Quaternion(), _qy = new THREE.Quaternion();
+const _p = new THREE.Vector3(), _v = new THREE.Vector3(), _s = new THREE.Vector3(), _ax = new THREE.Vector3();
+const UP = new THREE.Vector3(0, 1, 0);
+const smooth = t => t * t * (3 - 2 * t);
+
+export function create(ctx) {
+  const { scene, sim, events, config, map, views } = ctx;
+  const P = config.PALETTE;
+  const DIRS = config.DIRS;
+  const WATER_Y = config.WATER_Y ?? -0.32;
+  let live = false; // events before the first frame (scenario setup) apply instantly, without animation
+
+  // ---------------- materials ----------------
+  // Wind: the world's shared gust field (views.terrain.wind, src/view/world/wind.js) so trees lean in the
+  // same rolling gust fronts that sweep the grass; the clock follows terrain's dt-advanced wind time.
+  // Without it, a gentle gust field of our own.
+  const tWind = views.terrain?.wind;
+  const worldWind = typeof tWind?.glsl === 'string' && /float\s+windGust\s*\(/.test(tWind.glsl)
+    && /uniform\s+float\s+uWindTime/.test(tWind.glsl) ? tWind.glsl : null;
+  const wd = Array.isArray(tWind?.params?.dir) ? tWind.params.dir : [0.9, 0.44];
+  const windU = {
+    uWindTime: { value: 0 },
+    uWindAmp: { value: 1 },
+    uWindDir: { value: new THREE.Vector2(wd[0], wd[1]).normalize() },
+  };
+  const windHeader = worldWind || /* glsl */`
+    uniform float uWindTime;
+    float windGust(vec2 p) { return 0.25 + 0.25 * sin(uWindTime * 0.37 + p.x * 0.11 - p.y * 0.07) + 0.2 * sin(uWindTime * 0.9 - p.x * 0.3); }`;
+  const swayGlsl = withGlow => /* glsl */`
+    #include <begin_vertex>
+    {
+      float hgt = max(transformed.y - 0.32, 0.0);
+      vec3 ip = vec3(0.0);
+      mat3 im = mat3(1.0);
+      #ifdef USE_INSTANCING
+        ip = vec3(instanceMatrix[3][0], instanceMatrix[3][1], instanceMatrix[3][2]);
+        im = mat3(instanceMatrix);
+      #endif
+      float s2 = max(dot(im[0], im[0]), 1e-4);
+      float ph = ip.x * 0.55 + ip.z * 0.35;
+      float gust = clamp(windGust(ip.xz), 0.0, 1.0);
+      // world wind direction (and its perpendicular) in this instance's local space
+      vec3 wl = (vec3(uWindDir.x, 0.0, uWindDir.y) * im) / s2;
+      vec3 wp = (vec3(-uWindDir.y, 0.0, uWindDir.x) * im) / s2;
+      float k = hgt * hgt * 0.017 * uWindAmp * aFx.z;
+      // a steady lean downwind that deepens as a gust front rolls through, plus a slow rocking
+      float sway = 0.3 + 0.95 * gust + sin(uWindTime * 1.3 + ph) * (0.2 + 0.3 * gust) + sin(uWindTime * 2.1 + ph * 1.7) * 0.1;
+      transformed += wl * (sway * k) + wp * (sin(uWindTime * 1.6 + ph * 1.3) * k * 0.25);
+      // leaf flutter rippling through the crown, stronger in gusts
+      float fl = hgt * 0.006 * uWindAmp * aFx.z * (0.35 + gust);
+      transformed.x += sin(uWindTime * 5.3 + position.y * 7.0 + position.z * 5.0 + ph) * fl;
+      transformed.z += cos(uWindTime * 4.4 + position.x * 6.0 + position.y * 3.0 + ph) * fl;
+      // hit shiver
+      float sh = aFx.x * hgt;
+      transformed.x += sin(uWindTime * 37.0 + position.y * 9.0 + position.z * 7.0) * sh * 0.06;
+      transformed.z += cos(uWindTime * 31.0 + position.x * 8.0 + position.y * 6.0) * sh * 0.06;
+      transformed.y += sin(uWindTime * 43.0 + position.x * 11.0) * sh * 0.025;
+      ${withGlow ? 'vGlow = aFx.y;' : ''}
+    }`;
+  // vGlow 0..1 = highlight (hover / soft flash); 1..2 = full highlight blending toward a warm white (hit flash)
+  const flashU = { uFlashCol: { value: new THREE.Vector3(1.0, 0.985, 0.94) } };
+  const glowFrag = shader => {
+    Object.assign(shader.uniforms, flashU);
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', '#include <common>\nvarying float vGlow;\nuniform vec3 uGlowMul;\nuniform vec3 uGlowAdd;\nuniform vec3 uFlashCol;')
+      .replace('#include <opaque_fragment>', [
+        'outgoingLight = mix(outgoingLight, outgoingLight * uGlowMul + uGlowAdd, min(vGlow, 1.0));',
+        // hit flash: brighten (keeps hue + shading) and, only near the peak, blend toward warm white
+        '{ float wf = clamp(vGlow - 1.0, 0.0, 1.0); float lum = dot(outgoingLight, vec3(0.3, 0.59, 0.11));',
+        '  vec3 wcol = uFlashCol * clamp(0.62 + lum * 1.2, 0.0, 1.0);',
+        '  outgoingLight = mix(outgoingLight * (1.0 + 0.6 * wf), wcol, wf * wf * 0.62); }',
+        '#include <opaque_fragment>'].join('\n'));
+  };
+  // highlight = a sunny brighten that keeps saturation (mostly multiply, a little warm lime added)
+  const leafGlow = { uGlowMul: { value: new THREE.Vector3(1.24, 1.3, 1.04) }, uGlowAdd: { value: new THREE.Vector3(0.03, 0.045, 0.0) } };
+  const rockGlow = { uGlowMul: { value: new THREE.Vector3(1.1, 1.08, 1.0) }, uGlowAdd: { value: new THREE.Vector3(0.075, 0.065, 0.03) } };
+  const injectLeaf = (withGlow, glowU) => shader => {
+    Object.assign(shader.uniforms, windU, glowU || {});
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', `#include <common>\n${windHeader}\nuniform float uWindAmp;\nuniform vec2 uWindDir;\nattribute vec3 aFx;${withGlow ? '\nvarying float vGlow;' : ''}`)
+      .replace('#include <begin_vertex>', swayGlsl(withGlow));
+    if (withGlow) glowFrag(shader);
+  };
+  // leaves: smooth (bent) normals from the geometry, so the crown reads as a few big soft planes
+  const leafMat = new THREE.MeshLambertMaterial({ vertexColors: true });
+  leafMat.onBeforeCompile = injectLeaf(true, leafGlow);
+  leafMat.customProgramCacheKey = () => `props-tree-v9-${worldWind ? 'w' : 'o'}`;
+  const leafDepth = new THREE.MeshDepthMaterial();
+  leafDepth.onBeforeCompile = injectLeaf(false);
+  leafDepth.customProgramCacheKey = () => `props-tree-v9-depth-${worldWind ? 'w' : 'o'}`;
+  // rocks + stumps: flat facets, highlight only
+  const propMat = new THREE.MeshLambertMaterial({ vertexColors: true, flatShading: true });
+  // + a warm bounce light proportional to the albedo, strongest on side faces: the green hemisphere ground
+  // light turns cream rock olive otherwise (the reference's rock sides are warm ochre)
+  const warmU = { uWarm: { value: new THREE.Vector3(0.21, 0.09, 0.0) } };
+  propMat.onBeforeCompile = shader => {
+    Object.assign(shader.uniforms, rockGlow, warmU);
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', '#include <common>\nattribute vec3 aFx;\nvarying float vGlow;')
+      .replace('#include <begin_vertex>', '#include <begin_vertex>\nvGlow = aFx.y;');
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', '#include <common>\nuniform vec3 uWarm;')
+      .replace('#include <opaque_fragment>', [
+        'float sideK = 1.0 - clamp(dot(normal, normalize((viewMatrix * vec4(0.0, 1.0, 0.0, 0.0)).xyz)), 0.0, 1.0);',
+        'outgoingLight += diffuseColor.rgb * uWarm * (0.35 + 0.65 * sideK);',
+        '#include <opaque_fragment>'].join('\n'));
+    glowFrag(shader);
+  };
+  propMat.customProgramCacheKey = () => 'props-solid-glow-v8';
+  const nuggetMat = new THREE.MeshLambertMaterial({ vertexColors: true, flatShading: true });
+
+  // ---------------- instanced batches ----------------
+  class Batch {
+    constructor(geo, mat, cap, { cast = true, receive = false, depth = null } = {}) {
+      this.geo = geo;
+      cap = Math.max(1, cap);
+      const m = this.mesh = new THREE.InstancedMesh(geo, mat, cap);
+      m.count = 0; m.frustumCulled = false; m.castShadow = cast; m.receiveShadow = receive;
+      m.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+      m.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(cap * 3).fill(1), 3);
+      m.instanceColor.setUsage(THREE.DynamicDrawUsage);
+      if (depth) m.customDepthMaterial = depth;
+      this.fx = new THREE.InstancedBufferAttribute(new Float32Array(cap * 3), 3);
+      this.fx.setUsage(THREE.DynamicDrawUsage);
+      geo.setAttribute('aFx', this.fx);
+      this.recs = [];
+      this.dirty = false;
+      scene.add(m);
+    }
+    add(rec, matrix) {
+      if (this.mesh.count >= this.mesh.instanceMatrix.count) return false;
+      rec.slot = this.mesh.count++;
+      rec.batch = this;
+      this.recs[rec.slot] = rec;
+      this.mesh.setMatrixAt(rec.slot, matrix);
+      this.mesh.setColorAt(rec.slot, rec.tint);
+      this.setFx(rec);
+      return true;
+    }
+    remove(rec) {
+      if (rec.batch !== this) return;
+      const last = this.mesh.count - 1, i = rec.slot;
+      if (i !== last) {
+        const moved = this.recs[last];
+        this.mesh.getMatrixAt(last, _m); this.mesh.setMatrixAt(i, _m);
+        this.recs[i] = moved; moved.slot = i;
+        this.mesh.setColorAt(i, moved.tint);
+        this.setFx(moved);
+      }
+      this.recs.length = last;
+      this.mesh.count = last;
+      rec.batch = null; rec.slot = -1;
+      this.dirty = true;
+    }
+    write(rec, matrix) { this.mesh.setMatrixAt(rec.slot, matrix); this.dirty = true; }
+    setFx(rec) { this.fx.setXYZ(rec.slot, rec.shiver, rec.glow, rec.sway); this.dirty = true; }
+    flush() {
+      if (!this.dirty) return;
+      this.mesh.visible = this.mesh.count > 0;
+      this.mesh.instanceMatrix.needsUpdate = true;
+      this.mesh.instanceColor.needsUpdate = true;
+      this.fx.needsUpdate = true;
+      this.dirty = false;
+    }
+  }
+
+  const resources = [...sim.entities.values()].filter(e => e.resource);
+  const nTrees = resources.filter(e => e.kind === 'tree').length;
+  const count = (kind, v) => resources.filter(e => e.kind === kind && (e.variant % (kind === 'tree' ? TREE_VARIANTS : ROCK_VARIANTS)) === v).length;
+  const treeGeos = Array.from({ length: TREE_VARIANTS }, (_, v) => buildTree(v));
+  const rockGeos = Array.from({ length: ROCK_VARIANTS }, (_, v) => buildRock(v));
+  const stumpGeo = buildStump();
+  const treeBatches = treeGeos.map((g, v) => new Batch(g, leafMat, count('tree', v) + 2, { depth: leafDepth }));
+  const rockBatches = rockGeos.map((g, v) => new Batch(g, propMat, count('rock', v) + 2, { receive: true }));
+  const stumpBatch = new Batch(stumpGeo, propMat, nTrees + resources.filter(e => e.kind === 'stump').length + 4, { receive: true });
+  const batchFor = e => (e.kind === 'tree' ? treeBatches[e.variant % TREE_VARIANTS] : e.kind === 'rock' ? rockBatches[e.variant % ROCK_VARIANTS] : stumpBatch);
+  const allBatches = [...treeBatches, ...rockBatches, stumpBatch];
+  const treeGeo = rec => treeGeos[rec.e.variant % TREE_VARIANTS].userData;
+
+  // ---------------- records ----------------
+  const recs = new Map();      // entity id -> rec (also keeps dying props until their animation ends)
+  const active = new Set();    // recs animating this frame
+  const falling = new Map();   // tile index -> falling tree rec (for flightDelay / flightOrigin)
+
+  function makeRec(e) {
+    const rng = mulberry32((e.x * 73856093) ^ (e.z * 19349663) ^ (e.kind.length * 83492791));
+    const tint = new THREE.Color(1, 1, 1);
+    if (e.kind === 'tree') { const k = 0.95 + rng() * 0.1; tint.setRGB(k * (0.97 + rng() * 0.06), k, k * (0.96 + rng() * 0.08)); }
+    else tint.setScalar(0.97 + rng() * 0.05);
+    // rocks only rotate in coarse steps so their lit faces stay on the sun side
+    const rot = e.kind === 'rock' ? Math.round(e.rot / (Math.PI / 3)) * (Math.PI / 3) * 0.35 : e.rot;
+    const rec = {
+      id: e.id, e, kind: e.kind, x: e.x, z: e.z, rot, scale: e.scale || 1,
+      tint, batch: null, slot: -1, handle: new THREE.Object3D(),
+      wob: new Wobble({ freq: e.kind === 'tree' ? 2.6 : 5, decay: e.kind === 'tree' ? 4.2 : 7 }),
+      sq: new Spring(1, { stiffness: 320, damping: 13 }),
+      size: new Spring(1, { stiffness: 260, damping: 12 }),
+      jolt: new Spring(0, { stiffness: 420, damping: 17 }),
+      pop: new Spring(1, { stiffness: 250, damping: 13 }),
+      hovScale: new Spring(1, { stiffness: 300, damping: 12 }),
+      hovTarget: 0, hovLin: 0, hovT: 0,
+      flash: 0, shiver: 0, glow: 0, sway: e.kind === 'tree' ? 1 : 0, dirX: 0, dirZ: 1,
+      fall: null, vanish: null, appearDelay: 0, dead: false,
+      white: 0, stop: 0,          // hit flash toward white (0..1), hit-stop seconds left
+      grow: null, sink: null,     // regrowth: sapling / rock rise in, replaced stump sinking out
+      byPlayer: false, brush: false, brushT: 0,
+    };
+    rec.handle.userData = { entityId: e.id, kind: e.kind };
+    rec.handle.matrixAutoUpdate = false;
+    return rec;
+  }
+
+  function compose(rec, o = {}) {
+    const tilt = o.tilt || 0, k = (o.sizeK ?? 1) * rec.scale;
+    const sy = o.sy ?? 1, sxz = o.sxz ?? 1;
+    _qy.setFromAxisAngle(UP, rec.rot);
+    _ax.set(rec.dirZ, 0, -rec.dirX); // rotating +tilt about this axis tips the top toward (dirX, dirZ)
+    _q.setFromAxisAngle(_ax, tilt).multiply(_qy);
+    _p.set(o.pivotX || 0, 0, o.pivotZ || 0);
+    _v.copy(_p).applyAxisAngle(_ax, tilt);
+    _s.set(k * sxz, k * sy, k * sxz);
+    _m.compose(_v.set(rec.x + _p.x - _v.x + (o.offX || 0), (o.offY || 0) + _p.y - _v.y, rec.z + _p.z - _v.z + (o.offZ || 0)), _q, _s);
+    if (o.shrink !== undefined && o.shrink !== 1) {
+      // scale about a world point (fallen log centre)
+      const [cx, cy, cz] = o.shrinkAt;
+      _m2.makeTranslation(-cx, -cy, -cz); _m.premultiply(_m2);
+      _m2.makeScale(o.shrink, o.shrink, o.shrink); _m.premultiply(_m2);
+      _m2.makeTranslation(cx, cy, cz); _m.premultiply(_m2);
+    }
+    return _m;
+  }
+  function writeRec(rec, o) {
+    const m = compose(rec, o);
+    if (rec.batch) rec.batch.write(rec, m);
+    rec.handle.matrix.copy(m);
+    rec.handle.matrixWorld.copy(m);
+    m.decompose(rec.handle.position, rec.handle.quaternion, rec.handle.scale);
+  }
+
+  function addResource(e, { appear = false, delay = 0, grow = false } = {}) {
+    const rec = makeRec(e);
+    recs.set(e.id, rec);
+    const b = batchFor(e);
+    if (grow && live) {
+      // regrowth: starts invisible, sprouts / rises in stepGrow
+      rec.grow = { t: -Math.max(0, delay), kind: e.kind, sprouted: false, landed: false, done: false };
+      if (e.kind === 'tree') rec.sway = 0.25;
+      b.add(rec, compose(rec, { sizeK: 0.0001 }));
+      active.add(rec);
+    } else if (appear && live) {
+      rec.pop.set(0); rec.appearDelay = Math.max(delay, 1e-6);
+      b.add(rec, compose(rec, { sizeK: 0.0001 }));
+      active.add(rec);
+    } else {
+      b.add(rec, compose(rec));
+      writeRec(rec);
+    }
+    if (hoverId === e.id) setHoverTarget(rec, 1);
+    return rec;
+  }
+  function removeRec(rec) {
+    rec.batch?.remove(rec);
+    active.delete(rec);
+    if (recs.get(rec.id) === rec) recs.delete(rec.id);
+    for (const [k, r] of falling) if (r === rec) falling.delete(k);
+  }
+
+  // ---------------- hover highlight ----------------
+  let hoverId = null, hoverExplicit = false;
+  function setHoverTarget(rec, on) {
+    if (!rec || rec.hovTarget === on) return;
+    rec.hovTarget = on;
+    if (on) { rec.hovT = 0; if (live) rec.hovScale.kick(0.4); }
+    active.add(rec);
+  }
+  function applyHover(id) {
+    id = id ?? null;
+    if (id === hoverId) return;
+    setHoverTarget(hoverId != null ? recs.get(hoverId) : null, 0);
+    hoverId = id;
+    const rec = id != null ? recs.get(id) : null;
+    if (rec && !rec.dead) setHoverTarget(rec, 1);
+  }
+
+  for (const e of resources) addResource(e);
+
+  // ---------------- deposits ----------------
+  const nuggetGeos = { 1: buildNugget('copper'), 2: buildNugget('stone') };
+  const depTiles = new Map(); // idx -> tile
+  const depCounts = { 1: 0, 2: 0 };
+  const depositList = [];
+  for (let z = 0; z < map.h; z++) for (let x = 0; x < map.w; x++) {
+    const d = map.depositAt(x, z);
+    if (!d) continue;
+    const rng = mulberry32(Math.floor(hash2(x, z, 991) * 1e9));
+    // one ore clump per tile (a big nugget with mediums packed around it) + a few loose bits
+    const pts = [];
+    const cx = (rng() - 0.5) * 0.24, cz = (rng() - 0.5) * 0.24;
+    const big = d === 1 ? 0.17 + rng() * 0.05 : 0.15 + rng() * 0.05;
+    const fits = (px, pz, s) => Math.abs(px) < 0.43 - s * 0.5 && Math.abs(pz) < 0.43 - s * 0.5 && !pts.some(p => Math.hypot(p.ox - px, p.oz - pz) < (p.s + s) * 0.78);
+    const push = (px, pz, s) => pts.push({ ox: px, oz: pz, s, rot: rng() * Math.PI * 2, tilt: (rng() - 0.5) * 0.5, bury: 0.22 + rng() * 0.2, slot: -1, phase: rng(), tint: 0.9 + rng() * 0.18 });
+    push(cx, cz, big);
+    const mids = 2 + Math.floor(rng() * 2);
+    for (let i = 0, tries = 0; i < mids && tries < 40; tries++) {
+      const s = 0.09 + rng() * 0.05, a = rng() * Math.PI * 2, r = (big + s) * (0.8 + rng() * 0.15);
+      const px = cx + Math.cos(a) * r, pz = cz + Math.sin(a) * r;
+      if (fits(px, pz, s)) { push(px, pz, s); i++; }
+    }
+    const loose = 1 + Math.floor(rng() * 2);
+    for (let i = 0, tries = 0; i < loose && tries < 40; tries++) {
+      const s = 0.05 + rng() * 0.03, px = (rng() - 0.5) * 0.78, pz = (rng() - 0.5) * 0.78;
+      if (fits(px, pz, s)) { push(px, pz, s); i++; }
+    }
+    depCounts[d] += pts.length;
+    depositList.push({ x, z, d, pts });
+  }
+  const nuggetBatches = {};
+  const _c = new THREE.Color();
+  for (const d of [1, 2]) {
+    const m = new THREE.InstancedMesh(nuggetGeos[d], nuggetMat, Math.max(1, depCounts[d]));
+    m.count = 0; m.frustumCulled = false; m.castShadow = false; m.receiveShadow = true;
+    m.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    m.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(Math.max(1, depCounts[d]) * 3).fill(1), 3);
+    scene.add(m);
+    nuggetBatches[d] = { mesh: m, dirty: false };
+  }
+  const _e = new THREE.Euler();
+  function writeTile(tile) {
+    const b = nuggetBatches[tile.d];
+    const tau = tile.t, vis = Math.max(0, tile.vis.value);
+    for (let i = 0; i < tile.pts.length; i++) {
+      const p = tile.pts[i];
+      let hop = 0, sy = 1;
+      if (tile.jiggling) {
+        const ti = tau - i * 0.035;
+        if (ti > 0) {
+          hop = ti < 0.26 ? arc(ti / 0.26) * (0.05 + p.phase * 0.04) : 0;
+          sy = 1 + 0.3 * Math.exp(-7 * ti) * Math.sin(ti * Math.PI * 2 * 4.2);
+        }
+      }
+      const s = p.s * vis;
+      _e.set(p.tilt, p.rot, 0);
+      _q.setFromEuler(_e);
+      const sxz = 1 / Math.sqrt(Math.max(0.3, sy));
+      _s.set(s * sxz, s * sy, s * sxz);
+      _p.set(tile.x + p.ox, -p.s * p.bury + hop, tile.z + p.oz);
+      _m.compose(_p, _q, s > 1e-4 ? _s : _s.setScalar(1e-4));
+      b.mesh.setMatrixAt(p.slot, _m);
+    }
+    b.dirty = true;
+  }
+  for (const t of depositList) {
+    const b = nuggetBatches[t.d];
+    for (const p of t.pts) { p.slot = b.mesh.count++; b.mesh.setColorAt(p.slot, _c.setRGB(p.tint * 1.02, p.tint, p.tint * 0.97)); }
+    const tile = { ...t, t: 0, jiggling: false, vis: new Spring(1, { stiffness: 240, damping: 15 }), active: false };
+    depTiles.set(map.idx(t.x, t.z), tile);
+    writeTile(tile);
+  }
+  const activeTiles = new Set();
+  const tileAt = (x, z) => (map.inBounds(x, z) ? depTiles.get(map.idx(x, z)) : null);
+  function setTileCovered(x, z, covered) {
+    const tile = tileAt(x, z);
+    if (!tile) return;
+    tile.vis.target = covered ? 0 : 1;
+    if (!live) { tile.vis.set(tile.vis.target); writeTile(tile); return; }
+    if (!covered) tile.vis.value = Math.max(tile.vis.value, 0.55);
+    activeTiles.add(tile);
+  }
+  for (const e of sim.entities.values()) if (!e.resource) setTileCovered(e.x, e.z, true);
+
+  // ---------------- helpers ----------------
+  const fx = () => views.fx;
+  const dirOf = fromDir => DIRS[((fromDir ?? 1) % 4 + 4) % 4] || DIRS[1];
+  const isGround = (x, z) => map.isGround(Math.round(x), Math.round(z));
+  function topY(rec) {
+    const g = rec.batch?.geo || batchFor(rec.e).geo;
+    return (g.userData.height || 0.5) * rec.scale;
+  }
+  function crownPos(rec, out = new THREE.Vector3()) {
+    return out.set(rec.x, treeGeo(rec).crownY * rec.scale, rec.z);
+  }
+  function hitPoint(id) {
+    const rec = recs.get(id);
+    if (rec && !rec.dead) {
+      const y = rec.kind === 'tree' ? 0.32 * rec.scale : rec.kind === 'rock' ? topY(rec) * 0.5 : 0.14;
+      return new THREE.Vector3(rec.x, y, rec.z);
+    }
+    const e = sim.entities.get(id);
+    return e ? new THREE.Vector3(e.x, 0.3, e.z) : null;
+  }
+  // Dust on ground, a splash on water.
+  function impactAt(x, z, { size = 0.15, count = 3, spread = 0.32, up = 0.35 } = {}) {
+    if (isGround(x, z)) fx()?.puff?.(new THREE.Vector3(x, 0.05, z), { count, size, spread, up });
+    else fx()?.splash?.(new THREE.Vector3(x, WATER_Y, z), { radius: 0.4 + spread * 0.5, count: count + 4, size: size * 0.75 });
+  }
+
+  // ---------------- felled tree: where does it stop? ----------------
+  // Obstacle silhouette in the fall plane for the entity on a tile: horizontal half width and [y0, y1].
+  function obstacleShape(e) {
+    if (!e) return null;
+    const rec = recs.get(e.id);
+    if (e.kind === 'tree') {
+      const g = treeGeos[e.variant % TREE_VARIANTS].userData, s = e.scale || 1;
+      return { r: g.crownR * s * 0.8, y0: g.crownBase * s, y1: g.height * s, rec, tree: true };
+    }
+    if (e.kind === 'rock') {
+      const g = rockGeos[e.variant % ROCK_VARIANTS].userData, s = e.scale || 1;
+      return { r: (g.radius || 0.4) * s * 0.75, y0: 0, y1: g.height * s, rec };
+    }
+    if (e.kind === 'stump') return { r: 0.24, y0: 0, y1: 0.22, rec };
+    const b = BUILD_SHAPE[e.kind] || [0.6, 0.4];
+    return { r: b[1], y0: 0, y1: b[0], building: e.id };
+  }
+  // First tilt angle at which the felled crown touches an obstacle `dist` tiles ahead, or null.
+  function contactTilt(rec, ob, dist) {
+    const g = treeGeo(rec), s = rec.scale, pv = 0.1 * s;
+    const u0 = dist - ob.r, u1 = dist + ob.r;
+    const prof = g.profile;
+    const radiusAt = d => {
+      if (d < g.crownBase * s) return 0.07 * s; // trunk
+      let r = prof[0][1];
+      for (let i = 0; i < prof.length; i++) if (d >= prof[i][0] * s) r = prof[i][1];
+      return r * s * 0.7; // foliage squishes a little before it stops anything
+    };
+    for (let th = 0; th <= FALL.land; th += 0.01) {
+      const sn = Math.sin(th), cs = Math.cos(th);
+      for (let d = 0.15; d <= g.height * s; d += 0.1) {
+        const u = pv - pv * cs + d * sn, y = pv * sn + d * cs;
+        const dx = Math.max(u0 - u, 0, u - u1), dy = Math.max(ob.y0 - y, 0, y - ob.y1);
+        if (dx * dx + dy * dy < radiusAt(d) ** 2) return th;
+      }
+    }
+    return null;
+  }
+  function planFall(rec) {
+    const dx = rec.dirX, dz = rec.dirZ;
+    let best = null;
+    for (const dist of [1, 2]) {
+      const e = sim.at?.(rec.x + dx * dist, rec.z + dz * dist);
+      if (!e || e.id === rec.id) continue;
+      const ob = obstacleShape(e);
+      if (!ob) continue;
+      const th = contactTilt(rec, ob, dist);
+      if (th !== null && th < LEAN_MAX && (!best || th < best.th)) best = { th, ob, e };
+    }
+    if (best) return { mode: 'lean', land: Math.max(LEAN_MIN, best.th), ob: best.ob, obId: best.e.id };
+    const water = !isGround(rec.x + dx, rec.z + dz);
+    return { mode: water ? 'water' : 'ground', land: water ? WATER_LAND : FALL.land };
+  }
+
+  // ---------------- reactions ----------------
+  // Who swung at what: camp:swing lands `hitIn` s later as resource:hit. Only the player's blows shake the camera.
+  let clock = 0;
+  const swingBy = new Map(); // entity id -> { by, t }
+  function onSwing({ by, target }) {
+    if (target?.type !== 'resource' || target.id == null) return;
+    swingBy.set(target.id, { by, t: clock });
+  }
+  function hitByPlayer(id) {
+    const s = swingBy.get(id);
+    swingBy.delete(id);
+    if (s) return s.by === 'player' && clock - s.t < 1.5;
+    return !ctx.camp; // the sandbox: every hit is the player's (Space / click)
+  }
+  // A regrowing prop that gets chopped / removed mid-growth keeps its current size (never pops to full).
+  function bakeGrow(rec) {
+    const g = rec.grow;
+    if (!g) return;
+    rec.scale *= Math.max(0.05, g.k ?? 0.05);
+    rec.grow = null;
+    rec.sway = rec.kind === 'tree' ? 1 : 0;
+  }
+
+  function onHit({ entity, fromDir, hp }) {
+    const rec = recs.get(entity.id);
+    if (!rec || rec.dead) return;
+    const [dx, dz] = dirOf(fromDir);
+    rec.dirX = dx; rec.dirZ = dz;
+    const byPlayer = hitByPlayer(entity.id);
+    if (!live) return;
+    const final = !(hp > 0);
+    rec.byPlayer = byPlayer;
+    // the struck pose: hit-stop holds it for a couple of frames (white), then the springs let go
+    rec.stop = final ? HIT.stopFinal : HIT.stop;
+    rec.white = HIT.white;
+    const F = final ? 1.7 : 1;
+    const f = fx();
+    const hit = hitPoint(entity.id);
+    const back = [-dx, -dz];
+    if (rec.kind === 'tree') {
+      rec.wob.hit(0.15); rec.wob.t = 0.035; // already knocked back on the impact frame
+      rec.sq.value = Math.min(rec.sq.value, 0.94);
+      rec.sq.kick(-1.7);
+      rec.shiver = 1;
+      rec.flash = 0.5;
+      const cr = treeGeo(rec).crownR * rec.scale;
+      f?.leaves?.(crownPos(rec).add(_v.set(-dx * cr * 0.85, 0.1, -dz * cr * 0.85 + 0.15)), { count: Math.round(6 * F), spread: 0.3 * (final ? 1.35 : 1) });
+      if (final) f?.leaves?.(crownPos(rec).add(_v.set(dx * cr * 0.5, cr * 0.4, dz * cr * 0.5)), { count: 6, spread: 0.45, delay: 0.04 });
+      const c = hit.clone().add(_v.set(-dx * 0.12, 0, -dz * 0.12));
+      f?.chips?.(c, '#8a5733', { count: Math.round(3 * F), size: 0.045, dir: back, speed: 1.4 * (final ? 1.25 : 1) });
+      f?.chips?.(c, P.stumpTop || '#f1d39a', { count: final ? 3 : 2, size: 0.032, dir: back, speed: 1.7, up: 2.8, life: 0.6 });
+      f?.impact?.(c.add(_v.set(-dx * 0.06, 0.02, -dz * 0.06)), { size: final ? 1.25 : 0.85, dir: back, small: final ? 3 : 2 });
+    } else if (rec.kind === 'rock') {
+      rec.wob.hit(0.06); rec.wob.t = 0.012;
+      rec.jolt.value = Math.max(rec.jolt.value, 0.03);
+      rec.jolt.kick(1.7);
+      rec.sq.value = Math.min(rec.sq.value, 0.93);
+      rec.sq.kick(-2.1);
+      rec.flash = 0.6;
+      const lost = (entity.maxHp || 4) - Math.max(0, hp);
+      rec.size.target = 1 - 0.075 * lost;
+      const c = hit.clone().add(_v.set(-dx * 0.25, 0.05, -dz * 0.25));
+      f?.chips?.(c, '#f6dfae', { count: Math.round(5 * F), size: 0.055, dir: back, speed: 1.6, life: 0.75 });
+      f?.puff?.(hit, { count: final ? 3 : 2, size: 0.13, spread: 0.12, up: 0.4 });
+      f?.impact?.(c.add(_v.set(-dx * 0.05, 0.04, -dz * 0.05)), { size: final ? 1.2 : 0.85, dir: back, color: '#fffbea' });
+    } else {
+      rec.sq.value = Math.min(rec.sq.value, 0.92);
+      rec.sq.kick(-1.6);
+      rec.jolt.kick(0.8);
+      rec.flash = 0.55;
+      const c = new THREE.Vector3(rec.x - dx * 0.16, 0.14, rec.z - dz * 0.16);
+      f?.chips?.(c, P.trunk, { count: Math.round(3 * F), size: 0.04, dir: back, speed: 1.3, up: 2.4, life: 0.7 });
+      f?.impact?.(c, { size: 0.8, dir: back, small: 1 });
+    }
+    if (final && byPlayer) views.camera?.shake?.(HIT.shake * (rec.kind === 'rock' ? 1.3 : rec.kind === 'tree' ? 1 : 0.8));
+    active.add(rec);
+  }
+
+  // Regrowth (camp): a tree grows back on its stump's tile, a rock respawns where it broke.
+  const regrowTiles = new Set(); // tiles whose stump just started sinking for a new tree (the sapling waits a beat)
+  function onSpawned({ entity, grow }) {
+    if (!entity?.resource || recs.has(entity.id)) return;
+    const after = regrowTiles.delete(map.idx(entity.x, entity.z));
+    if (grow !== false) addResource(entity, { grow: true, delay: after ? GROW.delay : 0 });
+    else addResource(entity, { appear: true, delay: 0 });
+  }
+  function onRemoved({ entity, regrow }) {
+    const rec = entity ? recs.get(entity.id) : null;
+    if (!rec || rec.dead) return;
+    bakeGrow(rec);
+    rec.dead = true;
+    rec.hovTarget = 0;
+    recs.delete(entity.id);
+    if (hoverId === entity.id) hoverId = null;
+    if (!live) { removeRec(rec); return; }
+    if (regrow) { rec.sink = { t: 0, chipped: false }; regrowTiles.add(map.idx(rec.x, rec.z)); }
+    else rec.vanish = { t: 0, kind: rec.kind, burst: false };
+    active.add(rec);
+  }
+
+  function onDepleted({ entity, fromDir, replacedBy }) {
+    const rec = recs.get(entity.id);
+    const [dx, dz] = dirOf(fromDir);
+    if (!rec) { if (replacedBy) addResource(replacedBy); return; }
+    bakeGrow(rec);
+    rec.dirX = dx; rec.dirZ = dz;
+    rec.tilt0 = rec.wob.value; // the fall blends out of the current wobble instead of snapping upright
+    rec.dead = true;
+    rec.hovTarget = 0;
+    recs.delete(entity.id); // the id is gone from the sim; the rec lives on in `active` until it finishes
+    if (hoverId === entity.id) hoverId = null;
+    if (!live) {
+      removeRec(rec);
+      if (replacedBy) addResource(replacedBy);
+      return;
+    }
+    if (rec.kind === 'tree') {
+      const plan = planFall(rec);
+      const fallDur = plan.mode === 'lean' ? Math.max(0.2, FALL.fall * Math.sqrt(plan.land / FALL.land)) : FALL.fall * (plan.mode === 'water' ? 1.06 : 1);
+      const tLand = FALL.antic + fallDur;
+      const tVanish = tLand + (plan.mode === 'lean' ? FALL.popLean : plan.mode === 'water' ? FALL.popWater : FALL.pop);
+      rec.fall = { t: 0, ...plan, fallDur, tLand, tVanish, tEnd: tVanish + FALL.grow + FALL.shrink, landed: false, bounced: false, vanished: false, tilt: 0 };
+      falling.set(map.idx(rec.x, rec.z), rec);
+      rec.shiver = 0.6;
+      if (replacedBy) addResource(replacedBy, { appear: true, delay: FALL.antic + 0.1 });
+    } else {
+      rec.vanish = { t: 0, kind: rec.kind, burst: false };
+      if (replacedBy) addResource(replacedBy, { appear: true, delay: 0.15 });
+    }
+    active.add(rec);
+  }
+
+  function onDepositMined({ x, z, item }) {
+    const tile = tileAt(x, z);
+    if (!live) return;
+    const pos = new THREE.Vector3(x, 0.08, z);
+    const col = tile?.d === 2 || item === 'stone' ? P.stoneBlock : P.copper;
+    fx()?.chips?.(pos, col, { count: 5, size: 0.05, speed: 1.6, up: 2.6 });
+    fx()?.puff?.(pos, { count: 2, size: 0.12, spread: 0.2, up: 0.3 });
+    if (!tile) return;
+    tile.t = 0; tile.jiggling = true;
+    activeTiles.add(tile);
+  }
+
+  const safe = fn => p => { try { fn(p || {}); } catch (err) { console.error('[props]', err); } };
+  const offs = [
+    events.on('resource:hit', onHit),
+    events.on('resource:depleted', onDepleted),
+    events.on('resource:spawned', safe(onSpawned)),
+    events.on('resource:removed', safe(onRemoved)),
+    events.on('camp:swing', safe(onSwing)),
+    events.on('deposit:mined', onDepositMined),
+    events.on('build:placed', ({ entity }) => setTileCovered(entity.x, entity.z, true)),
+    events.on('build:removed', ({ entity }) => setTileCovered(entity.x, entity.z, false)),
+  ];
+
+  // ---------------- per-frame animation ----------------
+  const fallLen = rec => (treeGeo(rec).crownY + 0.1) * rec.scale;
+  // world point `d` along a felled tree's axis at tilt `th`
+  function alongAxis(rec, d, th, out = new THREE.Vector3()) {
+    const pv = 0.1 * rec.scale;
+    const u = pv - pv * Math.cos(th) + d * Math.sin(th), y = pv * Math.sin(th) + d * Math.cos(th);
+    return out.set(rec.x + rec.dirX * u, y, rec.z + rec.dirZ * u);
+  }
+
+  function stepFall(rec, dt) {
+    const f = rec.fall;
+    if (rec.stop > 0) { rec.stop -= dt; dt = 0; } // final-blow hit-stop: hold the struck pose
+    f.t += dt;
+    const t = f.t, s = rec.scale;
+    const pivot = 0.1 * s;
+    const L = f.land, tLand = f.tLand;
+    let tilt;
+    // knocked pose of the last blow, blending into the anticipation lean
+    if (t < FALL.antic) tilt = lerp(rec.tilt0 || 0, -FALL.lean, ease.sineOut(t / FALL.antic));
+    else if (t < tLand) { const k = (t - FALL.antic) / f.fallDur; tilt = lerp(-FALL.lean, L, 0.2 * k + 0.8 * k * k); }
+    else if (f.mode === 'lean') {
+      // knocked back a little by the neighbour, then settles against it in smaller and smaller bounces
+      const tau = t - tLand;
+      tilt = L - 0.085 * Math.exp(-4.6 * tau) * Math.abs(Math.sin(Math.PI * 2.9 * tau));
+    } else if (f.mode === 'water') {
+      // a soft bounce on the surface, then a slow float bob
+      const tau = t - tLand;
+      tilt = L - 0.1 * Math.exp(-5 * tau) * Math.abs(Math.sin(Math.PI * 2.4 * tau)) + 0.022 * Math.sin(tau * Math.PI * 2 * 0.9) * Math.exp(-1.2 * tau);
+    } else if (t < tLand + FALL.b1) tilt = L - FALL.bounce1 * arc((t - tLand) / FALL.b1);
+    else if (t < tLand + FALL.b1 + FALL.b2) tilt = L - FALL.bounce2 * arc((t - tLand - FALL.b1) / FALL.b2);
+    else tilt = L;
+    f.tilt = tilt;
+    const dx = rec.dirX, dz = rec.dirZ;
+    const len = fallLen(rec);
+    if (!f.landed && t >= tLand) {
+      f.landed = true;
+      rec.sq.kick(-1.2);
+      rec.shiver = 1;
+      if (f.mode === 'lean') {
+        // caught by the neighbour: it takes the hit (wobble / shiver / boop), leaves shake loose
+        rec.sq.kick(0.5);
+        const o = f.ob?.rec;
+        if (o && !o.dead) {
+          o.dirX = dx; o.dirZ = dz;
+          o.wob.hit(o.kind === 'tree' ? 0.07 : 0.025);
+          if (o.kind === 'tree') o.shiver = Math.max(o.shiver, 0.9);
+          o.sq.kick(-0.8);
+          active.add(o);
+        }
+        if (f.ob?.building != null) views.buildings?.poke?.(f.ob.building, 0.8);
+        const c = alongAxis(rec, len * 1.15, L);
+        fx()?.leaves?.(c, { count: 9, spread: 0.45 });
+        fx()?.puff?.(alongAxis(rec, len * 0.9, L), { count: 3, size: 0.13, spread: 0.25, up: 0.25 });
+        if (rec.byPlayer) views.camera?.shake?.(0.04);
+      } else if (f.mode === 'water') {
+        for (const k of [0.75, 1.15, 1.5]) impactAt(rec.x + dx * len * k, rec.z + dz * len * k, { count: 3, size: 0.15, spread: 0.3 });
+        fx()?.splash?.(new THREE.Vector3(rec.x + dx * len * 1.05, WATER_Y, rec.z + dz * len * 1.05), { radius: 0.85, count: 14, size: 0.12, drops: 8 });
+        fx()?.leaves?.(new THREE.Vector3(rec.x + dx * len * 1.05, 0.25, rec.z + dz * len * 1.05), { count: 8, spread: 0.55 });
+        if (rec.byPlayer) views.camera?.shake?.(0.05);
+      } else {
+        // dust bursts out from under the whole crown, a soft ring where it hits hardest, leaves fly
+        for (const k of [0.5, 0.85, 1.2, 1.55]) impactAt(rec.x + dx * len * k, rec.z + dz * len * k);
+        const mid = new THREE.Vector3(rec.x + dx * len * 1.05, 0.04, rec.z + dz * len * 1.05);
+        if (isGround(mid.x, mid.z)) fx()?.ring?.(mid, { radius: 0.62, count: 11, size: 0.1 });
+        fx()?.leaves?.(mid.clone().setY(0.4), { count: 10, spread: 0.55 });
+        if (rec.byPlayer) views.camera?.shake?.(0.06);
+      }
+    }
+    if (!f.bounced && f.mode === 'ground' && t >= tLand + FALL.b1) {
+      f.bounced = true;
+      impactAt(rec.x + dx * len * 1.1, rec.z + dz * len * 1.1, { count: 3, size: 0.14, spread: 0.3, up: 0.3 });
+    }
+    // where the log shrinks away: the middle of the crown in its resting pose
+    const sc = alongAxis(rec, len * 0.95, L, _p);
+    const shrinkAt = [sc.x, Math.max(sc.y, f.mode === 'water' ? WATER_Y + 0.1 : 0.2), sc.z];
+    let shrink = 1;
+    if (t >= f.tVanish) {
+      const tv = t - f.tVanish;
+      shrink = tv < FALL.grow ? 1 + 0.07 * ease.quadOut(tv / FALL.grow) : 1.07 * (1 - ease.cubicIn(clamp((tv - FALL.grow) / FALL.shrink)));
+      if (!f.vanished && tv >= FALL.grow + FALL.shrink * 0.55) {
+        f.vanished = true;
+        const c = new THREE.Vector3(shrinkAt[0], shrinkAt[1], shrinkAt[2]);
+        if (f.mode === 'water') fx()?.splash?.(c.clone().setY(WATER_Y), { radius: 0.55, count: 10, size: 0.1, drops: 4 });
+        else fx()?.puff?.(c, { count: 4, size: 0.14, spread: 0.36, up: 0.45 });
+        fx()?.leaves?.(c.clone().setY(Math.max(0.3, c.y)), { count: 5, spread: 0.4 });
+      }
+    }
+    rec.sq.update(dt);
+    const sy = rec.sq.value;
+    writeRec(rec, {
+      tilt, pivotX: dx * pivot, pivotZ: dz * pivot, sy, sxz: 1 / Math.sqrt(Math.max(0.4, sy)),
+      shrink, shrinkAt,
+    });
+    return t < f.tEnd;
+  }
+
+  function stepVanish(rec, dt) {
+    const v = rec.vanish;
+    if (rec.stop > 0) { rec.stop -= dt; dt = 0; } // final-blow hit-stop
+    v.t += dt;
+    const isRock = rec.kind === 'rock';
+    const grow = isRock ? 0.06 : 0.09, shrink = isRock ? 0.13 : 0.16, peak = isRock ? 1.08 : 1.16;
+    let k;
+    if (v.t < grow) k = 1 + (peak - 1) * ease.quadOut(v.t / grow);
+    else k = peak * (1 - ease.cubicIn(clamp((v.t - grow) / shrink)));
+    if (!v.burst && v.t >= grow) {
+      v.burst = true;
+      const h = topY(rec);
+      if (isRock) {
+        const c = new THREE.Vector3(rec.x, h * 0.35, rec.z);
+        // chunks hop outward from the rock's volume and shrink away; a soft puff where it stood
+        fx()?.chips?.(c, '#f8e6bd', { count: 4, size: 0.12, speed: 1.15, up: 2.5, spread: 0.2, life: 0.7 });
+        fx()?.chips?.(c, '#eccf98', { count: 4, size: 0.055, speed: 1.6, up: 2.9, spread: 0.12, life: 0.65 });
+        fx()?.puff?.(c.setY(0.1), { count: 4, size: 0.17, spread: 0.26, up: 0.45 });
+        fx()?.ring?.(new THREE.Vector3(rec.x, 0.04, rec.z), { radius: 0.55, count: 8, size: 0.08 });
+      } else {
+        const c = new THREE.Vector3(rec.x, 0.15, rec.z);
+        fx()?.chips?.(c, P.trunk, { count: 6, size: 0.06, speed: 1.8, up: 2.6 });
+        fx()?.chips?.(c, P.stumpTop, { count: 3, size: 0.05, speed: 1.6, up: 2.8 });
+        fx()?.puff?.(c.setY(0.08), { count: 4, size: 0.16, spread: 0.2, up: 0.4 });
+      }
+    }
+    rec.sq.update(dt);
+    const sy = rec.sq.value;
+    writeRec(rec, { sizeK: Math.max(1e-4, k * rec.size.value * rec.hovScale.value), sy, sxz: 1 / Math.sqrt(Math.max(0.4, sy)) });
+    return v.t < grow + shrink;
+  }
+
+  // Highlight glow (hit flash + hover pulse) and leaf shiver -> the instance's aFx.
+  // glow 0..1 = brighten (hover / soft flash); above 1 the instance blends toward white (the hit flash).
+  function stepFx(rec, dt, frozen = false) {
+    if (rec.flash > 0) rec.flash = Math.max(0, rec.flash - dt * 2.6);
+    if (rec.white > 0 && !frozen) rec.white = Math.max(0, rec.white - dt * HIT.whiteDecay);
+    rec.shiver = rec.shiver > 0.002 ? rec.shiver * Math.exp(-4.5 * dt) : 0;
+    const target = rec.dead ? 0 : rec.hovTarget;
+    // linear ramp eased with smoothstep: eases both in and out
+    rec.hovLin = target > rec.hovLin ? Math.min(target, rec.hovLin + dt / HOVER.in) : Math.max(target, rec.hovLin - dt / HOVER.out);
+    rec.hovT += dt;
+    const h = smooth(rec.hovLin);
+    const pulse = 0.78 + 0.22 * Math.cos(rec.hovT * Math.PI * 2 * HOVER.pulseHz); // starts bright, breathes
+    rec.glow = Math.min(1, rec.flash + h * pulse * (rec.kind === 'tree' ? 0.85 : 0.75) + rec.white * 3) + rec.white;
+    rec.hovScale.target = 1 + HOVER.scale * target;
+    rec.hovScale.update(dt);
+    if (rec.fall) rec.sway = Math.max(0, rec.sway - dt * 6); // a felled tree stops swaying in the wind
+    if (frozen) { const s = rec.shiver; rec.shiver = 0; rec.batch?.setFx(rec); rec.shiver = s; } // hit-stop: leaves hold still too
+    else rec.batch?.setFx(rec);
+  }
+
+  // ---------------- regrowth ----------------
+  function sproutFx(rec) {
+    const f = fx();
+    const c = new THREE.Vector3(rec.x, 0.04, rec.z);
+    // a soft ring of dust rolls out from under the sprout, a few leaves hop out of it
+    f?.ring?.(c.clone().setY(0.03), { radius: 0.42, count: 7, size: 0.065, color: '#f1e6c8' });
+    f?.leaves?.(c.clone().setY(0.22), { count: 6, spread: 0.12 });
+    f?.sparkle?.(c.clone().setY(0.3), { count: 2, spread: 0.16, size: 0.06, color: '#eaffc8' });
+  }
+  function riseFx(rec) {
+    const f = fx();
+    const c = new THREE.Vector3(rec.x, 0.05, rec.z);
+    f?.puff?.(c, { count: 5, size: 0.15, spread: 0.3, up: 0.35, color: '#f3ead2' });
+    f?.ring?.(c.clone().setY(0.03), { radius: 0.5, count: 9, size: 0.08, color: '#f3ead2' });
+    f?.chips?.(c.clone().setY(0.08), '#d9c08a', { count: 3, size: 0.035, speed: 1.0, up: 2.2, life: 0.55 });
+  }
+  // Pose of a regrowing prop this frame: g.k (size), g.sy (stretch), g.offY. Trees: sprout -> sapling holds a
+  // beat -> grows to full with a springy overshoot, the crown filling out. Rocks: rise out of the ground.
+  function growPose(rec, dt) {
+    const g = rec.grow;
+    g.t += dt;
+    const t = g.t;
+    g.offY = 0;
+    if (t < 0) { g.k = 0; g.sy = 1; return; } // waiting for the stump to start sinking
+    if (rec.kind === 'tree') {
+      if (!g.sprouted) { g.sprouted = true; sproutFx(rec); }
+      if (t < GROW.sprout) {
+        const u = t / GROW.sprout;
+        g.k = lerp(0.04, GROW.sap, ease.backOut(u, 2.4));
+        g.sy = lerp(1.7, GROW.sapStretch, ease.quadOut(u));
+      } else if (t < GROW.sprout + GROW.hold) {
+        g.k = GROW.sap; g.sy = GROW.sapStretch;
+        if (!g.wiggled) { g.wiggled = true; rec.wob.hit(0.07); rec.shiver = Math.max(rec.shiver, 0.5); }
+      } else {
+        const u = clamp((t - GROW.sprout - GROW.hold) / GROW.grow);
+        g.k = lerp(GROW.sap, 1, ease.backOut(u, 1.7));
+        g.sy = lerp(GROW.sapStretch, 1, ease.cubicOut(u));
+        rec.sway = Math.max(rec.sway, lerp(0.25, 1, u));
+        if (u >= 1) {
+          g.done = true;
+          rec.sq.kick(-1.3); rec.shiver = Math.max(rec.shiver, 0.7);
+          fx()?.leaves?.(crownPos(rec).add(_v.set(0, 0.1, 0.1)), { count: 3, spread: 0.35 });
+        }
+      }
+      return;
+    }
+    // rocks (and anything else): a dust puff, then it pushes up out of it
+    if (!g.sprouted) { g.sprouted = true; riseFx(rec); }
+    const u = clamp((t - RISE.lead) / RISE.dur);
+    g.offY = -topY(rec) * RISE.from * (1 - ease.backOut(u, 1.9));
+    g.k = lerp(RISE.scale0, 1, ease.cubicOut(u));
+    g.sy = 1 + 0.16 * (1 - ease.quadOut(u));
+    if (!g.landed && u >= 0.6) {
+      g.landed = true;
+      rec.sq.kick(-1.6); rec.wob.hit(0.035);
+    }
+    if (u >= 1) g.done = true;
+  }
+  // The stump a regrowing tree replaces: a tiny anticipation swell, then it sinks and shrinks away.
+  function stepSink(rec, dt) {
+    const s = rec.sink;
+    s.t += dt;
+    const k = s.t < SINK.grow ? 1 + 0.06 * ease.quadOut(s.t / SINK.grow) : 1.06 * (1 - ease.cubicIn(clamp((s.t - SINK.grow) / SINK.shrink)));
+    if (!s.chipped && s.t >= SINK.grow) {
+      s.chipped = true;
+      fx()?.chips?.(new THREE.Vector3(rec.x, 0.12, rec.z), P.trunk, { count: 3, size: 0.035, speed: 0.9, up: 1.8, life: 0.5 });
+    }
+    rec.sq.update(dt);
+    const sy = rec.sq.value;
+    writeRec(rec, { sizeK: Math.max(1e-4, k), offY: -SINK.depth * ease.quadIn(clamp(s.t / (SINK.grow + SINK.shrink))), sy, sxz: 1 / Math.sqrt(Math.max(0.4, sy)) });
+    return s.t < SINK.grow + SINK.shrink;
+  }
+
+  function stepRec(rec, dt) {
+    // hit-stop: the struck pose holds (springs, wobble and growth paused) for a couple of frames
+    const frozen = rec.stop > 0 && !rec.fall && !rec.vanish;
+    if (frozen) rec.stop -= dt;
+    stepFx(rec, dt, frozen || (rec.stop > 0));
+    if (rec.fall) return stepFall(rec, dt);
+    if (rec.vanish) return stepVanish(rec, dt);
+    if (rec.sink) return stepSink(rec, dt);
+
+    if (rec.appearDelay > 0) {
+      rec.appearDelay -= dt;
+      if (rec.appearDelay <= 0) { rec.pop.value = 0.62; rec.pop.target = 1; rec.pop.velocity = 2; }
+      else { writeRec(rec, { sizeK: 1e-4 }); return true; }
+    }
+    const adt = frozen ? 0 : dt;
+    let gk = 1, gsy = 1, gy = 0;
+    if (rec.grow) {
+      growPose(rec, adt);
+      gk = rec.grow.k; gsy = rec.grow.sy; gy = rec.grow.offY;
+      if (rec.grow.done) rec.grow = null;
+    }
+    rec.wob.update(adt);
+    rec.sq.update(adt); rec.size.update(adt); rec.jolt.update(adt); rec.pop.update(adt);
+    const sy = rec.sq.value * gsy;
+    const j = rec.jolt.value;
+    writeRec(rec, {
+      tilt: rec.wob.value, sy, sxz: 1 / Math.sqrt(Math.max(0.4, sy)), offY: gy,
+      sizeK: Math.max(1e-4, gk * rec.size.value * rec.pop.value * rec.hovScale.value), offX: rec.dirX * j, offZ: rec.dirZ * j,
+    });
+    const wobLeft = rec.wob.amp * Math.exp(-rec.wob.decay * rec.wob.t);
+    return wobLeft > 0.0015 || !rec.sq.settled || !rec.size.settled || !rec.jolt.settled || !rec.pop.settled
+      || !rec.hovScale.settled || rec.flash > 0 || rec.white > 0 || rec.stop > 0 || rec.shiver > 0 || rec.hovLin > 0 || rec.hovTarget > 0
+      || !!rec.grow;
+  }
+
+  // "Not now": the player brushing a rock while stone has no use yet gets a tiny wobble (never a hit), once per
+  // contact. Camp only; checks the 3x3 tiles around the player.
+  const _pp = new THREE.Vector3();
+  function updateBrush() {
+    const camp = ctx.camp;
+    if (!camp?.useful || !sim.at) return;
+    let p = null;
+    try { p = views.player?.getPosition?.(_pp) || null; } catch { p = null; }
+    if (!p || !Number.isFinite(p.x)) return;
+    let useful = null;
+    const tx = Math.round(p.x), tz = Math.round(p.z);
+    for (let dz = -1; dz <= 1; dz++) for (let dx = -1; dx <= 1; dx++) {
+      const e = sim.at(tx + dx, tz + dz);
+      if (!e || e.kind !== 'rock') continue;
+      const rec = recs.get(e.id);
+      if (!rec || rec.dead || rec.grow) continue;
+      const ex = e.x - p.x, ez = e.z - p.z, d = Math.hypot(ex, ez);
+      if (rec.brush) { if (d > BRUSH.release) rec.brush = false; continue; }
+      if (d > BRUSH.dist || d < 1e-3) continue;
+      rec.brush = true;
+      if (useful === null) useful = !!camp.useful('stone');
+      if (useful || clock - rec.brushT < BRUSH.cooldown) continue;
+      rec.brushT = clock;
+      rec.dirX = ex / d; rec.dirZ = ez / d;
+      rec.wob.hit(BRUSH.wobble);
+      rec.sq.kick(-0.45);
+      active.add(rec);
+    }
+  }
+
+  function stepTile(tile, dt) {
+    tile.t += dt;
+    tile.vis.update(dt);
+    if (tile.jiggling && tile.t > 0.9) tile.jiggling = false;
+    writeTile(tile);
+    return tile.jiggling || !tile.vis.settled;
+  }
+
+  // wind clock: follow the grass (terrain's dt-advanced wind time) when exposed, else our own dt clock
+  let windT = 0;
+  function windClock(dt) {
+    windT += dt;
+    const w = views.terrain?.wind;
+    let tt = w?.uniforms?.uWindTime?.value;
+    if (!Number.isFinite(tt)) tt = w?.time;
+    windU.uWindTime.value = Number.isFinite(tt) ? tt : windT;
+  }
+
+  // ---------------- public ----------------
+  return {
+    meshFor: id => recs.get(id)?.handle || null,
+    hitPoint,
+    // Seconds fx should wait before flying drops from tile (x, z): lets a falling tree land first.
+    flightDelay(x, z) {
+      const rec = map.inBounds(x, z) ? falling.get(map.idx(x, z)) : null;
+      if (rec?.fall) return Math.max(0, rec.fall.tVanish + 0.03 - rec.fall.t);
+      return 0.05;
+    },
+    // Where the n-th of `count` drops from tile (x, z) starts its flight (along a fallen log, or the tile).
+    flightOrigin(x, z, i = 0, count = 1) {
+      const rec = map.inBounds(x, z) ? falling.get(map.idx(x, z)) : null;
+      if (rec?.fall) {
+        const len = fallLen(rec);
+        const k = count > 1 ? i / (count - 1) : 0.5;
+        const o = alongAxis(rec, lerp(0.25, 1.45, k) * len, rec.fall.land);
+        o.y = Math.max(o.y, rec.fall.mode === 'water' ? WATER_Y + 0.15 : 0.25);
+        return o;
+      }
+      return null;
+    },
+    // Small hover nudge (squash + shiver), e.g. when a prop becomes the interaction target.
+    poke(id, amount = 1) {
+      const rec = recs.get(id);
+      if (!rec || rec.dead || !live) return;
+      rec.sq.kick(-0.6 * amount);
+      if (rec.kind === 'tree') rec.shiver = Math.max(rec.shiver, 0.35 * amount);
+      active.add(rec);
+    },
+    // Soft highlight on the hovered resource (brighten + pulse + a tiny springy grow). null clears it.
+    setHover(id) { hoverExplicit = true; applyHover(id); },
+    get hoverId() { return hoverId; },
+    // test/debug snapshot of felled trees in progress (tilt in radians from upright)
+    get falling() { return [...falling.values()].map(r => ({ x: r.x, z: r.z, mode: r.fall?.mode, land: r.fall?.land, tilt: r.fall?.tilt, t: r.fall?.t })); },
+    // test/debug: the live animation record of a prop
+    _rec: id => recs.get(id) || null,
+    // test/debug: props regrowing / sinking right now
+    get regrowing() { return [...active].filter(r => r.grow || r.sink).map(r => ({ id: r.id, kind: r.kind, x: r.x, z: r.z, grow: r.grow ? +r.grow.t.toFixed(3) : null, k: r.grow?.k, sink: r.sink ? +r.sink.t.toFixed(3) : null })); },
+    update(dt, t) {
+      live = true;
+      clock += dt;
+      windClock(dt);
+      updateBrush();
+      // until interact drives setHover itself, follow the shared hover state
+      if (!hoverExplicit) applyHover(ctx.ui?.hover?.entityId ?? null);
+      for (const rec of active) {
+        let keep = false;
+        try { keep = stepRec(rec, dt); } catch (err) { active.delete(rec); throw err; }
+        if (!keep) {
+          active.delete(rec);
+          if (rec.dead) removeRec(rec);
+          else { rec.shiver = 0; rec.glow = 0; rec.batch?.setFx(rec); }
+        }
+      }
+      for (const tile of activeTiles) if (!stepTile(tile, dt)) activeTiles.delete(tile);
+      for (const b of allBatches) b.flush();
+      for (const d of [1, 2]) { const b = nuggetBatches[d]; if (b.dirty) { b.mesh.instanceMatrix.needsUpdate = true; b.dirty = false; } }
+    },
+    dispose() { offs.forEach(off => off()); },
+  };
+}

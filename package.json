@@ -1,0 +1,8 @@
+{
+  "name": "isle-factory",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "playwright-core": "^1.60.0"
+  }
+}

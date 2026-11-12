@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="theme-color" content="#cfeee2">
+  <title>Isle Factory</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="./src/ui/ui.css">
+  <style>
+    :root { --safe-top: env(safe-area-inset-top, 0px); --safe-bottom: env(safe-area-inset-bottom, 0px); }
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #cfeee2; }
+    body.mobile, body.mobile #app canvas { touch-action: none; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent; }
+    #app { position: fixed; inset: 0; }
+    #app canvas { display: block; width: 100%; height: 100%; outline: none; }
+    #ui { position: fixed; inset: 0; pointer-events: none; }
+    #ui > * { pointer-events: auto; }
+    #errors { position: fixed; left: 8px; bottom: 8px; max-width: 60vw; font: 12px/1.4 ui-monospace, monospace; color: #fff;
+      background: rgba(150, 30, 30, .85); padding: 6px 10px; border-radius: 6px; white-space: pre-wrap; display: none; z-index: 99; pointer-events: auto; }
+  </style>
+  <script type="importmap">
+    { "imports": { "three": "./vendor/three/build/three.module.js", "three/addons/": "./vendor/three/examples/jsm/" } }
+  </script>
+</head>
+<body>
+  <div id="app"></div>
+  <div id="ui"></div>
+  <div id="errors"></div>
+  <script type="module" src="./src/main.js"></script>
+</body>
+</html>
