@@ -13,6 +13,10 @@
 // Touches that start on UI or on the touch controls never reach the canvas, so they are ignored here.
 //
 // The UI owns Escape, 1-4, C and Tab; this module never handles those.
+//
+// Camp mode (ctx.camp): the robot gathers on its own, so there is no build ghost, no tile highlight, no hover
+// targets and no click-to-chop. A left click on the ground walks there (holding the button and moving the mouse
+// keeps re-aiming); a click on a tree / rock walks up next to it. Wheel / pinch zoom still work.
 import * as THREE from 'three';
 import { findPath } from './player/path.js';
 
@@ -52,6 +56,7 @@ export function create(ctx) {
   const { DIRS, PLAYER, ITEMS, BUILDINGS, dirAngle } = config;
   const { Spring, damp, clamp, angleDelta, ease } = anim;
   const REACH = PLAYER.reach ?? 1.5, USE_REACH = PLAYER.useReach ?? 4, BUILD_REACH = PLAYER.buildReach ?? 10;
+  const campMode = !!ctx.camp;
 
   canvas.style.touchAction = 'none';
 
@@ -112,7 +117,7 @@ export function create(ctx) {
 
   const playerPos = () => views.player?.getPosition?.(pp) || pp.set(sim.player.x, 0, sim.player.z);
   const playerDist = (x, z) => { const p = playerPos(); return Math.hypot(x - p.x, z - p.z); };
-  const selectedKind = () => (ui.selected ? ITEMS[ui.selected]?.building || null : null);
+  const selectedKind = () => (!campMode && ui.selected ? ITEMS[ui.selected]?.building || null : null);
 
   function pickAt(cx, cy, building = !!selectedKind()) {
     const rect = canvas.getBoundingClientRect();
@@ -167,6 +172,7 @@ export function create(ctx) {
     };
   }
   function computeHover() {
+    if (campMode) return null;
     if (pointer.type === 'touch') {
       if (!touchTile) return null;
       if (!selectedKind() && !gesture && touchHoverT <= 0) return null;
@@ -357,8 +363,30 @@ export function create(ctx) {
     return true;
   }
 
+  // Camp: walk to a ground tile; a blocked tile (tree, rock, station) walks up next to it instead.
+  let campHold = null; // { key } while the left button is held (re-aims as the cursor moves)
+  function campWalk(t) {
+    if (!t) return false;
+    if (sim.isWalkable(t.x, t.z)) { walkTo(t.x, t.z); return true; }
+    if (!map.isGround?.(t.x, t.z) && !map.isLand?.(t.x, t.z)) return false;
+    cancelJob();
+    const pl = views.player;
+    const from = pl?.tile || sim.player;
+    const path = findPath(sim, map, from.x, from.z, (tx, tz) => Math.hypot(tx - t.x, tz - t.z) <= 1.5);
+    if (!path) return false;
+    const j = { kind: 'walk', x: t.x, z: t.z, walking: true };
+    job = j;
+    pl?.walkPath?.(path.length ? path : [{ x: from.x, z: from.z }], () => { if (job === j) job = null; }, {
+      stopWhen: (px, pz) => Math.hypot(px - t.x, pz - t.z) <= 1.05,
+      onFail: () => { if (job === j) job = null; },
+    });
+    if (path.length) showMarker(path[path.length - 1].x, path[path.length - 1].z);
+    return true;
+  }
+
   // A primary press (mouse down, or a touch tap / touch-down on a harvestable) on tile t.
   function primaryAt(t, held) {
+    if (campMode) { campWalk(t); return; }
     const kind = selectedKind();
     if (kind) {
       if (!t) return;
@@ -413,6 +441,14 @@ export function create(ctx) {
     if (e.pointerType === 'touch') { onTouchDown(e); return; }
     onMove(e);
     if (ui.pointerOverUi) return;
+    if (campMode) {
+      if (e.button !== 0 || views.player?.booting) return;
+      leftDown = true;
+      const t = pickAt(e.clientX, e.clientY, true);
+      campHold = { key: t ? tkey(t.x, t.z) : '' };
+      campWalk(t);
+      return;
+    }
     hover = computeHover();
     hlState.pulse.velocity -= 2.2;
     if (e.button === 0) { leftDown = true; primaryAt(hover, true); }
@@ -426,7 +462,7 @@ export function create(ctx) {
   };
   const onUp = e => {
     if (e.pointerType === 'touch') { onTouchUp(e); return; }
-    if (e.button === 0) { leftDown = false; holdHarvest = false; drag = null; }
+    if (e.button === 0) { leftDown = false; holdHarvest = false; drag = null; campHold = null; }
     if (e.button === 2) { rightDown = false; rdrag = null; }
   };
   const onWheel = e => {
@@ -449,7 +485,7 @@ export function create(ctx) {
       touchHoverT = 0.5;
       hlState.pulse.velocity -= 2.2;
       // a finger down on a resource starts chopping at once (and keeps mining while held)
-      if (!selectedKind() && t && harvestKind(t.x, t.z)) { holdHarvest = true; startHarvest(t.x, t.z, true); gesture.startedJob = true; }
+      if (!campMode && !selectedKind() && t && harvestKind(t.x, t.z)) { holdHarvest = true; startHarvest(t.x, t.z, true); gesture.startedJob = true; }
     } else if (touches.size === 2) {
       // a second finger: this is a pinch, not a tap / paint / hold
       if (gesture) {
@@ -507,7 +543,7 @@ export function create(ctx) {
     touchHoverT = Math.max(0, touchHoverT - dt);
     const g = gesture;
     let want = 0, building = null;
-    if (g && !g.cancelled && !g.moved && !g.longDone && g.tile) {
+    if (g && !campMode && !g.cancelled && !g.moved && !g.longDone && g.tile) {
       g.t += dt;
       const e = sim.at(g.tile.x, g.tile.z);
       if (e && !e.resource) {
@@ -536,6 +572,7 @@ export function create(ctx) {
   // ---------- keys ----------
   const onKeyDown = e => {
     if (isTyping(e) || e.ctrlKey || e.metaKey || e.altKey) return;
+    if (campMode) return;
     if (e.code === 'Space' || e.code === 'KeyE') {
       e.preventDefault();
       if (e.repeat) return;
@@ -742,6 +779,14 @@ export function create(ctx) {
 
   function updateHeld(dt) {
     if (cooldown > 0) cooldown -= dt;
+    if (campMode) {
+      if (campHold && leftDown && pointer.inside && pointer.type !== 'touch' && !ui.pointerOverUi) {
+        const t = pickAt(pointer.cx, pointer.cy, true);
+        const k = t ? tkey(t.x, t.z) : '';
+        if (k && k !== campHold.key && !views.player?.steering) { campHold.key = k; campWalk(t); }
+      }
+      return;
+    }
     if (job) return;
     const pl = views.player;
     // holding the button: pick up the next hovered resource
@@ -752,6 +797,7 @@ export function create(ctx) {
 
   function updateCursor() {
     let c = 'default';
+    if (campMode) { if (c !== cursor) { cursor = c; canvas.style.cursor = c; } return; }
     if (hover && !selectedKind() && pointer.type !== 'touch') {
       const e = hover.entityId != null ? sim.entities.get(hover.entityId) : null;
       if (e?.resource || usable(e) || (!e && hover.deposit)) c = 'pointer';
@@ -787,6 +833,7 @@ export function create(ctx) {
     get dragging() { return !!drag; }, // painting belts: the hovered tile is usually one we just placed
     get job() { return job ? { kind: job.kind, x: job.x, z: job.z, walking: !!job.walking } : null; },
     get touchTile() { return touchTile; },
+    campMode,
     get longPress() { return gesture && !gesture.cancelled ? { t: gesture.t, done: gesture.longDone } : null; },
     buildReach: BUILD_REACH,
     // test helpers: act as if the pointer were over tile (x, z) / clicked it

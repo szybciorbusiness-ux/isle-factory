@@ -9,6 +9,7 @@ import * as THREE from 'three';
 import { Spring, ease, clamp } from '../../util/anim.js';
 import { Parts, rbox, puck, gear, jitter, C, boulder, log, beam, gable } from './geo.js';
 import { popScale } from './slots.js';
+import { DRUMSTICK } from '../items.js';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 
 const V = (x, y, z) => new THREE.Vector3(x, y, z);
@@ -458,7 +459,7 @@ function spitMeatGeometry(env) {
     const p = new Parts();
     for (const [x, rx] of [[-0.24, 0.0], [0.0, 2.1], [0.24, 4.2]]) {
       const g = src.clone();
-      g.translate(0.04, -0.072, 0);       // centre the meaty end on the bar
+      g.translate(-DRUMSTICK.bulbX, -DRUMSTICK.meatAxisY, 0);   // centre the meaty bulge on the bar
       g.rotateY(Math.PI / 2);             // bone along z (skewered across the bar)
       g.rotateX(rx);
       g.translate(x, 0, 0);

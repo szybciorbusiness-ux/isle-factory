@@ -1,15 +1,24 @@
 // Diorama camera: narrow-FOV perspective at a high pitch. Follows the player's smoothed position with a
 // critically damped spring (no overshoot, no jitter at any frame rate) plus a small look-ahead in the walking
 // direction that eases in and out; the lead slightly exceeds the follow lag, so walking never feels like the
-// camera is dragging behind. Smooth wheel / pinch zoom, a dt-driven shake, and portrait framing (about 9.5
-// tiles across a phone's width). Honours ctx.debug.cam = [x, z, dist?] as a fixed camera for tests.
+// camera is dragging behind. Smooth wheel / pinch zoom, a dt-driven shake, and portrait framing (about 6.75
+// tiles across a phone's width, so the robot and stations read). Honours ctx.debug.cam = [x, z, dist?] as a fixed
+// camera for tests.
+//
+// Camp mode: the camera pulls back a touch with every camp level, and on hearth:level it breathes out (a quick
+// ease-out to a little farther, then a slow settle at the new level's distance) over the warm wave's 1.2 s,
+// timed from views.lighting.mood.wave when the world runs one.
 import * as THREE from 'three';
 
 const FOV = 30;
 const PITCH = THREE.MathUtils.degToRad(58);
 // Landscape: 20 matches the reference's tile size (~100 px per tile at 1920x1080; sky.js / lighting.js mirror it).
 const DEFAULT_DIST = 20;
-const PORTRAIT_TILES = 9.6;   // tiles across the width on portrait screens
+const PORTRAIT_TILES = 6.75;  // tiles across the width on portrait screens
+const LEVEL_PULL = 0.032;     // camp: extra distance per camp level (x1.16 at level 5)
+const BEAT_T = 1.2;           // hearth:level beat length (s), the world's warm-wave time
+const BEAT_AMP = 0.055;       // how far the beat breathes out (fraction of the distance)
+const BEAT_PEAK = 0.26;       // fraction of the beat spent easing out (the rest settles)
 const ZOOM_MIN = 0.68, ZOOM_MAX = 1.7; // wheel / pinch range, relative to the default distance
 const OMEGA = 12;             // follow spring rate (1/s), critically damped: steady lag = 2 v / OMEGA (0.17 s of travel)
 const LEAD_T = 0.26;          // look-ahead: seconds of player velocity (> 2 / OMEGA, so the lag is covered)
@@ -40,8 +49,9 @@ function smoothDamp(cur, target, st, key, smoothTime, dt) {
 }
 
 export function create(ctx) {
-  const { camera, sim, debug, anim, views } = ctx;
-  const { damp, clamp } = anim;
+  const { camera, sim, debug, anim, views, events } = ctx;
+  const { damp, clamp, ease, lerp } = anim;
+  const camp = ctx.camp || null;
 
   camera.fov = FOV;
   camera.near = 0.5;
@@ -72,7 +82,35 @@ export function create(ctx) {
     return aspect >= 1 ? DEFAULT_DIST : Math.max(DEFAULT_DIST, d);
   }
   baseDist = frameDistance(camera.aspect);
-  const wantDist = () => (fixed?.[2] ? fixed[2] : baseDist * zoomMul);
+  // camp level pull-back + the level-up beat
+  const levelMulOf = lv => 1 + LEVEL_PULL * clamp(Number(lv) || 0, 0, 6);
+  let levelMul = camp ? levelMulOf(camp.level) : 1;
+  const beat = { t: -1, from: levelMul, to: levelMul, bump: 0 };
+  const beatProgress = () => {
+    const w = views.lighting?.mood?.wave;
+    if (w?.active && Number.isFinite(w.t) && w.t <= beat.t + 0.1) return clamp(w.t / BEAT_T);
+    return clamp(beat.t / BEAT_T);
+  };
+  function updateLevel(dt) {
+    if (!camp) return;
+    if (beat.t >= 0) {
+      beat.t += dt;
+      const k = beatProgress();
+      levelMul = lerp(beat.from, beat.to, ease.sineInOut(k));
+      beat.bump = k < BEAT_PEAK ? ease.quadOut(k / BEAT_PEAK) : 1 - ease.sineInOut((k - BEAT_PEAK) / (1 - BEAT_PEAK));
+      if (k >= 1) { beat.t = -1; beat.bump = 0; levelMul = beat.to; }
+    } else {
+      // the level changed without the event (restored state, tests): ease there
+      levelMul = damp(levelMul, levelMulOf(camp.level), 3, dt);
+    }
+  }
+  const offLevel = camp && events?.on ? events.on('hearth:level', ({ level } = {}) => {
+    beat.from = levelMul;
+    beat.to = levelMulOf(Number.isFinite(level) ? level : camp.level);
+    beat.t = 0;
+  }) : null;
+
+  const wantDist = () => (fixed?.[2] ? fixed[2] : baseDist * zoomMul * levelMul * (1 + BEAT_AMP * beat.bump));
   distance = wantDist();
 
   function place(sx = 0, sy = 0) {
@@ -104,6 +142,7 @@ export function create(ctx) {
   function update(dt) {
     if (!(dt > 0)) return;
     zoomMul = smoothDamp(zoomMul, wantZoom, vel, 'd', ZOOM_SMOOTH, dt);
+    updateLevel(dt);
     distance = wantDist();
 
     if (fixed) {
@@ -151,6 +190,10 @@ export function create(ctx) {
     get pitch() { return PITCH; },
     get fov() { return FOV; },
     get lookAhead() { return { x: ahead.x, z: ahead.z }; },
+    // camp: distance multiplier from the camp level, and the level-up beat (0..1, 0 = at rest)
+    get levelMul() { return levelMul; },
+    get beat() { return beat.bump; },
+    get portraitTiles() { return PORTRAIT_TILES; },
     // amount ~ world units of peak offset: 0.03 a tool hit, 0.08 a tree falling, 0.15 something big
     shake(amount = 0.05) {
       shakeAmp = clamp(Math.max(shakeAmp, amount) + amount * 0.25, 0, 0.4);
@@ -170,5 +213,6 @@ export function create(ctx) {
     snap,
     update,
     resize,
+    dispose() { offLevel?.(); },
   };
 }

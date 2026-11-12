@@ -140,6 +140,24 @@ const input = { move: { x: 0, z: 0 }, active: false };
 const views = {};
 // The camp reads the player's smoothed float position (falls back to the sim tile before the view exists).
 const camp = campMode ? createCamp(sim, { playerPos: () => views.player?.getPosition?.() }) : null;
+
+// ---------- save / load (camp) ----------
+// Progress lives in localStorage. Restored BEFORE the views are built, so they draw the saved camp instantly.
+// ?fresh starts over (and clears the save); tests (?paused, ?scenario) and ?nosave never read or write it.
+const SAVE_KEY = 'isle-factory.camp.v1';
+const saving = !!camp && !params.has('paused') && !params.has('scenario') && !params.has('nosave');
+const storage = { get: () => { try { return localStorage.getItem(SAVE_KEY); } catch { return null; } }, set: v => { try { localStorage.setItem(SAVE_KEY, v); } catch { /* private mode */ } }, clear: () => { try { localStorage.removeItem(SAVE_KEY); } catch { /* ignore */ } } };
+if (camp && params.has('fresh')) storage.clear();
+if (saving && !params.has('fresh')) {
+  const raw = storage.get();
+  if (raw) { try { camp.restore(JSON.parse(raw)); } catch (e) { reportError(`[save] could not restore, starting fresh: ${e}`); storage.clear(); } }
+}
+function saveNow() { if (saving) try { storage.set(JSON.stringify(camp.snapshot())); } catch (e) { /* keep playing */ } }
+if (saving) {
+  setInterval(saveNow, 4000);
+  addEventListener('pagehide', saveNow);
+  document.addEventListener('visibilitychange', () => { if (document.hidden) saveNow(); });
+}
 const ctx = {
   camp,
   THREE, renderer, scene, camera, canvas: renderer.domElement, uiRoot: document.getElementById('ui'),
@@ -257,6 +275,7 @@ window.__game = {
     const v = new THREE.Vector3(x, y, z).project(camera);
     return { x: (v.x * 0.5 + 0.5) * innerWidth, y: (-v.y * 0.5 + 0.5) * innerHeight };
   },
+  save: () => saveNow(), resetSave: () => storage.clear(),
   ready: true,
 };
 document.body.dataset.ready = '1';

@@ -4,8 +4,8 @@
 import { chromium } from 'playwright-core';
 
 const mobile = process.argv.includes('--mobile');
-const url = `http://localhost:4660/?paused=1&shot=1${mobile ? '&mobile=1&safeTop=59&safeBottom=24' : ''}`;
-const browser = await chromium.launch({ headless: true, args: ['--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist', '--enable-webgl'] });
+const url = `http://localhost:4660/?paused=1&factory=1&shot=1${mobile ? '&mobile=1&safeTop=59&safeBottom=24' : ''}`;
+const browser = await chromium.launch({ headless: true, args: ['--use-angle=d3d11', '--ignore-gpu-blocklist', '--enable-gpu'] });
 const page = await browser.newPage({ viewport: mobile ? { width: 402, height: 874 } : { width: 960, height: 540 } });
 const logs = [];
 page.on('pageerror', e => logs.push(`PAGEERROR ${e.message}`));

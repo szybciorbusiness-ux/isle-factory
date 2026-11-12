@@ -5,6 +5,7 @@
 //   node src/view/player/shots.mjs sheet --out x.png --seq "<js run before frames>" --frames 12 --every 3
 //          [--keys KeyD,KeyS] [--move 0.5,0] [--follow] [--box 220] [--scale 2] [--mobile] [--url ...]
 //   node src/view/player/shots.mjs log --out x.json --script <name> [--dt 60|120|jitter]
+// Real GPU by default (--swiftshader for software). Default URLs add noboot=1; --cy <world y> centres the clip higher.
 //
 // Sheets: each frame is clipped around the robot's screen position (--follow) or the first frame's position.
 import { chromium } from 'playwright-core';
@@ -20,12 +21,12 @@ const args = Object.fromEntries(argv.slice(1).reduce((acc, a, i, all) => {
 const mobile = !!args.mobile;
 const W = Number(args.w || (mobile ? 402 : 1920)), H = Number(args.h || (mobile ? 874 : 1080));
 const scale = Number(args.scale || 2);
-let url = args.url || (mobile ? '/?paused=1&mobile=1&safeTop=59&safeBottom=24' : '/?paused=1');
+let url = args.url || (mobile ? '/?paused=1&noboot=1&mobile=1&safeTop=59&safeBottom=24' : '/?paused=1&noboot=1');
 url = `http://localhost:${args.port || 4660}${url}${url.includes('?') ? '&' : '?'}shot=1`;
 const out = resolve(args.out || 'shots/polish3-player/dev.png');
 mkdirSync(dirname(out), { recursive: true });
 
-const browser = await chromium.launch({ headless: true, args: ['--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist', '--enable-webgl'] });
+const browser = await chromium.launch({ headless: true, args: args.swiftshader ? ['--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist', '--enable-webgl'] : ['--use-angle=d3d11', '--ignore-gpu-blocklist', '--enable-gpu'] });
 const page = await browser.newPage({ viewport: { width: W, height: H }, deviceScaleFactor: scale });
 const logs = [];
 page.on('pageerror', e => logs.push(`PAGEERROR ${e.message}`));
@@ -38,7 +39,7 @@ if (args.dist) await page.evaluate(d => { const c = __game.views.camera; c.setDi
 if (args.hideui) await page.addStyleTag({ content: '#ui{display:none!important}' });
 
 async function robotScreen() {
-  return page.evaluate(() => { const p = __game.views.player.getPosition(); return __game.toScreen(p.x, 0.35, p.z); });
+  return page.evaluate(cy => { const p = __game.views.player.getPosition(); return __game.toScreen(p.x, cy, p.z); }, Number(args.cy || 0.35));
 }
 async function sheet(frames, cols, label = true) {
   const p2 = await browser.newPage();

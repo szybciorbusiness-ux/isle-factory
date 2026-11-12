@@ -1,5 +1,5 @@
-// Camp view geometry helpers: the shared colour set, boulders / logs / cloth, flame + ember + glow shapes,
-// and nice fallback item meshes (meat, cooked meat, copper bar) until items.js has its own.
+// Camp view geometry helpers: the shared colour set, boulders / logs / cloth, flame + ember + glow shapes.
+// (Item meshes, the drumsticks and the copper ingot included, live in src/view/items.js.)
 // Everything is built with the buildings toolkit (Parts: merged, vertex-coloured, one Lambert material).
 import * as THREE from 'three';
 import { Parts, rbox, puck, gear, jitter, rng } from '../buildings/geom.js';
@@ -110,40 +110,4 @@ export function glowTexture(size = 128) {
   const tex = new THREE.CanvasTexture(cv);
   tex.colorSpace = THREE.SRGBColorSpace;
   return tex;
-}
-
-// ---------- fallback items (origin at the bottom centre, lying flat, about the size of items.js items) ----------
-function drumstick(p, meat, light, dark, bone, cooked) {
-  // meaty end: a faceted, slightly squashed egg toward -x
-  const egg = jitter(new THREE.SphereGeometry(0.085, 9, 6), 0.008, 4);
-  p.add(egg, meat, {
-    p: [-0.04, 0.072, 0], s: [1.38, 0.86, 1.05], flat: true, jitter: 0.05, seed: 5,
-    faceColor: (cx, cy, cz, nx, ny) => (ny > 0.55 ? light : ny < -0.4 ? dark : null),
-  });
-  if (cooked) {
-    // grill marks across the top
-    for (const x of [-0.085, -0.035, 0.015]) p.add(rbox(0.018, 0.012, 0.13, 0.005), dark, { p: [x, 0.142, 0], r: [0, 0.35, 0], ao: false });
-  } else {
-    // a little fat marbling
-    p.add(rbox(0.07, 0.01, 0.03, 0.005), light, { p: [-0.06, 0.143, 0.02], r: [0, 0.5, 0], ao: false });
-  }
-  // bone shaft + knuckle
-  p.add(new THREE.CylinderGeometry(0.022, 0.027, 0.13, 7), bone, { p: [0.095, 0.064, 0], r: [0, 0, Math.PI / 2 - 0.12], flat: true });
-  for (const z of [-0.022, 0.022]) p.add(new THREE.SphereGeometry(0.03, 7, 5), bone, { p: [0.165, 0.074, z], flat: true, faceColor: (cx, cy, cz, nx, ny) => (ny < -0.3 ? C.boneShade : null) });
-}
-export function fallbackItemGeometry(id) {
-  const p = new Parts({ ao: { y0: 0, y1: 0.12, min: 0.82 } });
-  if (id === 'meat') drumstick(p, C.meat, C.meatLight, C.meatDark, C.bone, false);
-  else if (id === 'cookedMeat') drumstick(p, C.cooked, C.cookedLight, C.cookedDark, C.bone, true);
-  else if (id === 'copperBar') {
-    // classic ingot: a square frustum stretched long, light top, warm bevelled sides, embossed top plate
-    const g = new THREE.CylinderGeometry(0.098, 0.13, 0.075, 4, 1);
-    g.rotateY(Math.PI / 4);
-    p.add(g, C.bar, {
-      p: [0, 0.0375, 0], s: [1.45, 1, 0.78], flat: true,
-      faceColor: (cx, cy, cz, nx, ny, nz) => (ny > 0.9 ? C.barLight : ny < -0.9 ? C.barDark : Math.abs(nx) > Math.abs(nz) ? C.barDark : null),
-    });
-    p.add(rbox(0.13, 0.008, 0.055, 0.004), '#fbcb98', { p: [0, 0.077, 0], ao: false });
-  } else return null;
-  return p.merge();
 }

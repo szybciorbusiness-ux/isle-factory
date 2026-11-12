@@ -1,20 +1,9 @@
 // Instanced item pools: one InstancedMesh per item id holds every camp item of that type (line riders,
 // pile stacks, station input buffers, zone icons, hops in flight). Rebuilt every frame: begin(), push(), end().
-// Geometry comes from views.items when it has a real model; meat / cookedMeat / copperBar fall back to our own
-// meshes while items.js still draws them as plain boxes.
+// Geometry and material come from views.items (every camp item has a real model there); a plain rounded cube
+// only if items.js failed to load.
 import * as THREE from 'three';
-import { fallbackItemGeometry, Parts, rbox } from './geo.js';
-
-const OWN_FALLBACKS = new Set(['meat', 'cookedMeat', 'copperBar']);
-
-// items.js's generic fallback is an 0.18 cube; anything else is a real model.
-function isPlaceholder(geo) {
-  if (!geo) return true;
-  if (!geo.boundingBox) geo.computeBoundingBox();
-  const s = new THREE.Vector3();
-  geo.boundingBox.getSize(s);
-  return Math.abs(s.x - 0.18) < 0.004 && Math.abs(s.y - 0.18) < 0.004 && Math.abs(s.z - 0.18) < 0.004;
-}
+import { Parts, rbox } from './geo.js';
 
 export function createItemPools(ctx, parent, { castShadow = true } = {}) {
   const { config } = ctx;
@@ -27,7 +16,6 @@ export function createItemPools(ctx, parent, { castShadow = true } = {}) {
     if (geoCache.has(id)) return geoCache.get(id);
     let g = null;
     try { g = items()?.getGeometry?.(id) || null; } catch { g = null; }
-    if ((!g || isPlaceholder(g)) && OWN_FALLBACKS.has(id)) g = fallbackItemGeometry(id) || g;
     if (!g) { const p = new Parts(); p.add(rbox(0.18, 0.18, 0.18, 0.04), config.ITEMS[id]?.color || '#ffffff', { p: [0, 0.09, 0] }); g = p.merge(); }
     geoCache.set(id, g);
     return g;

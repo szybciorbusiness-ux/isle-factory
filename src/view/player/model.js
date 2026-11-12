@@ -8,11 +8,12 @@
 //        └ tilt (rotation.z = -lean forward, rotation.x = bank / waddle roll; pivot on the ground)
 //            └ hop (position.y)
 //                └ squash (scale, pivot at the ground)
-//                    ├ body (egg, hazard band, copper trim, ear bolts), visor (bezel + screen)
 //                    ├ hipL, hipR (markers the legs attach to)
-//                    ├ antenna (pivot on top) ─ joint ─ bulb
-//                    ├ pack (pivot at the upper back) ─ pipeTip
-//                    └ armL, armR (shoulder pivots; rotation.z swings forward) ─ hand ─ tool ─ axe, pickaxe
+//                    └ upper (rotation.y = upper-body twist: swings while walking turn the egg, not the legs)
+//                        ├ body (egg, hazard band, copper trim, ear bolts), visor (bezel + screen)
+//                        ├ antenna (pivot on top) ─ joint ─ bulb
+//                        ├ pack (pivot at the upper back) ─ pipeTip; PACK_TOP = where the carried stack sits
+//                        └ armL, armR (shoulder pivots; rotation.z swings forward) ─ hand ─ tool ─ axe, pickaxe, club
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
@@ -30,7 +31,10 @@ export const HIP = new THREE.Vector3(0.005, BODY_LIFT + 0.035, 0.092); // right 
 export const FOOT_Z = 0.098;     // feet rest this far to each side
 export const LEG_R = 0.028;
 export const PACK_PIVOT = new THREE.Vector3(-0.19, BODY_LIFT + 0.35, 0);
-export const PIPE_TIP = new THREE.Vector3(-0.1, 0.15, -0.07); // in pack space
+// exhaust up the pack's left side (clear of the carried stack, which sits on the lid)
+export const PIPE_TIP = new THREE.Vector3(-0.07, 0.115, -0.148); // in pack space
+// top centre of the pack lid in pack space: the base of the carried stack (camp mode)
+export const PACK_TOP = new THREE.Vector3(-0.07, 0.036, 0);
 export const ANTENNA_Y = BODY_LIFT + BODY_H - 0.008;
 export const ANT_SEG = 0.075;
 
@@ -230,12 +234,13 @@ function packGeometry() {
   }
   // battery gauge housing on the back face (the lit bars are a separate glowing mesh)
   const gauge = paint(place(new RoundedBoxGeometry(0.02, 0.15, 0.1, 2, 0.008), { x: cx - W / 2 - 0.004, y: cy + 0.005 }), COLORS.slateDark);
-  // exhaust pipe on the top-left with a copper collar and a flared slate tip
+  // exhaust pipe up the left side (a bracket ties it to the box) with a copper collar and a flared slate tip
   const t = PIPE_TIP;
-  const pipe = paint(place(new THREE.CylinderGeometry(0.017, 0.02, 0.12, 10), { x: t.x, y: t.y - 0.065, z: t.z }), COLORS.slate);
-  const collar = paint(place(new THREE.CylinderGeometry(0.026, 0.026, 0.022, 12), { x: t.x, y: t.y - 0.095, z: t.z }), COLORS.copperLight);
+  const pipe = paint(place(new THREE.CylinderGeometry(0.017, 0.02, 0.2, 10), { x: t.x, y: t.y - 0.105, z: t.z }), COLORS.slate);
+  const bracket = paint(place(new RoundedBoxGeometry(0.05, 0.026, 0.04, 2, 0.008), { x: t.x, y: t.y - 0.15, z: t.z + 0.022 }), COLORS.copperDark);
+  const collar = paint(place(new THREE.CylinderGeometry(0.026, 0.026, 0.022, 12), { x: t.x, y: t.y - 0.065, z: t.z }), COLORS.copperLight);
   const tip = paint(place(new THREE.CylinderGeometry(0.027, 0.019, 0.03, 12), { x: t.x, y: t.y - 0.012, z: t.z }), COLORS.slateLight);
-  return merge([box, lid, lidStripe, base, ...vents, gauge, pipe, collar, tip]);
+  return merge([box, lid, lidStripe, base, ...vents, gauge, pipe, bracket, collar, tip]);
 }
 function gaugeBarsGeometry() {
   const cx = -0.062 - 0.135 / 2 - 0.016, cy = -0.1;
@@ -291,6 +296,17 @@ function pickaxeGeometry(P) {
   ]);
 }
 
+function clubGeometry(P) {
+  // a chunky wooden club: grip wrap, a fat faceted head with a copper band (it bonks, it never cuts)
+  return merge([
+    paint(place(new THREE.CylinderGeometry(0.019, 0.024, 0.3, 6), { y: 0.11 }), P.wood),
+    paint(place(new THREE.CylinderGeometry(0.026, 0.026, 0.07, 6), { y: 0.0 }), P.woodDark),
+    paint(place(new THREE.DodecahedronGeometry(0.075, 0), { y: 0.3, sx: 0.95, sy: 1.25, sz: 0.95 }), P.wood, (x, y) => 0.9 + (y - 0.3) * 1.6),
+    paint(place(new THREE.CylinderGeometry(0.068, 0.068, 0.03, 8), { y: 0.26 }), COLORS.copper),
+    paint(place(new THREE.DodecahedronGeometry(0.03, 0), { x: 0.045, y: 0.36, z: 0.02 }), P.woodDark),
+  ]);
+}
+
 export function buildRobot(P) {
   const mat = new THREE.MeshLambertMaterial({ vertexColors: true });
   const ceramic = ceramicMaterial();
@@ -300,8 +316,8 @@ export function buildRobot(P) {
 
   const root = new THREE.Group();
   root.name = 'player';
-  const tilt = new THREE.Group(), hop = new THREE.Group(), squash = new THREE.Group();
-  root.add(tilt); tilt.add(hop); hop.add(squash);
+  const tilt = new THREE.Group(), hop = new THREE.Group(), squash = new THREE.Group(), upper = new THREE.Group();
+  root.add(tilt); tilt.add(hop); hop.add(squash); squash.add(upper);
 
   // soft contact shadow (the sun shadow does the rest)
   const shadow = new THREE.Mesh(new THREE.PlaneGeometry(0.78, 0.78).rotateX(-Math.PI / 2),
@@ -314,14 +330,14 @@ export function buildRobot(P) {
   const body = mesh(bodyGeometry(), ceramic);
   body.receiveShadow = true;
   const band = mesh(bandGeometry(0.135, 0.178, 0.005), new THREE.MeshLambertMaterial({ map: stripeTexture() }));
-  squash.add(body, band);
+  upper.add(body, band);
 
   // visor: dark bezel + glowing screen (face canvas) + soft glow sprite
   const face = createFace();
   const bezel = mesh(paint(surfacePatch({ yc: VISOR.y, halfA: VISOR.halfA + 7, halfH: VISOR.halfH + 0.02, off: 0.005, p: 3.4 }), COLORS.bezel), metal, false);
   const screenMat = new THREE.MeshBasicMaterial({ map: face.texture });
   const screen = mesh(surfacePatch({ yc: VISOR.y, halfA: VISOR.halfA, halfH: VISOR.halfH, off: 0.011, p: 4.2 }), screenMat, false);
-  squash.add(bezel, screen);
+  upper.add(bezel, screen);
   const visorGlow = new THREE.Sprite(new THREE.SpriteMaterial({
     map: radialTexture([[0, 'rgba(190,255,236,0.9)'], [0.35, 'rgba(130,245,214,0.35)'], [1, 'rgba(110,240,210,0)']]),
     transparent: true, opacity: 0.2, depthWrite: false, blending: THREE.AdditiveBlending,
@@ -330,7 +346,7 @@ export function buildRobot(P) {
   visorGlow.scale.setScalar(0.46);
   const visorAnchor = new THREE.Object3D();
   surface(0, VISOR.y, 0.03, visorAnchor.position);
-  squash.add(visorAnchor);
+  upper.add(visorAnchor);
   root.add(visorGlow); // positioned at visorAnchor in root space by player.js (keeps the sprite unsquashed)
 
   // hips (leg attachment markers)
@@ -341,7 +357,7 @@ export function buildRobot(P) {
   // antenna: copper base, two slate segments on spring joints, a warm light bulb with a glow
   const antBase = mesh(paint(new THREE.CylinderGeometry(0.03, 0.04, 0.034, 14), COLORS.copper, (x, y) => 0.9 + y * 3), metal);
   antBase.position.y = ANTENNA_Y + 0.01;
-  squash.add(antBase);
+  upper.add(antBase);
   const antenna = new THREE.Group();
   antenna.position.y = ANTENNA_Y + 0.025;
   const segGeo = paint(new THREE.CylinderGeometry(0.0095, 0.012, ANT_SEG, 8).translate(0, ANT_SEG / 2, 0), COLORS.slate);
@@ -358,7 +374,7 @@ export function buildRobot(P) {
   const bulbCap = mesh(paint(new THREE.CylinderGeometry(0.02, 0.024, 0.02, 12).translate(0, -0.036, 0), COLORS.copperDark), metal);
   bulb.add(bulbGlass, bulbCap);
   antJoint.add(bulb);
-  squash.add(antenna);
+  upper.add(antenna);
   const bulbGlow = new THREE.Sprite(new THREE.SpriteMaterial({
     map: radialTexture([[0, 'rgba(255,246,200,1)'], [0.3, 'rgba(255,224,130,0.5)'], [1, 'rgba(255,200,100,0)']]),
     transparent: true, opacity: 0.75, depthWrite: false, blending: THREE.AdditiveBlending,
@@ -377,7 +393,7 @@ export function buildRobot(P) {
   const pipeTip = new THREE.Object3D();
   pipeTip.position.copy(PIPE_TIP);
   pack.add(pipeTip);
-  squash.add(pack);
+  upper.add(pack);
 
   // arms + mitts
   const armGeo = armGeometry(), mittGeo = mittGeometry();
@@ -390,7 +406,7 @@ export function buildRobot(P) {
     hand.position.y = -ARM_LEN;
     hand.add(mesh(mittGeo, metal));
     arm.add(hand);
-    squash.add(arm);
+    upper.add(arm);
     arms.push({ arm, hand });
   }
   const [{ arm: armL, hand: handL }, { arm: armR, hand: handR }] = arms;
@@ -398,8 +414,9 @@ export function buildRobot(P) {
   // tools live in the right mitt
   const tool = new THREE.Group();
   const axe = mesh(axeGeometry(P).scale(1.15, 1.15, 1.15), toolMat), pickaxe = mesh(pickaxeGeometry(P).scale(1.15, 1.15, 1.15), toolMat);
-  axe.visible = pickaxe.visible = false;
-  tool.add(axe, pickaxe);
+  const club = mesh(clubGeometry(P).scale(1.15, 1.15, 1.15), toolMat);
+  axe.visible = pickaxe.visible = club.visible = false;
+  tool.add(axe, pickaxe, club);
   handR.add(tool);
 
   // legs + feet live directly under the root: player.js plants the feet and stretches the legs to the hips
@@ -410,8 +427,8 @@ export function buildRobot(P) {
   root.add(legL, legR, footL, footR);
 
   return {
-    root, tilt, hop, squash, shadow, body, band, bezel, screen, face, visorGlow, visorAnchor,
+    root, tilt, hop, squash, upper, shadow, body, band, bezel, screen, screenMat, face, visorGlow, visorAnchor,
     hipL, hipR, legL, legR, footL, footR, antenna, antJoint, bulb, bulbMat, bulbGlow,
-    pack, packMesh, gaugeBars, gaugeMat, pipeTip, armL, armR, handL, handR, tool, tools: { axe, pickaxe },
+    pack, packMesh, gaugeBars, gaugeMat, pipeTip, armL, armR, handL, handR, tool, tools: { axe, pickaxe, club },
   };
 }

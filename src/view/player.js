@@ -9,10 +9,22 @@
 // into acceleration, bank into turns, a settle on stopping, a spring antenna bulb, a lagging power-pack that puffs
 // now and then, an expressive visor face (blinks, looks into turns, squints when striking, looks around when idle).
 // Everything is driven by the dt passed to update(dt) — see DESIGN.md "Motion principles".
+//
+// Camp mode (ctx.camp): the carried stack rides the pack (player/stack.js); camp:swing (by 'player') plays a swing
+// whose strike lands at hitIn, as an upper-body twist while walking so the legs keep going; player:eject is a
+// happy hop out of a new building's footprint; a fresh camp (level 0) boots up first (player/boot.js; ?noboot=1
+// skips it) and input stays locked until it is done.
 import * as THREE from 'three';
-import { buildRobot, FOOT_Z } from './player/model.js';
+import { buildRobot, FOOT_Z as ROBOT_FOOT_Z } from './player/model.js';
+import { buildDug, FOOT_Z as DUG_FOOT_Z } from './player/dug.js';
+// The player is Dug, the mole miner (CHARACTER.md). ?robot brings back the old robot.
+const USE_ROBOT = new URLSearchParams(location.search).has('robot');
+const buildCharacter = USE_ROBOT ? buildRobot : buildDug;
+const FOOT_Z = USE_ROBOT ? ROBOT_FOOT_Z : DUG_FOOT_Z;
 import { createMotion, RADIUS } from './player/motion.js';
 import { smoothPath } from './player/path.js';
+import { createStack } from './player/stack.js';
+import { bootPose, BOOT_T, BOOT_END } from './player/boot.js';
 
 const MOVE_KEYS = {
   KeyW: [0, -1], ArrowUp: [0, -1], KeyS: [0, 1], ArrowDown: [0, 1],
@@ -34,13 +46,17 @@ const LEAN_SPEED = 0.1;          // forward lean at full speed
 const LEAN_ACC = 0.011;          // lean per tile/s^2 of forward acceleration
 const BANK_ACC = 0.012;          // bank per tile/s^2 of sideways (turning) acceleration
 const WIND = 0.13, STRIKE = 0.07, FOLLOW = 0.2;
-const SWING_T = WIND + STRIKE + FOLLOW;
 const SWING_CHAIN = 0.06;        // a new swing may take over during the last bit of follow-through
 const ARM_WIND = 2.75, ARM_STRIKE = 0.8, ARM_OVER = 0.55, ARM_CARRY = 0.85; // carry: hand low and forward ...
 const WRIST_CARRY = 2.55;        // ... with the wrist turned so the tool stands upright by the shoulder
 const TOOL_LINGER = 0.32;        // the tool stays out this long after a swing (covers the gap between chained hits)
 const TOOL_GRIP = Math.PI - 0.55; // tool angle relative to the arm: handle out past the mitt, head forward
 const CELEB_CROUCH = 0.1, CELEB_AIR = 0.5, BOUNCE_T = 0.26;
+// camp
+const TWIST_MAX = 1.1;           // upper-body twist toward a swing target while walking (rad)
+const WALK_SWING_BODY = 0.4;     // how much of the whole-body lean / lunge a walking swing keeps
+const HOP_CROUCH = 0.09;         // eject hop: anticipation crouch (s)
+const TOOL_KIND = { axe: 'axe', pick: 'pickaxe', pickaxe: 'pickaxe', club: 'club' };
 
 const TAU = Math.PI * 2;
 const frac = v => v - Math.floor(v);
@@ -58,10 +74,13 @@ export function create(ctx) {
   const { PLAYER, PALETTE } = config;
   const SPEED = PLAYER.moveSpeed || 4.2;
   const scale = ctx.mobile ? SCALE_MOBILE : SCALE;
+  const camp = ctx.camp || null;
 
-  const rig = buildRobot(PALETTE);
+  const rig = buildCharacter(PALETTE);
   rig.root.scale.setScalar(scale);
   scene.add(rig.root);
+  let stack = null;
+  if (camp) { try { stack = createStack(ctx, rig, { scale }); } catch (e) { console.error('[player] stack', e); stack = null; } }
 
   const walk = (x, z) => sim.isWalkable(x, z);
   const motion = createMotion({ isWalkable: walk, moveSpeed: SPEED, x: sim.player.x, z: sim.player.z, heading: dirHeading(sim.player.dir) });
@@ -128,6 +147,15 @@ export function create(ctx) {
   let celebT = -1, bounceT = -1;
   let idleT = 0, glance = 0, glanceTarget = 0, glanceT = 0, nextGlance = 5;
   let puffT = 0.4, clock = 0, gulpGlow = 0;
+  // camp: upper-body twist (walking swings), the eject hop, the boot-up intro
+  const twist = new Spring(0, { stiffness: 320, damping: 27 });
+  let walkBlend = 0, walkingNow = false;
+  let hopJ = null;                   // { t, x0, z0, x1, z1, dur, height, h1 }
+  let landKick = 0, stepPrev = 0, celebWait = -1, spinPrev = 0;
+  const noBoot = !!ctx.params?.has?.('noboot') || !!ctx.debug?.scenario;
+  let bootT = camp && (camp.level | 0) === 0 && !noBoot ? 0 : -1;
+  let power = 1, bulbPower = 1, bootHopPrev = 0;
+  const boot = { on: false, b: null };
   let rngState = 7654321;
   const rnd = () => ((rngState = (rngState * 1103515245 + 12345) >>> 0) / 4294967296);
 
@@ -168,16 +196,16 @@ export function create(ctx) {
     toolIdle = 0;
   }
   function swingPose(a) {
-    const t = a.t;
-    if (t < WIND) {
-      const k = ease.quadOut(t / WIND);
+    const t = a.t, W = a.w, S = a.s;
+    if (t < W) {
+      const k = ease.quadOut(t / W);
       return { arm: lerp(a.a0, ARM_WIND, k), lean: -0.16 * k, lunge: -0.02 * k, stretch: 0.05 * k, squint: 0.6 * k };
     }
-    if (t < WIND + STRIKE) {
-      const k = ease.cubicIn((t - WIND) / STRIKE);
+    if (t < W + S) {
+      const k = ease.cubicIn((t - W) / S);
       return { arm: lerp(ARM_WIND, ARM_STRIKE, k), lean: lerp(-0.16, 0.26, k), lunge: lerp(-0.02, 0.065, k), stretch: lerp(0.05, -0.035, k), squint: lerp(0.6, 1, k) };
     }
-    const k = clamp((t - WIND - STRIKE) / FOLLOW);
+    const k = clamp((t - W - S) / a.f);
     const over = Math.sin(Math.min(1, k / 0.35) * Math.PI);
     const back = ease.cubicInOut(clamp((k - 0.3) / 0.7));
     return {
@@ -185,30 +213,38 @@ export function create(ctx) {
       lean: 0.26 * (1 - ease.cubicOut(k)), lunge: 0.065 * (1 - ease.cubicOut(k)), stretch: -0.035 * (1 - k), squint: 1 - ease.quadOut(k),
     };
   }
-  function startSwing(target, onImpact, tool) {
+  // hitIn: seconds from now to the strike (camp swings); the wind-up and strike stretch or shrink to land on it
+  function startSwing(target, onImpact, tool, hitIn) {
     const dx = target.x - s.x, dz = target.z - s.z;
     const h = dx * dx + dz * dz > 0.0025 ? Math.atan2(dz, dx) : s.heading;
-    toolKind = tool === 'pickaxe' ? 'pickaxe' : 'axe';
+    toolKind = TOOL_KIND[tool] || 'axe';
+    // while walking the egg twists toward the target (clamped); standing, the whole robot turns to it
+    const facing = walkingNow ? s.heading + clamp(angleDelta(s.heading, h), -TWIST_MAX, TWIST_MAX) : h;
     // hold the tool in whichever mitt faces the camera (+z), so the swing is never hidden behind the body
     if (toolShow.value < 0.1) {
-      swingSide = Math.cos(h) < -0.2 ? -1 : 1;
+      swingSide = Math.cos(facing) < -0.2 ? -1 : 1;
       (swingSide > 0 ? rig.handR : rig.handL).add(rig.tool);
     }
     if (action) cancelSwing(); // chaining: the old follow-through blends into the new wind-up
     const arm = swingSide > 0 ? armSpring.R : armSpring.L;
-    action = { t: 0, target: { x: target.x, z: target.z }, onImpact, impacted: false, a0: arm.value, heading: h };
-    faceHeading = h; faceTimer = WIND + STRIKE + 0.06;
+    const k = Number.isFinite(hitIn) && hitIn > 0 ? clamp(hitIn / (WIND + STRIKE), 0.4, 1.6) : 1;
+    const w = WIND * k, st = STRIKE * k, f = FOLLOW * Math.max(0.65, k);
+    action = { t: 0, target: { x: target.x, z: target.z }, onImpact, impacted: false, a0: arm.value, heading: h, w, s: st, f, T: w + st + f };
+    if (!walkingNow) { faceHeading = h; faceTimer = w + st + 0.06; }
     toolIdle = 0;
   }
 
   // ---------- per-frame ----------
-  const pose = { lean: 0, lunge: 0, stretch: 0, hopExtra: 0, spin: 0, squint: 0, arm: null };
+  const pose = { lean: 0, lunge: 0, stretch: 0, hopExtra: 0, spin: 0, squint: 0, arm: null, armsUp: 0, armsLimp: 0, droop: 0 };
   function advanceActions(dt) {
     pose.lean = pose.lunge = pose.stretch = pose.hopExtra = pose.spin = pose.squint = 0;
+    pose.armsUp = pose.armsLimp = pose.droop = 0;
     pose.arm = null;
+    walkBlend = damp(walkBlend, walkingNow ? 1 : 0, 12, dt);
+    let twistTarget = 0;
     if (action) {
       action.t += dt;
-      if (!action.impacted && action.t >= WIND + STRIKE) {
+      if (!action.impacted && action.t >= action.w + action.s) {
         action.impacted = true;
         squash.velocity = Math.max(-4, squash.velocity - 2.4);
         lean.kick(1.3);
@@ -219,10 +255,16 @@ export function create(ctx) {
       }
       if (action) {
         const p = swingPose(action);
-        pose.arm = p.arm; pose.lean += p.lean; pose.lunge += p.lunge; pose.stretch += p.stretch; pose.squint = p.squint;
-        if (action.t >= SWING_T) { action = null; toolIdle = 0; }
+        const body = lerp(1, WALK_SWING_BODY, walkBlend);
+        pose.arm = p.arm; pose.lean += p.lean * body; pose.lunge += p.lunge * body; pose.stretch += p.stretch; pose.squint = p.squint;
+        // walking: the egg turns toward the target for the wind-up and strike, then unwinds during the follow-through
+        const hold = 1 - ease.cubicInOut(clamp((action.t - action.w - action.s * 0.5) / (action.f * 0.9)));
+        twistTarget = clamp(angleDelta(s.heading, action.heading), -TWIST_MAX, TWIST_MAX) * hold * walkBlend;
+        if (action.t >= action.T) { action = null; toolIdle = 0; }
       }
     } else toolIdle += dt;
+    twist.target = twistTarget;
+    twist.update(dt);
     for (const k in resid) { resid[k] = damp(resid[k], 0, 14, dt); pose[k] += resid[k]; }
 
     if (celebT >= 0) {
@@ -244,6 +286,36 @@ export function create(ctx) {
       if (bounceT < BOUNCE_T) pose.hopExtra += 0.07 * arc(bounceT / BOUNCE_T);
       else { bounceT = -1; squash.velocity = Math.max(-4, squash.velocity - 1.6); ant.z1.kick(2.5); }
     }
+    // eject hop: crouch, arc out of the footprint with the arms up, land with a squash
+    if (hopJ) {
+      const T = hopJ.t;
+      if (T < HOP_CROUCH) pose.stretch -= 0.14 * ease.sineOut(T / HOP_CROUCH);
+      else {
+        const u = clamp((T - HOP_CROUCH) / hopJ.dur);
+        pose.hopExtra += hopJ.height * arc(u);
+        pose.stretch += 0.12 * Math.sin(Math.PI * Math.min(1, u * 1.5)) - 0.14 * Math.max(0, 1 - u * 6);
+        pose.armsUp = Math.max(pose.armsUp, 0.75 * Math.sin(Math.PI * Math.min(1, u * 1.15)));
+      }
+    }
+    // boot-up intro
+    boot.on = bootT >= 0;
+    if (boot.on) {
+      const b = bootPose(bootT);
+      boot.b = b;
+      pose.lean += 0.36 * b.slump;
+      pose.stretch += b.stretch - 0.09 * b.slump;
+      pose.hopExtra += b.hop;
+      pose.armsUp = Math.max(pose.armsUp, b.armsUp);
+      pose.armsLimp = b.armsLimp;
+      pose.droop = b.droop;
+      power = b.power; bulbPower = b.bulb;
+      if (bootHopPrev > 0 && b.hop <= 0) { squash.velocity = Math.max(-5, squash.velocity - 3); ant.z1.kick(3.5); packBob.kick(-0.5); landKick = Math.max(landKick, 0.9); landPuff(0.8); }
+      bootHopPrev = b.hop;
+    } else { power = damp(power, 1, 10, dt); bulbPower = damp(bulbPower, 1, 10, dt); }
+  }
+  function landPuff(size = 1) {
+    if (!views.fx?.puff) return;
+    try { views.fx.puff(v1.set(s.x, groundY + 0.05, s.z), { count: 5, size: 0.08 * size, spread: 0.32 * size, up: 0.35, color: '#f4efe2' }); } catch { /* fx optional */ }
   }
 
   const v1 = new THREE.Vector3(), v2 = new THREE.Vector3(), UP = new THREE.Vector3(0, 1, 0);
@@ -347,13 +419,18 @@ export function create(ctx) {
     if (!wasMoving && movingNow && views.fx?.puff) puffT = Math.min(puffT, 0.05);
     wasMoving = movingNow; prevSpd = spd;
 
+    // foot contacts (a wrap of the step phase): the carried stack gets a little squeeze
+    const stepPh = frac(2 * (phase - beta / 2));
+    const stepKick = movingNow && stepPh < stepPrev - 0.5 ? gb : 0;
+    stepPrev = stepPh;
+
     // --- springs ---
     lean.target = LEAN_SPEED * k + clamp(fwdAcc * LEAN_ACC, -0.2, 0.18) + (s.blocked ? 0.1 : 0);
     lean.update(dt);
     bank.target = clamp(latAcc * BANK_ACC, -0.24, 0.24);
     bank.update(dt);
     squash.update(dt);
-    ant.z1.target = clamp(fwdAcc * 0.014 - lean.velocity * 0.06, -0.6, 0.6) + 0.05 * gb * cStep;
+    ant.z1.target = clamp(fwdAcc * 0.014 - lean.velocity * 0.06, -0.6, 0.6) + 0.05 * gb * cStep - 0.95 * pose.droop;
     ant.x1.target = clamp(-latAcc * 0.014 + bank.velocity * 0.05, -0.6, 0.6) - 0.06 * g * cCycle;
     ant.z1.update(dt); ant.x1.update(dt);
     ant.z2.target = ant.z1.value * 0.8; ant.x2.target = ant.x1.value * 0.8;
@@ -364,7 +441,7 @@ export function create(ctx) {
     if (g > 0.3 && Math.abs(cStep) > 0.995) packBob.velocity -= 0.12 * gb; // nudged at each foot contact
 
     // --- idle life ---
-    const idleNow = !movingNow && !action && celebT < 0 && !s.path && s.speed < 0.05;
+    const idleNow = !movingNow && !action && celebT < 0 && !s.path && s.speed < 0.05 && !boot.on && !hopJ;
     idleT = idleNow ? idleT + dt : 0;
     if (!idleNow) { glanceTarget = 0; glanceT = 0; }
     else if (glanceT <= 0 && idleT > nextGlance) {
@@ -405,6 +482,13 @@ export function create(ctx) {
       face.open = 1 - arc(clamp(blinkT / 0.14));
       if (blinkT >= 0.14) { blinkT = -1; blinkWait = rnd() < 0.2 ? 0.18 : 2 + rnd() * 3.2; }
     }
+    if (boot.on && boot.b) {
+      const b = boot.b;
+      face.open = Math.min(face.open, b.open);
+      face.lookX = b.lookX; face.lookY = b.lookY;
+      face.wide = Math.max(face.wide, b.wide);
+      if (b.happy) face.happy = Math.max(face.happy, b.happy);
+    }
     rig.face.draw(face);
 
     // --- body ---
@@ -417,6 +501,7 @@ export function create(ctx) {
     const off = pose.lunge;
     rig.root.position.set(s.x + ch * off, groundY, s.z + sh * off);
     rig.root.rotation.y = -(h + pose.spin + glance);
+    rig.upper.rotation.y = -twist.value;
     rig.tilt.rotation.set(roll + bank.value, 0, -(lean.value + pose.lean));
     rig.hop.position.y = bob + pose.hopExtra / scale;
     rig.squash.scale.set(side, sq, side);
@@ -428,7 +513,7 @@ export function create(ctx) {
     rig.pack.position.y = PACK_Y + packBob.value * 0.1;
     rig.pack.scale.setScalar(packPulse.value);
     gulpGlow = Math.max(0, gulpGlow - dt * 2.5);
-    rig.gaugeMat.color.setRGB(0.49 + 0.5 * gulpGlow, 0.96 + 0.04 * gulpGlow, 0.83 + 0.17 * gulpGlow);
+    rig.gaugeMat.color.setRGB(lerp(0.2, 0.49 + 0.5 * gulpGlow, power), lerp(0.26, 0.96 + 0.04 * gulpGlow, power), lerp(0.3, 0.83 + 0.17 * gulpGlow, power));
 
     // --- arms: counter-swing, inertia, the swing itself ---
     const swingArm = Math.cos(TAU * phase) * ARM_SWING * g;
@@ -441,6 +526,12 @@ export function create(ctx) {
       (swingSide > 0 ? armSpring.R : armSpring.L).set(pose.arm);
       (swingSide > 0 ? armSpring.L : armSpring.R).target = 0.5 + lag;
     }
+    if (pose.armsLimp > 0) { armSpring.R.target = lerp(armSpring.R.target, -0.16, pose.armsLimp); armSpring.L.target = lerp(armSpring.L.target, -0.16, pose.armsLimp); }
+    if (pose.armsUp > 0) {
+      const upA = 2.9;
+      if (pose.arm == null || swingSide < 0) armSpring.R.target = lerp(armSpring.R.target, upA, pose.armsUp);
+      if (pose.arm == null || swingSide > 0) armSpring.L.target = lerp(armSpring.L.target, upA, pose.armsUp);
+    }
     armSpring.R.update(dt); armSpring.L.update(dt);
     rig.armR.rotation.set(0.36, 0, armSpring.R.value);
     rig.armL.rotation.set(-0.36, 0, armSpring.L.value);
@@ -449,7 +540,7 @@ export function create(ctx) {
     toolShow.target = action || toolIdle < TOOL_LINGER ? 1 : 0;
     toolShow.update(dt);
     const ts = Math.max(0, toolShow.value);
-    for (const kind of ['axe', 'pickaxe']) {
+    for (const kind in rig.tools) {
       const t = rig.tools[kind];
       const on = kind === toolKind && ts > 0.02;
       t.visible = on;
@@ -480,19 +571,34 @@ export function create(ctx) {
     rig.root.updateMatrixWorld(true);
     placeLeg(rig.legL, rig.hipL, rig.footL);
     placeLeg(rig.legR, rig.hipR, rig.footR);
+    if (stack) {
+      try {
+        stack.update(dt, {
+          yaw: h + pose.spin + glance + twist.value, twist: twist.value, center: rig.root.position, lean: lean.value + pose.lean, bank: roll + bank.value,
+          fwdAcc, latAcc, headingVel: (dh + angleDelta(spinPrev, pose.spin)) / dt, speed01: k, step: stepKick, land: landKick, ground: groundY,
+        });
+      } catch (e) { console.error('[player] stack update', e); stack = null; }
+    }
+    landKick = 0;
+    spinPrev = pose.spin;
     // glow sprites (kept in root space so the squash never distorts them)
     rig.visorAnchor.getWorldPosition(v1); rig.root.worldToLocal(rig.visorGlow.position.copy(v1));
     // the visor glow only shows while the screen faces the camera (+z), so it never smudges the grass behind
-    const toCam = clamp(Math.sin(h + glance) * 1.4 + 0.1);
-    rig.visorGlow.material.opacity = (0.2 + 0.03 * Math.sin(clock * 3.1) + 0.1 * face.happy) * toCam;
-    rig.visorGlow.visible = toCam > 0.01;
+    const toCam = clamp(Math.sin(h + glance + twist.value) * 1.4 + 0.1);
+    rig.visorGlow.material.opacity = (0.2 + 0.03 * Math.sin(clock * 3.1) + 0.1 * face.happy) * toCam * power;
+    rig.visorGlow.visible = toCam > 0.01 && power > 0.02;
+    // powered down (boot): a dark glass screen with a faint teal sheen
+    if (power < 0.999) rig.screenMat.color.setRGB(lerp(0.07, 1, power), lerp(0.13, 1, power), lerp(0.15, 1, power));
+    else rig.screenMat.color.setRGB(1, 1, 1);
     rig.bulb.getWorldPosition(v1); rig.root.worldToLocal(rig.bulbGlow.position.copy(v1));
     const flash = celebT >= 0 ? 0.3 : 0;
-    rig.bulbGlow.material.opacity = 0.62 + 0.12 * Math.sin(clock * 2.3) + flash;
-    rig.bulbMat.color.setRGB(1, 0.86 + 0.06 * Math.sin(clock * 2.3) + flash * 0.3, 0.48 + flash);
+    rig.bulbGlow.material.opacity = (0.62 + 0.12 * Math.sin(clock * 2.3) + flash) * bulbPower;
+    rig.bulbGlow.visible = bulbPower > 0.02;
+    const bp = bulbPower;
+    rig.bulbMat.color.setRGB(lerp(0.42, 1, bp), lerp(0.4, 0.86 + 0.06 * Math.sin(clock * 2.3) + flash * 0.3, bp), lerp(0.36, 0.48 + flash, bp));
 
     // --- exhaust: a little puff now and then while moving ---
-    if (movingNow && views.fx?.puff) {
+    if (movingNow && views.fx?.puff && !hopJ) {
       puffT -= dt * (0.5 + 0.5 * k);
       if (puffT <= 0) {
         rig.pipeTip.getWorldPosition(v1);
@@ -506,23 +612,87 @@ export function create(ctx) {
   function update(dt) {
     if (!(dt > 0)) return;
     clock += dt;
+    if (bootT >= 0) { bootT += dt; if (bootT >= BOOT_END) bootT = -1; }
+    if (celebWait >= 0 && (celebWait -= dt) < 0 && !hopJ && bootT < 0) api.celebrate();
     syncExternal();
-    const nowSteering = readInput();
+    let nowSteering = readInput();
+    const locked = (bootT >= 0 && bootT < BOOT_T) || !!hopJ;
+    if (locked) { inp.x = inp.z = 0; nowSteering = false; }
     if (nowSteering && !steering) {
       if (s.path) motion.cancelPath();
-      if (action && !action.impacted) cancelSwing();
+      // camp swings land on the sim's clock whatever we do, so a camp swing keeps playing (it becomes a twist)
+      if (action && !action.impacted && !camp) cancelSwing();
       faceTimer = 0;
     }
     steering = nowSteering;
-    motion.setInput(inp.x, inp.z);
-    if (faceTimer > 0) { faceTimer -= dt; motion.face(faceHeading); } else motion.face(null);
-    motion.step(dt);
+    walkingNow = !!camp && (steering || !!s.path || s.speed > 0.5);
+    if (walkingNow && action) faceTimer = 0;
+    if (hopJ) stepHop(dt);
+    else {
+      motion.setInput(inp.x, inp.z);
+      if (faceTimer > 0) { faceTimer -= dt; motion.face(faceHeading); } else motion.face(null);
+      motion.step(dt);
+    }
     report();
     advanceActions(dt);
     animate(dt);
   }
 
+  // ---------- eject hop (camp: a station was built under us) ----------
+  function startHop(x, z) {
+    // the sim already put sim.player on the destination tile: accept that instead of cutting there
+    lastSent = { x: sim.player.x, z: sim.player.z, dir: sim.player.dir };
+    if (s.path) motion.cancelPath();
+    if (action) cancelSwing();
+    faceTimer = 0; motion.face(null);
+    const d = Math.hypot(x - s.x, z - s.z);
+    hopJ = {
+      t: 0, x0: s.x, z0: s.z, x1: x, z1: z,
+      dur: clamp(0.36 + d * 0.06, 0.4, 0.58), height: clamp(0.36 + d * 0.11, 0.42, 0.7),
+      h1: d > 0.05 ? Math.atan2(z - s.z, x - s.x) : s.heading,
+    };
+    happyT = Math.max(happyT, 1.3);
+    blinkT = -1;
+    ant.z1.kick(-2.5);
+  }
+  function stepHop(dt) {
+    const j = hopJ;
+    j.t += dt;
+    s.vx = s.vz = 0; s.speed = 0; s.moved = 0; s.blocked = false;
+    if (j.t < HOP_CROUCH) return;
+    const u = clamp((j.t - HOP_CROUCH) / j.dur), e = ease.sineInOut(u);
+    s.x = lerp(j.x0, j.x1, e); s.z = lerp(j.z0, j.z1, e);
+    // turn toward where we're going (the hop is short: a quick, damped turn)
+    s.heading = anim.dampAngle(s.heading, j.h1, 14, dt);
+    if (u >= 1) {
+      hopJ = null;
+      motion.teleport(j.x1, j.z1, s.heading);
+      s.headingVel = 0;
+      feetReset = true;
+      squash.velocity = Math.max(-5, squash.velocity - 3.2);
+      ant.z1.kick(4); packBob.kick(-0.6);
+      landKick = 1.1;
+      landPuff(1);
+      happyT = Math.max(happyT, 0.6);
+    }
+  }
+
   events.on('craft:done', () => api.bounce());
+  if (camp) {
+    events.on('camp:swing', ev => {
+      if (ev?.by !== 'player' || hopJ || (bootT >= 0 && bootT < BOOT_T)) return;
+      const t = ev.target || {};
+      const target = { x: Number.isFinite(t.x) ? t.x : s.x + Math.cos(s.heading), z: Number.isFinite(t.z) ? t.z : s.z + Math.sin(s.heading) };
+      startSwing(target, null, ev.tool, Number(ev.hitIn));
+    });
+    // level-up: a celebration spin-hop a beat after the fire flares; a bigger pack: a proud little bounce
+    events.on('hearth:level', () => { celebWait = 0.22; });
+    events.on('capacity:changed', () => { api.bounce(); packPulse.velocity += 2.2; });
+    events.on('player:eject', ev => {
+      const x = Number(ev?.x), z = Number(ev?.z);
+      if (Number.isFinite(x) && Number.isFinite(z)) startHop(x, z);
+    });
+  }
 
   const api = {
     object: rig.root,
@@ -539,14 +709,31 @@ export function create(ctx) {
     get moving() { return s.speed > 0.15 || !!s.path; },
     get pathing() { return !!s.path; },
     get steering() { return steering; },
-    get busy() { return !!action && action.t < SWING_T - SWING_CHAIN; },
+    get busy() { return !!action && action.t < action.T - SWING_CHAIN; },
+    // camp: true while the boot-up intro runs (input is locked; the guide waits for it)
+    get booting() { return bootT >= 0 && bootT < BOOT_T; },
+    get ejecting() { return !!hopJ; },
+    // World point on top of the carried stack (the pack lid when nothing is carried): flights land on / leave from it.
+    getStackTop(out = new THREE.Vector3()) {
+      if (stack?.getTop(out)) return out;
+      api.getPackPosition(out);
+      out.y += 0.14;
+      return out;
+    },
+    // Height of the stack top above the robot's ground (world units).
+    stackTopY() {
+      const y = stack?.topY();
+      return Number.isFinite(y) ? y : api.getStackTop(vTop).y - groundY;
+    },
+    get stack() { return stack; },
     radius: RADIUS,
 
-    // Turn to targetPos, wind up, strike (onImpact at contact), follow through. opts.tool: 'axe' | 'pickaxe'.
+    // Turn to targetPos, wind up, strike (onImpact at contact), follow through. opts.tool: 'axe' | 'pick(axe)' | 'club';
+    // opts.hitIn: seconds to the strike (default: the full wind-up).
     swing(targetPos, onImpact, opts = {}) {
       if (api.busy) return false;
       const target = { x: targetPos?.x ?? s.x + Math.cos(s.heading), z: targetPos?.z ?? s.z + Math.sin(s.heading) };
-      startSwing(target, onImpact, opts.tool);
+      startSwing(target, onImpact, opts.tool, opts.hitIn);
       return true;
     },
     gulp() {
@@ -580,11 +767,15 @@ export function create(ctx) {
       removeEventListener('keyup', onKeyUp);
       removeEventListener('blur', clearKeys);
       document.removeEventListener('visibilitychange', onVis);
+      stack?.dispose?.();
     },
     // test hooks
     _motion: motion,
     _rig: rig,
+    get _boot() { return bootT; },
+    get _swing() { return action ? { t: action.t, impacted: action.impacted, strikeAt: action.w + action.s, T: action.T, tool: toolKind, twist: twist.value } : null; },
+    skipBoot() { if (bootT >= 0) bootT = BOOT_END - 0.001; },
   };
-  const PACK_CENTER = new THREE.Vector3(0, -0.11, 0);
+  const PACK_CENTER = new THREE.Vector3(0, -0.11, 0), vTop = new THREE.Vector3();
   return api;
 }

@@ -190,3 +190,27 @@ test('the guide always has a next step from a fresh start through camp level 2',
   const g = camp.nextGoal();
   assert.ok(g && ['gather', 'pay'].includes(g.kind), JSON.stringify(g));
 });
+
+test('save / load: a camp restored from its snapshot matches the original', () => {
+  const a = setup();
+  for (const id of ['hearth:1', 'build:sawmill', 'build:cookfire', 'hearth:2', 'upgrade:pack1', 'build:hut', 'hire:lumberjack', 'bridge:west']) a.camp.completePad(id);
+  a.sim.inventory.add('plank', 3); a.sim.inventory.add('wood', 2);
+  a.moveTo(30, 30);
+  a.step(20, 1 / 20);
+  const snap = JSON.parse(JSON.stringify(a.camp.snapshot()));
+  const b = setup();
+  assert.ok(b.camp.restore(snap));
+  assert.equal(b.camp.level, a.camp.level);
+  assert.deepEqual([...b.camp.stations.keys()].sort(), [...a.camp.stations.keys()].sort());
+  assert.deepEqual([...b.camp.bridges], [...a.camp.bridges]);
+  assert.equal(b.camp.capacity, a.camp.capacity);
+  assert.deepEqual(b.camp.stack, a.camp.stack);
+  assert.equal(b.camp.workers.size, a.camp.workers.size);
+  assert.deepEqual(b.camp.pads.map(p => p.id).sort(), a.camp.pads.map(p => p.id).sort());
+  assert.equal(b.camp.stations.get('sawmill').pile.count, a.camp.stations.get('sawmill').pile.count);
+  for (const [x, z] of b.map.bridges.west.tiles) assert.equal(b.sim.isWalkable(x, z), true);
+  const kinds = s => [...s.entities.values()].filter(e => e.resource).map(e => `${e.kind}@${e.x},${e.z}`).sort().join();
+  assert.equal(kinds(b.sim), kinds(a.sim));
+  // and it keeps running
+  b.step(10, 1 / 20);
+});

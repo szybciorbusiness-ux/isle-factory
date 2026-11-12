@@ -3,11 +3,13 @@
 // stands in it the fill warms up, the rim thickens and the chevrons hurry; every drop flashes it a little.
 // All zones are ONE InstancedMesh (per-instance size / arrow / state attributes). The accepted item's icon
 // (a real 3D item from the pools) floats in the middle; camp.js draws that.
+// add(rect, toward, { ring: true, grow }) makes a pickup ring instead (no chevrons; a little larger than its
+// tile so it shows around the pile's pallet).
 import * as THREE from 'three';
 import { damp } from '../../util/anim.js';
 
 const RIM = '#fff8e8', FILL = '#ffffff', FILL_HI = '#ffe7a0', CHEV = '#ffd36b';
-const CAP = 6;
+const CAP = 12;
 
 function zoneMaterial() {
   const m = new THREE.MeshBasicMaterial({ color: '#ffffff', transparent: true, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 });
@@ -38,7 +40,7 @@ float zoneBox( vec2 p, vec2 b, float r ) { vec2 q = abs( p ) - b + r; return len
 		float cc = off > 0.0 ? abs( abs( c ) - off ) : abs( c );
 		float f = ( a + cc * 0.95 ) * 3.2 - phase;
 		float fa = max( fwidth( f ), 0.001 );
-		float chev = 1.0 - smoothstep( 0.17 - fa, 0.17 + fa, abs( fract( f ) - 0.5 ) );
+		float chev = ( 1.0 - smoothstep( 0.17 - fa, 0.17 + fa, abs( fract( f ) - 0.5 ) ) ) * step( 0.5, dot( dir, dir ) );
 		chev *= 1.0 - smoothstep( 0.17, 0.2, cc );
 		chev *= 1.0 - smoothstep( halfDir - 0.24, halfDir - 0.12, abs( a ) );
 		chev *= inside;
@@ -54,7 +56,7 @@ float zoneBox( vec2 p, vec2 b, float r ) { vec2 q = abs( p ) - b + r; return len
 		diffuseColor.a = alpha * appear;
 	}`);
   };
-  m.customProgramCacheKey = () => 'isle-camp-zones-v2';
+  m.customProgramCacheKey = () => 'isle-camp-zones-v3';
   return m;
 }
 
@@ -71,14 +73,18 @@ export function createZones(parent) {
   const list = [];
   const _m = new THREE.Matrix4();
 
-  function add(zone, toward) {
-    const [x, z, w, h] = zone;
-    const cx = x + (w - 1) / 2, cz = z + (h - 1) / 2;
-    const dx = toward.x - cx, dz = toward.z - cz;
-    const dir = Math.abs(dx) > Math.abs(dz) ? [Math.sign(dx), 0] : [0, Math.sign(dz) || -1];
+  function add(zone, toward, { ring = false, grow = 0 } = {}) {
+    const [x, z] = zone;
+    const w = zone[2] + grow, h = zone[3] + grow;
+    const cx = x + (zone[2] - 1) / 2, cz = z + (zone[3] - 1) / 2;
+    let dir = [0, 0];
+    if (!ring && toward) {
+      const dx = toward.x - cx, dz = toward.z - cz;
+      dir = Math.abs(dx) > Math.abs(dz) ? [Math.sign(dx), 0] : [0, Math.sign(dz) || -1];
+    }
     let phase = 0, breath = 0, hi = 0, appear = 0, flash = 0, t = list.length * 1.3;
     const zh = {
-      center: new THREE.Vector3(cx, 0.02, cz), dir, rect: zone, w, h,
+      center: new THREE.Vector3(cx, 0.02, cz), dir, rect: zone, w, h, ring,
       appear: 0,        // target 0..1 (set by the owner)
       hi: 0,            // target highlight 0..1
       flash() { flash = Math.min(1, flash + 0.5); },

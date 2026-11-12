@@ -1,29 +1,47 @@
 // Camp view: draws the camp stations and their production lines from ctx.camp state + camp events
 // (GAMEPLAY.md). Stations rise out of the ground when built, work visibly (saw spins up, pot bubbles, drills
-// plunge, the smelter glows), lines carry items exactly at their sim p, outputs hop onto neat pickup piles,
-// and drop zones breathe on the ground and light up when you stand in them.
+// plunge, the smelter glows), lines carry items exactly at their sim p, outputs hop onto generous heaps, drop
+// zones breathe on the ground and light up when you stand in them, and every converting station wears a little
+// wooden sign (input icon -> output icon) so it explains itself (FIRST-20.md).
 //
 // Draw calls (everything built): ~7 station bodies + ~10 moving parts + 3 line shapes + 1 pallets +
-// 3 fire systems + up to 7 item pools + 3 zones  (<= 40). All motion is driven from update(dt).
+// 3 fire systems + up to 7 item pools + 1 zone/ring mesh + <= 4 sign meshes (<= 45). All motion is driven from
+// update(dt).
 //
-// API (views.campview): { object, stationObject(id), pileTop(id), zoneCenter(id), intakePoint(id),
-//   lineEnd(id), stationTop(id), createModel(id), update, info() }
+// API (views.campview): { object, stationObject(id), pileTop(id), pileCrest(id), zoneCenter(id), intakePoint(id),
+//   inputPoint(id) (alias of intakePoint), lineEnd(id), stationTop(id), signPoint(id), coveredTiles(id),
+//   createModel(id), update, info() }
 import * as THREE from 'three';
 import { Spring, ease, clamp } from '../util/anim.js';
 import { CAMP, STATIONS } from '../sim/camp-data.js';
 import { createItemPools } from './camp/itempool.js';
 import { createFireSystem } from './camp/fire.js';
 import { createLines, lineLayout, RIDE_Y } from './camp/lines.js';
-import { pileSlot, pileHeight } from './camp/piles.js';
+import { pileSlot, pileLayout, pileCrest } from './camp/piles.js';
 import { createZones } from './camp/zones.js';
 import { buildStationRig } from './camp/stations.js';
 import { createSlots, popScale } from './camp/slots.js';
+import { createSigns } from './camp/signs.js';
 import { Parts, rbox, C } from './camp/geo.js';
 
 const RISE = { anticipation: 0.17, rise: 0.42, depth: 0.45 };
-const EMERGE = 0.42;
-const FLY_LAG = 0.3;               // pack -> station flight time (fx) before a drop shows on the station              // line p over which an output slides from the station onto the belt
+const EMERGE = 0.42;               // line p over which an output slides from the station onto the belt
+const FLY_LAG = 0.3;               // pack -> station flight time if fx is missing (fx says when it lands: fx:dropArrived)
+const FX_WAIT = 0.75;              // longest we wait for fx:dropArrived before showing a player's drop anyway
 const rectCenter = ([x, z, w, h]) => ({ x: x + (w - 1) / 2, z: z + (h - 1) / 2 });
+
+// Signposts, in station-local space (+z = south, toward the camera): post foot and post height. The sawmill and
+// the cookfire wear theirs on the side that faces the hearth (so both signs flank the middle of the camp, where you
+// spend the first minutes), the quarry and the drill on the side away from their line, the smelter (boxed in by
+// lines) behind its kiln. Never over the rack, basket, blade, pot or hopper.
+const SIGN_MOUNT = {
+  sawmill: { base: [1.32, 0, -0.32], post: 0.86 },
+  cookfire: { base: [-1.42, 0, -0.32], post: 0.86 },
+  smelter: { base: [0.0, 0, -0.92], post: 1.38 },
+  quarry: { base: [-1.28, 0, -0.3], post: 0.86 },
+  copperDrill: { base: [-1.28, 0, -0.3], post: 0.86 },
+};
+const SIGN_DELAY = 0.22;           // after the station has risen, the sign springs up on its post
 
 function palletGeometry() {
   const p = new Parts({ ao: { y0: 0, y1: 0.06, min: 0.85 } });
@@ -47,6 +65,8 @@ export function create(ctx) {
   const fire = createFireSystem(ctx, group, { mobile });
   const lines = createLines(ctx, group, { castShadow: !mobile });
   const zones = createZones(group);
+  let signs = null;
+  try { signs = createSigns(ctx, group, { castShadow: !mobile }); } catch (e) { console.error('[campview] signs', e); signs = null; }
 
   const pallets = new THREE.InstancedMesh(palletGeometry(), material, 8);
   pallets.count = 0; pallets.frustumCulled = false; pallets.receiveShadow = true; pallets.castShadow = false;
@@ -105,10 +125,19 @@ export function create(ctx) {
       layout: def.line ? lineLayout(def, STATIONS) : null,
       lineT: animate ? -10 : 100,  // seconds since the line started rolling out
       zone: null, zoneAppear: animate ? 0 : 1,
-      pile: def.pile ? { tile: def.pile, item: def.recipe?.out || def.auto?.out, hops: [], last: 0, bounce: new Spring(1, { stiffness: 300, damping: 14 }) } : null,
+      pile: def.pile ? {
+        tile: def.pile, item: def.recipe?.out || def.auto?.out, hops: [], last: 0,
+        bounce: new Spring(1, { stiffness: 300, damping: 14 }),
+        full: false, fullT: 10, tagSway: new Spring(0, { stiffness: 160, damping: 6 }), takeT: 10, ring: null,
+      } : null,
       leanDir: { x: 0, z: 1 },
       pending: [],     // drops still in flight (seconds left)
       triggered: {},
+      sign: SIGN_MOUNT[id] && signs?.has(id) ? {
+        mount: SIGN_MOUNT[id], shape: signs.shapeFor(id), t: 10, wait: animate,
+        sway: new Spring(0, { stiffness: 150, damping: 7 }), twist: new Spring(0, { stiffness: 120, damping: 6 }),
+        phase: [...id].reduce((a, ch) => a + ch.charCodeAt(0) * 0.37, 0) % (Math.PI * 2),
+      } : null,
     };
     if (def.zone) {
       const zc = rectCenter(def.zone);
@@ -117,8 +146,15 @@ export function create(ctx) {
       sv.zone.appear = animate ? 0 : 1;
       sv.zoneItem = def.accepts?.[0] || null;
     }
-    if (sv.pile) sv.pile.last = camp.stations.get(id)?.pile?.count || 0;
+    if (sv.pile) {
+      sv.pile.last = camp.stations.get(id)?.pile?.count || 0;
+      sv.pile.full = sv.pile.last >= CAMP.pileCap;
+      // a soft pickup ring around the pallet: faint at rest, warm while you stand on it taking items
+      sv.pile.ring = zones.add([def.pile[0], def.pile[1], 1, 1], null, { ring: true, grow: 0.24 });
+      sv.pile.ring.appear = animate ? 0 : 0.5;
+    }
     svs.set(id, sv);
+    coverGround(id);
     if (animate) {
       // start hidden underground at the anticipation pose, so no frame shows the finished model
       const h = rig.height || 1.2;
@@ -128,6 +164,21 @@ export function create(ctx) {
       fx()?.puff?.(new THREE.Vector3(c.x, 0.05, c.z), { count: 7, size: 0.16, spread: 0.8, up: 0.35, color: '#f6efdf' });
     }
     return sv;
+  }
+
+  // Grass blades, tufts and flowers must not poke through station bases, belts, pallets or drop zones: ask the
+  // terrain to clear every tile the station covers (it eases them away).
+  function coverGround(id) {
+    const cover = views.terrain?.cover;
+    if (typeof cover !== 'function') return;
+    const def = STATIONS[id];
+    if (!def) return;
+    try {
+      const rect = r => { if (r) cover.call(views.terrain, r[0], r[1], r[2], r[3], 1); };
+      rect(def.footprint); rect(def.zone);
+      for (const t of def.line || []) cover.call(views.terrain, t[0], t[1], 1, 1, 1);
+      if (def.pile) cover.call(views.terrain, def.pile[0], def.pile[1], 1, 1, 1);
+    } catch (e) { console.error('[campview] terrain cover', id, e); }
   }
 
   // the hearth is the heart of the camp: always drawn, even before the sim lists it as a station
@@ -148,14 +199,30 @@ export function create(ctx) {
     if (!sv) return;
     sv.squash.kick(-1.5);
     sv.rig.onProduced?.(station, item);
+    if (sv.sign) { sv.sign.sway.kick(-0.9); sv.sign.twist.kick(0.5); }
   });
   on('station:drop', ({ station, by }) => {
     const sv = svs.get(station.id);
     if (!sv) return;
     // the item is still flying (from the pack via fx, a worker's hands, or hopping off a line): the wobble,
-    // the zone flash and the rack / basket / hopper growth land with it
+    // the zone flash and the rack / basket / hopper growth land with it. A player's throw lands when fx says so
+    // (fx:dropArrived); the timer is only a safety net.
     const line = by && camp.stations.has(by);
-    sv.pending.push({ t: line ? 0.32 : by === 'player' ? FLY_LAG : FLY_LAG * 0.6, flash: by === 'player' });
+    const viaFx = by === 'player' && typeof views.fx?.flyItem === 'function';
+    sv.pending.push({ t: line ? 0.32 : by === 'player' ? (viaFx ? FX_WAIT : FLY_LAG) : FLY_LAG * 0.6, flash: by === 'player', fx: viaFx });
+  });
+  on('fx:dropArrived', ({ station }) => {
+    const sv = svs.get(station?.id);
+    if (!sv) return;
+    const i = sv.pending.findIndex(d => d.fx);
+    if (i < 0) return;
+    const d = sv.pending.splice(i, 1)[0];
+    intakeWobble(sv);
+    if (d.flash) sv.zone?.flash();
+  });
+  on('pile:take', ({ station, by }) => {
+    const sv = svs.get(station?.id);
+    if (sv?.pile && by === 'player') sv.pile.takeT = 0;
   });
   on('line:arrived', ({ station, item, to }) => {
     const sv = svs.get(station.id);
@@ -299,11 +366,11 @@ export function create(ctx) {
     const B = P.bounce.update(dt);
     const sxz = 1 / Math.sqrt(Math.max(0.3, B));
     const staticN = total - P.hops.length;
-    const slot = {};
+    const slot = P.slot || (P.slot = {});
     for (let i = 0; i < staticN; i++) {
       pileSlot(P.item, i, slot);
       const s = slot.s;
-      _m.compose(_p.set(tx + slot.x * sxz, PALLET_TOP + slot.y * B, tz + slot.z * sxz), _q.setFromEuler(_e.set(0, slot.ry, 0)), _s.set(s * sxz, s * B, s * sxz));
+      _m.compose(_p.set(tx + slot.x * sxz, PALLET_TOP + slot.y * B, tz + slot.z * sxz), _q.setFromEuler(_e.set(slot.rx, slot.ry, slot.rz)), _s.set(s * sxz, s * B, s * sxz));
       pools.push(P.item, _m);
     }
     // arrivals hop from the line end to their slot
@@ -315,14 +382,50 @@ export function create(ctx) {
       const to = _v.set(tx + slot.x, PALLET_TOP + slot.y, tz + slot.z);
       const x = THREE.MathUtils.lerp(h.from.x, to.x, k), z = THREE.MathUtils.lerp(h.from.z, to.z, k);
       const y = THREE.MathUtils.lerp(h.from.y, to.y, k) + Math.sin(k * Math.PI) * (0.32 + slot.y * 0.3);
-      const yaw = h.yaw + (slot.ry - h.yaw) * ease.cubicOut(k);
+      const ke = ease.cubicOut(k);
+      const yaw = h.yaw + (slot.ry - h.yaw) * ke;
       const s = slot.s * (k > 0.85 ? 1 + 0.12 * Math.sin((k - 0.85) / 0.15 * Math.PI) : 1);
-      _m.compose(_p.set(x, y, z), _q.setFromEuler(_e.set(0, yaw, 0)), _s.set(s, s, s));
+      _m.compose(_p.set(x, y, z), _q.setFromEuler(_e.set(slot.rx * ke, yaw, slot.rz * ke)), _s.set(s, s, s));
       pools.push(P.item, _m);
     }
     // landed hops become part of the stack (the oldest lands first)
     while (P.hops.length && P.hops[0].t >= P.hops[0].dur) { P.hops.shift(); P.bounce.kick(-1.1); }
+
+    // pickup ring: faint at rest, warm while the player stands on it, flashing as items leave
+    P.takeT += dt;
+    if (P.ring) {
+      if (sv.lineT >= 100 || lt > 0.1) P.ring.appear = total > 0 || P.hops.length ? 0.55 : 0.35;
+      let on = false;
+      if (hasPlayer()) {
+        views.player.getPosition(playerPos);
+        on = Math.abs(playerPos.x - tx) < 0.6 && Math.abs(playerPos.z - tz) < 0.6;
+      }
+      const taking = P.takeT < 0.3;
+      P.ring.hi = taking ? 1 : on && total > 0 ? 0.45 : 0;
+      if (taking || (on && total > 0)) P.ring.appear = 1;
+    }
+
+    // full (40): a little red "Full" tag gets planted on the crest of the heap and nods there
+    const full = total >= CAMP.pileCap;
+    if (full !== P.full) { P.full = full; P.fullT = 0; }
+    P.fullT += dt;
+    const tagS = popScale(P.full, P.full ? P.fullT - 0.12 : P.fullT, 0.4, 0.2);
+    if (P.full && P.fullT - dt < 0.12 && P.fullT >= 0.12) { P.bounce.kick(-1.2); P.tagSway.kick(2.2); }
+    if (tagS > 0.01 && signs) {
+      const c = pileCrest(P.item, Math.max(1, total), _crest);
+      // a slow nod every few seconds, so a full pile keeps asking to be emptied (gently)
+      const env = Math.max(0, Math.sin(time * 0.55 + tx) - 0.88) / 0.12;
+      const nod = Math.sin(time * 1.6) * 0.05 + env * env * Math.sin(time * 9) * 0.07;
+      const sw = P.tagSway.update(dt);
+      _m.compose(
+        _p.set(tx + c.x * 0.5 * sxz, PALLET_TOP + (c.y - 0.07) * B, tz + c.z * 0.5 * sxz),
+        _q.setFromEuler(_e.set(sw * 0.3 + nod, 0.18 * Math.sin(time * 0.8 + tx), Math.sin(time * 1.3 + tz) * 0.04)),
+        _s.set(tagS, tagS, tagS),
+      );
+      signs.board('tag', 'full', _m);
+    }
   }
+  const _crest = {}, _crest2 = {};
 
   function drawZone(sv, dt) {
     const Z = sv.zone;
@@ -342,6 +445,35 @@ export function create(ctx) {
       _m.compose(_p.set(Z.center.x, 0.07 + bob + 0.06 * hiK, Z.center.z), _q.setFromEuler(_e.set(0, time * 0.7, 0)), _s.set(s, s, s));
       pools.push(sv.zoneItem, _m);
     }
+  }
+
+  // Signpost: the post stands still (it follows the station's squash and lean), the board is bolted to its top and
+  // sways gently there, nodding when the station finishes an item. It springs up just after the station rises.
+  const _signM = new THREE.Matrix4(), _signL = new THREE.Matrix4();
+  function drawSign(sv, dt) {
+    const S = sv.sign;
+    if (!S || !signs) return;
+    if (S.wait) { if (!sv.risen) return; S.wait = false; S.t = -SIGN_DELAY; }
+    S.t += dt;
+    const k = popScale(true, S.t, 0.42);
+    if (k <= 0.01) return;
+    const [bx, by, bz] = S.mount.base;
+    const H = S.mount.post;
+    // post: unit cylinder scaled to its height (it grows with the sign)
+    _signL.compose(_p.set(bx, by, bz), _q.identity(), _s.set(k, H * Math.min(1, k), k));
+    _signM.multiplyMatrices(sv.root.matrixWorld, _signL);
+    signs.post(_signM);
+    // board on the post top
+    const ph = S.phase;
+    const sway = S.sway.update(dt), twist = S.twist.update(dt);
+    const rx = 0.03 * Math.sin(time * 1.15 + ph) + 0.012 * Math.sin(time * 2.4 + ph * 2) + sway * 0.1;
+    const ry = 0.05 * Math.sin(time * 0.7 + ph * 1.3) + twist * 0.1;
+    const rz = 0.022 * Math.sin(time * 0.95 + ph * 0.7);
+    // the board pops with a little stretch while it grows in
+    const st = S.t > 0 && S.t < 0.42 ? 1 + 0.1 * Math.sin((S.t / 0.42) * Math.PI) : 1;
+    _signL.compose(_p.set(bx, by + H * Math.min(1, k), bz), _q.setFromEuler(_e.set(rx, ry, rz)), _s.set(k, k * st, k));
+    _signM.multiplyMatrices(sv.root.matrixWorld, _signL);
+    signs.board(S.shape, sv.id, _signM);
   }
 
   function drawHops(dt) {
@@ -365,6 +497,7 @@ export function create(ctx) {
     time += dt;
     pools.begin();
     lines.begin();
+    signs?.begin(dt);
     palletN = 0;
     lines.advance(dt, CAMP.lineSpeed);
     for (const sv of svs.values()) {
@@ -377,12 +510,14 @@ export function create(ctx) {
       if (sv.layout) drawLine(sv, st, dt);
       if (sv.pile) drawPile(sv, st, dt);
       drawZone(sv, dt);
+      drawSign(sv, dt);
     }
     drawHops(dt);
     zones.update(dt);
     fire.update(dt);
     pools.end();
     lines.end();
+    signs?.end();
     pallets.count = palletN; pallets.visible = palletN > 0;
     if (palletN) pallets.instanceMatrix.needsUpdate = true;
 
@@ -425,16 +560,25 @@ export function create(ctx) {
   const api = {
     object: group,
     stationObject: id => svs.get(id)?.root || null,
-    // world point on top of a station's pickup pile (where the next item would sit / the top one lifts off)
+    // world point of the heap's next slot: where the next item lands, and (piles are last in, first out) where the
+    // item just taken by a pile:take sat, since the sim lowers the count before it emits the event
     pileTop(id, out = new THREE.Vector3()) {
       const sv = svs.get(id), def = STATIONS[id];
       const tile = def?.pile;
       if (!tile) return null;
       const n = Math.min(camp.stations.get(id)?.pile?.count || 0, CAMP.pileCap);
       const item = sv?.pile?.item || def.recipe?.out || def.auto?.out;
-      if (n <= 0) return out.set(tile[0], PALLET_TOP + 0.05, tile[1]);
-      const s = pileSlot(item, n - 1);
-      return out.set(tile[0] + s.x, PALLET_TOP + pileHeight(item, n), tile[1] + s.z);
+      const s = pileSlot(item, Math.min(n, CAMP.pileCap - 1));
+      return out.set(tile[0] + s.x, PALLET_TOP + s.y + pileLayout(item).top * s.s, tile[1] + s.z);
+    },
+    // highest point of a station's heap right now (e.g. for a bubble or an arrow over the pile)
+    pileCrest(id, out = new THREE.Vector3()) {
+      const sv = svs.get(id), def = STATIONS[id];
+      if (!def?.pile) return null;
+      const n = Math.min(camp.stations.get(id)?.pile?.count || 0, CAMP.pileCap);
+      const item = sv?.pile?.item || def.recipe?.out || def.auto?.out;
+      const c = pileCrest(item, n, _crest2);
+      return out.set(def.pile[0] + c.x, PALLET_TOP + c.y, def.pile[1] + c.z);
     },
     zoneCenter(id, out = new THREE.Vector3()) {
       const def = STATIONS[id];
@@ -447,6 +591,16 @@ export function create(ctx) {
       const sv = svs.get(id);
       if (!sv) return api.zoneCenter(id, out);
       return intakeWorld(sv, out);
+    },
+    // same point, under the name the creatures view asks for (workers deliver here)
+    inputPoint(id, out = new THREE.Vector3()) { return api.intakePoint(id, out); },
+    // world centre of a station's signboard (null for stations without one)
+    signPoint(id, out = new THREE.Vector3()) {
+      const sv = svs.get(id);
+      if (!sv?.sign) return null;
+      const [bx, by, bz] = sv.sign.mount.base;
+      out.set(bx, by + sv.sign.mount.post, bz);
+      return sv.root.localToWorld(out);
     },
     lineEnd(id, out = new THREE.Vector3()) {
       const sv = svs.get(id);
@@ -461,7 +615,8 @@ export function create(ctx) {
       const c = rectCenter(def.footprint);
       return out.set(c.x, 1.5, c.z);
     },
-    // tiles a station covers on the ground (footprint, line, pile, drop zone): for terrain to clear grass/tufts
+    // tiles a station covers on the ground (footprint, line, pile, drop zone); camp view already asks
+    // views.terrain.cover() to clear them when the station is built
     coveredTiles(id) {
       const def = STATIONS[id];
       if (!def) return [];
@@ -473,13 +628,15 @@ export function create(ctx) {
       return out;
     },
     createModel,
+    _signs: signs,       // test hooks: the sign atlas + meshes, a station view record
+    _sv: id => svs.get(id) || null,
     update,
     info() {
       let calls = 0;
       group.traverse(o => { if ((o.isMesh || o.isInstancedMesh) && o.visible && (!o.isInstancedMesh || o.count > 0)) calls++; });
-      return { stations: [...svs.keys()], drawCalls: calls, items: pools.drawn, hops: hops.length };
+      return { stations: [...svs.keys()], drawCalls: calls, items: pools.drawn, hops: hops.length, signs: signs ? signs.meshes.reduce((a, m) => a + (m.visible ? m.count : 0), 0) : 0 };
     },
-    dispose() { offs.forEach(f => f()); group.removeFromParent(); },
+    dispose() { offs.forEach(f => f()); signs?.dispose(); group.removeFromParent(); },
   };
   return api;
 }

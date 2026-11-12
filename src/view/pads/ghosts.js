@@ -1,11 +1,11 @@
 // Ghost previews of what a pad builds: one merged vertex-coloured geometry per pad (one draw call), drawn with
 // a soft translucent "blueprint" material. Local frame: origin at the pad centre on the ground, +x east, +z south.
-//   build:<station>  a chunky silhouette of the station on its footprint (ground ghost)
+//   build:<station>  a chunky silhouette of the station (fallback only: pads.js uses the camp view's real model)
 //   bridge:<id>      the plank path laid over the water where the bridge will go (ground ghost)
-//   upgrade:<id>     a star emblem floating over the pad (float ghost, slow spin)
-//   hire:<role>      a little villager silhouette with the role's hat (float ghost, gentle bob)
-//   hearth:<n>       a flame emblem (float ghost)
-// Returns { geometry, float, height, spin } (height = top of the ghost, for the cost bubble anchor).
+//   upgrade:<id>     a star emblem floating over the plate (float ghost, slow rock)
+//   hire:<role>      a little villager in the role's colours and hat (float ghost, gentle bob)
+//   hearth:1         a ghost flame sitting in the cold hearth pit (atHearth); later levels have no ghost (null)
+// Returns { geometry, float, height, spin, atHearth? } or null (height = top of the ghost).
 import * as THREE from 'three';
 import { Parts, rbox, puck } from '../buildings/geom.js';
 
@@ -146,22 +146,25 @@ function bridgeGhost(p, bridge, center) {
     fr.toWorld(end, v, w);
     p.add(new THREE.CylinderGeometry(0.045, 0.05, 0.26, 7), WOOD2, { p: [w.x - center.x, 0.02, w.z - center.z], flat: true, ao: false });
   }
-  // a small plank stack waiting on the shore pad
-  for (let k = 0; k < 3; k++) p.add(rbox(0.5, 0.05, 0.14, 0.015), k % 2 ? WOOD2 : WOOD, { p: [0, 0.03 + k * 0.055, 0], r: [0, fr.yaw + Math.PI / 2 + (k - 1) * 0.12, 0], ao: false });
 }
 
 function villagerGhost(p, role) {
-  p.add(new THREE.CapsuleGeometry(0.14, 0.16, 4, 10), CREAM, { p: [0, 0.26, 0] });
-  p.add(new THREE.SphereGeometry(0.13, 12, 10), CREAM, { p: [0, 0.54, 0] });
-  if (role === 'hunter') {
-    p.add(new THREE.ConeGeometry(0.15, 0.16, 10), GOLD2, { p: [0, 0.69, 0], flat: true });
-    p.add(rbox(0.04, 0.16, 0.02, 0.01), FLAME2, { p: [0.08, 0.76, 0], r: [0, 0, -0.5] });
+  // the worker you're hiring, in its own colours (the creatures view's villagers: overalls + role hat)
+  const hunter = role === 'hunter';
+  p.add(new THREE.CapsuleGeometry(0.14, 0.16, 4, 10), hunter ? '#9aa86a' : '#6fa3d8', { p: [0, 0.26, 0] });
+  p.add(new THREE.SphereGeometry(0.13, 12, 10), '#ffd9b4', { p: [0, 0.54, 0] });
+  if (hunter) {
+    p.add(new THREE.ConeGeometry(0.16, 0.17, 10), '#b9773f', { p: [0, 0.69, 0], flat: true });
+    p.add(puck(0.2, 0.02, 0.01, 12), '#b9773f', { p: [0, 0.62, 0] });
+    p.add(rbox(0.04, 0.17, 0.02, 0.01), '#ff6b5e', { p: [0.09, 0.77, 0], r: [0, 0, -0.5] });
+    // a little club
+    p.add(new THREE.CylinderGeometry(0.02, 0.045, 0.32, 7), '#c98a52', { p: [0.19, 0.38, 0], r: [0, 0, 0.45], flat: true });
   } else {
-    p.add(new THREE.SphereGeometry(0.135, 12, 6, 0, Math.PI * 2, 0, Math.PI / 2), FLAME, { p: [0, 0.6, 0] });
-    p.add(puck(0.04, 0.05, 0.01, 8), CREAM, { p: [0, 0.73, 0] });
+    p.add(new THREE.SphereGeometry(0.138, 12, 6, 0, Math.PI * 2, 0, Math.PI / 2), '#e2513b', { p: [0, 0.6, 0] });
+    p.add(new THREE.SphereGeometry(0.045, 8, 6), '#fff4e2', { p: [0, 0.75, 0] });
     // a little axe on the shoulder
-    p.add(new THREE.CylinderGeometry(0.018, 0.018, 0.34, 6), WOOD, { p: [0.17, 0.4, 0], r: [0, 0, 0.5], flat: true });
-    p.add(rbox(0.1, 0.07, 0.03, 0.01), STONE, { p: [0.24, 0.54, 0], r: [0, 0, 0.5] });
+    p.add(new THREE.CylinderGeometry(0.018, 0.018, 0.34, 6), '#c98a52', { p: [0.17, 0.4, 0], r: [0, 0, 0.5], flat: true });
+    p.add(rbox(0.1, 0.07, 0.03, 0.01), '#dfe6ea', { p: [0.24, 0.54, 0], r: [0, 0, 0.5] });
   }
 }
 
@@ -204,7 +207,11 @@ export function buildGhost(pad, { map, stations }) {
   } else if (kind === 'hire') {
     villagerGhost(p, arg); float = true; height = 0.85;
   } else if (kind === 'hearth') {
-    flameGhost(p); float = true; height = 0.85;
+    // the first level lights the cold hearth: a ghost flame flickers in the pit itself. Later levels already
+    // burn there, so the plate alone carries them.
+    if (Number(arg) > 1) return null;
+    flameGhost(p); height = 0.85;
+    return { geometry: p.merge(), float: false, height, spin, kind, arg, center, atHearth: true };
   } else {
     p.add(rbox(0.5, 0.5, 0.5, 0.08), CREAM, { p: [0, 0.25, 0] });
   }
@@ -235,6 +242,7 @@ const ghostFrag = /* glsl */`
   uniform float uGlow;
   uniform float uTime;
   uniform vec3 uRim;
+  uniform float uTint;
   varying vec3 vCol;
   varying vec3 vN;
   varying vec3 vV;
@@ -246,8 +254,8 @@ const ghostFrag = /* glsl */`
     float fres = pow(1.0 - ndv, 2.2);
     float lit = 0.66 + 0.46 * max(dot(n, normalize(vec3(-0.35, 1.0, 0.45))), 0.0);
     // a cool, airy tint keeps the blueprint apart from the warm grass and the real (solid) buildings
-    vec3 c = mix(vCol, vec3(0.80, 0.94, 1.0), 0.32) * lit;
-    c = mix(c, uRim, clamp(fres * 0.7 + uGlow * 0.15, 0.0, 1.0));
+    vec3 c = mix(vCol, vec3(0.80, 0.94, 1.0), uTint) * lit;
+    c = mix(c, uRim, clamp(fres * 0.7 * (0.4 + uTint * 1.9) + uGlow * 0.15, 0.0, 1.0));
     float scan = smoothstep(0.75, 1.0, sin(vY * 34.0 - uTime * 4.0)) * 0.08;
     float a = (0.5 + fres * 0.5 + scan + uGlow * 0.12) * uOpacity;
     gl_FragColor = vec4(c + scan * 0.5 + uGlow * 0.06, clamp(a, 0.0, 1.0));
@@ -258,7 +266,7 @@ export function ghostMaterial() {
   const m = new THREE.ShaderMaterial({
     vertexShader: ghostVert, fragmentShader: ghostFrag, vertexColors: true,
     transparent: true, depthWrite: false, fog: false,
-    uniforms: { uOpacity: { value: 0 }, uGlow: { value: 0 }, uTime: { value: 0 }, uRim: { value: new THREE.Color('#ffffff') } },
+    uniforms: { uOpacity: { value: 0 }, uGlow: { value: 0 }, uTime: { value: 0 }, uRim: { value: new THREE.Color('#ffffff') }, uTint: { value: 0.32 } },
   });
   return m;
 }

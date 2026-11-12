@@ -1,10 +1,63 @@
 // Item meshes: one merged vertex-coloured geometry per item id (origin at the bottom centre, ~0.2 tall) and a
-// single shared Lambert material, so belts can draw every item of a type with one InstancedMesh.
+// single shared Lambert material, so belts, piles, flights, stacks and workers can draw every item of a type with
+// one InstancedMesh. Camp items: wood, plank, stone, copperOre, meat + cookedMeat (drumsticks), copperBar (ingot).
 import * as THREE from 'three';
 import { Parts, rbox, jitter, rng } from './buildings/geom.js';
 import { miniModel } from './buildings/models.js';
 
 const ITEM_HEIGHT = 0.2;
+
+// ---------- camp food + bars ----------
+// Cartoon drumstick lying along x: a plump faceted bulb of meat (fat end toward -x) tapering into a cream bone
+// with two round knuckles, the bone tipped up a touch so the silhouette reads at icon size. Raw = pink with a
+// fat collar and marbling; cooked = golden brown with grill marks and a glossy top.
+export const DRUMSTICK = { meatAxisY: 0.07, bulbX: -0.062 };   // centre of the meaty bulge (spit / hand anchors)
+function drumstick(p, raw) {
+  const col = raw
+    ? { meat: '#ea887c', top: '#f6aea2', low: '#cc6a62', mark: '#f9cfc4', collar: '#fde7d4' }
+    : { meat: '#c8783c', top: '#e7a964', low: '#9a582c', mark: '#8c4f2a', collar: '#d99050' };
+  const L = 0.2, R = 0.078, x0 = -0.15, ay = DRUMSTICK.meatAxisY;
+  // bulb: a lathe along +y, laid along +x (fat end at x0)
+  const prof = [[0, 0], [0.04, 0.006], [0.064, 0.026], [0.076, 0.056], [R, 0.088], [0.072, 0.122], [0.057, 0.152], [0.04, 0.18], [0.028, L]]
+    .map(([r, y]) => new THREE.Vector2(r, y));
+  const bulb = jitter(new THREE.LatheGeometry(prof, 9), 0.006, raw ? 4 : 6);
+  bulb.rotateZ(-Math.PI / 2);
+  p.add(bulb, col.meat, {
+    p: [x0, ay, 0], s: [1, 0.9, 1.04], flat: true, jitter: 0.05, seed: raw ? 5 : 8,
+    faceColor: (cx, cy, cz, nx, ny) => (ny > 0.62 ? col.top : ny < -0.35 ? col.low : null),
+  });
+  if (raw) {
+    // fat collar where the meat meets the bone + two streaks of marbling on top
+    p.add(new THREE.TorusGeometry(0.03, 0.012, 5, 10), col.collar, { p: [x0 + L - 0.012, ay, 0], r: [0, Math.PI / 2, 0], flat: true, ao: false });
+    p.add(rbox(0.06, 0.006, 0.013, 0.003), col.mark, { p: [x0 + 0.08, ay + 0.066, -0.016], r: [0, 0.45, 0.04], ao: false });
+    p.add(rbox(0.04, 0.006, 0.011, 0.003), col.mark, { p: [x0 + 0.125, ay + 0.058, 0.02], r: [0, -0.3, 0.1], ao: false });
+  } else {
+    // crispy collar, grill marks pressed into the top, a glossy highlight
+    p.add(new THREE.TorusGeometry(0.029, 0.011, 5, 10), col.collar, { p: [x0 + L - 0.012, ay, 0], r: [0, Math.PI / 2, 0], flat: true, ao: false });
+    for (const [x, y] of [[0.055, 0.061], [0.095, 0.066], [0.135, 0.057]]) p.add(rbox(0.011, 0.006, 0.07, 0.003), col.mark, { p: [x0 + x, ay + y, 0.004], r: [0, 0.42, 0], ao: false });
+    p.add(rbox(0.045, 0.005, 0.016, 0.0025), '#f7cf93', { p: [x0 + 0.075, ay + 0.064, -0.034], r: [0, 0.42, 0], ao: false });
+  }
+  // bone: shaft tipped up a little, two knuckles at the end
+  const tip = 0.16;
+  const bx = x0 + L - 0.01, len = 0.085;
+  const ex = bx + Math.cos(tip) * len, ey = ay + Math.sin(tip) * len;
+  p.add(new THREE.CylinderGeometry(0.019, 0.023, len, 7), '#fff1d6', { p: [(bx + ex) / 2, (ay + ey) / 2, 0], r: [0, 0, -Math.PI / 2 + tip], flat: true });
+  for (const z of [-0.021, 0.021]) {
+    p.add(new THREE.SphereGeometry(0.027, 7, 5), '#fff1d6', { p: [ex + 0.006, ey + 0.004, z], flat: true, faceColor: (cx, cy, cz, nx, ny) => (ny < -0.3 ? '#ead7b4' : null) });
+  }
+}
+// Classic ingot: a square frustum stretched long, light top, warm bevelled sides, a raised plate stamped on top.
+function ingot(p) {
+  const g = new THREE.CylinderGeometry(0.1, 0.132, 0.085, 4, 1);
+  g.rotateY(Math.PI / 4);
+  p.add(g, '#e8894a', {
+    p: [0, 0.0425, 0], s: [1.42, 1, 0.8], flat: true,
+    faceColor: (cx, cy, cz, nx, ny, nz) => (ny > 0.9 ? '#f6aa6c' : ny < -0.9 ? '#c26a3a' : Math.abs(nx) > Math.abs(nz) ? '#cf7440' : null),
+  });
+  p.add(rbox(0.15, 0.01, 0.07, 0.005), '#fbc995', { p: [0, 0.088, 0], ao: false });
+  p.add(rbox(0.11, 0.004, 0.012, 0.002), '#e08a52', { p: [0, 0.094, -0.012], ao: false });
+  p.add(rbox(0.07, 0.004, 0.012, 0.002), '#e08a52', { p: [-0.02, 0.094, 0.014], ao: false });
+}
 
 function buildGeometry(id, config) {
   const P = config.PALETTE;
@@ -52,6 +105,9 @@ function buildGeometry(id, config) {
       for (const [z, y, ry] of [[-0.025, 0.1005, -0.1], [0.03, 0.1005, -0.1]]) p.add(rbox(0.22, 0.004, 0.008, 0.002), '#c99560', { p: [0.01, y, z + 0.005], r: [0, ry, 0], ao: false });
       break;
     }
+    case 'meat': { p.ao = { y0: 0, y1: 0.12, min: 0.82 }; drumstick(p, true); break; }
+    case 'cookedMeat': { p.ao = { y0: 0, y1: 0.12, min: 0.82 }; drumstick(p, false); break; }
+    case 'copperBar': { p.ao = { y0: 0, y1: 0.08, min: 0.85 }; ingot(p); break; }
     case 'copperPlate': {
       p.add(rbox(0.21, 0.05, 0.21, 0.016), P.copperDark, { p: [0, 0.025, 0] });
       p.add(rbox(0.2, 0.045, 0.2, 0.014), config.ITEMS.copperPlate.color, { p: [0, 0.042, 0] });
@@ -76,6 +132,10 @@ export function create(ctx) {
       let g;
       try { g = buildGeometry(id, config); } catch (e) { console.error('[items] geometry', id, e); g = null; }
       if (!g) { const p = new Parts(); p.add(rbox(0.18, 0.18, 0.18, 0.04), config.ITEMS[id]?.color || '#ffffff', { p: [0, 0.09, 0] }); g = p.merge(); }
+      // the contract: origin at the bottom centre (jittered rocks can end a hair above or below y = 0)
+      g.computeBoundingBox();
+      const y0 = g.boundingBox.min.y;
+      if (Math.abs(y0) > 0.003) { g.translate(0, -y0, 0); g.computeBoundingBox(); g.computeBoundingSphere(); }
       geos.set(id, g);
     }
     return geos.get(id);

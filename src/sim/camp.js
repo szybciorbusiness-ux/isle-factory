@@ -794,6 +794,60 @@ export function createCamp(sim, { playerPos = null, seed = 11 } = {}) {
     return null;
   };
 
+  // ---------- save / load ----------
+  // snapshot(): plain JSON of everything that matters for progress. restore(snap) must run on a fresh camp
+  // BEFORE the views are created (main.js does that), so views build the restored world without animations.
+  camp.snapshot = () => {
+    const p = getPlayer();
+    return {
+      v: 1, time: camp.time, level: camp.level, capacity: camp.capacity, gatherSpeed: camp.gatherSpeed,
+      padsDone: [...camp.padsDone], paid: Object.fromEntries(camp.pads.map(q => [q.id, { ...q.paid }])),
+      bridges: [...camp.bridges], upgrades: [...camp.upgrades], hired: [...camp.hired],
+      stations: [...camp.stations.values()].map(s => ({ id: s.id, input: { ...s.input }, pile: s.pile?.count || 0 })),
+      stack: [...camp.stack],
+      player: { x: +p.x.toFixed(2), z: +p.z.toFixed(2) },
+      workers: [...camp.workers.values()].map(w => ({ role: w.role, x: +w.x.toFixed(2), z: +w.z.toFixed(2), hunger: +w.hunger.toFixed(3) })),
+      resources: [...sim.entities.values()].filter(e => e.resource).map(e => [e.kind, e.x, e.z, e.hp, e.variant, +e.rot.toFixed(3), +e.scale.toFixed(3)]),
+      loose: camp.loose.map(l => [l.item, +l.x.toFixed(2), +l.z.toFixed(2)]),
+    };
+  };
+  camp.restore = snap => {
+    if (!snap || snap.v !== 1) return false;
+    // world resources: make the map's trees / rocks / stumps match the save, regrowing what was cut
+    const want = new Map(snap.resources.map(r => [`${r[1]},${r[2]}`, r]));
+    for (const e of [...sim.entities.values()]) if (e.resource && want.get(`${e.x},${e.z}`)?.[0] !== e.kind) sim.removeResource(e.id);
+    for (const [kind, x, z, hp, variant, rot, scale] of snap.resources) {
+      let e = sim.at(x, z);
+      if (!e) e = sim.spawnResource(kind, x, z, { variant, rot, scale });
+      if (e?.resource) { e.hp = hp; if (e.kind === 'stump') scheduleRegrow(e.id, 'stump'); }
+    }
+    for (const pr of map.props) if (!sim.at(pr.x, pr.z) && !blockers.has(map.idx(pr.x, pr.z))) scheduleRespawn(pr.kind, pr.x, pr.z, pr, CAMP.regrow[pr.kind === 'rock' ? 'rock' : 'stump'] * (0.4 + rng() * 0.6));
+    // progress, in the order it happened (pads are data-ordered; stations/bridges/upgrades/hires replay silently)
+    camp.level = snap.level;
+    for (const id of snap.padsDone) {
+      camp.padsDone.add(id);
+      const [kind, arg] = id.split(':'); const what = arg?.split('#')[0];
+      if (kind === 'build' && !camp.stations.has(what)) buildStation(what);
+      if (kind === 'upgrade') applyUpgrade(what);
+      if (kind === 'hire') camp.hired.add(id);
+    }
+    for (const id of snap.bridges) { for (const [x, z] of map.bridges[id].tiles) map.bridge[map.idx(x, z)] = map.bridges[id].orientation; camp.bridges.add(id); }
+    camp.capacity = snap.capacity; camp.gatherSpeed = snap.gatherSpeed;
+    camp.complete = camp.level >= MAX_LEVEL;
+    for (const s of snap.stations) { const st = camp.stations.get(s.id); if (st) { st.input = { ...s.input }; if (st.pile) st.pile.count = s.pile; } }
+    camp.pads.length = 0; refreshPads();
+    for (const q of camp.pads) if (snap.paid[q.id]) Object.assign(q.paid, snap.paid[q.id]);
+    // what you were carrying, in order
+    for (const item of snap.stack) inventory.add(item, 1);
+    // workers, where they were
+    for (const w of snap.workers) { const nw = hire(w.role); nw.x = w.x; nw.z = w.z; nw.hunger = w.hunger; }
+    for (const [item, x, z] of snap.loose || []) dropLoose(item, x, z);
+    // the player
+    sim.setPlayer(Math.round(snap.player.x), Math.round(snap.player.z));
+    camp.time = snap.time || 0;
+    return true;
+  };
+
   // helpers for views / tests
   camp.inRect = inRect;
   camp.rectCenter = rectCenter;

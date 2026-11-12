@@ -1,6 +1,9 @@
 // The hearth level-up moment: a soft shockwave ring rolling out over the ground and a radial burst of warm
 // light rays behind the hearth, both signed-distance shaders on single quads (2 draw calls, only while live).
-// Driven by play(x, z, y) + update(dt); nothing reads wall-clock time.
+// When the world's warm wave runs (views.lighting.mood.wave, the hearth's first ignition) the ring rides its
+// front: radius = how far the post's warm edge must travel to reach the frame corners x the wave's eased
+// progress, so the light and the ring arrive together. Later level-ups have no wave and use the same curve on
+// their own clock. Driven by play(...) + update(dt); nothing reads wall-clock time.
 import * as THREE from 'three';
 import { ease, clamp } from '../../util/anim.js';
 
@@ -50,6 +53,10 @@ const vert = /* glsl */`
   void main() { vP = position.xy * 2.0; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }
 `;
 
+const WAVE_T = 1.2;     // matches world/mood.js WAVE_TIME when no wave is running
+const R_MAX = 5.6;      // own-clock radius (later level-ups)
+const FRONT = 1.7;      // post.js COLD.front: the warm edge's blend width
+
 export function createBurst(ctx) {
   const { scene, camera } = ctx;
   const quad = new THREE.PlaneGeometry(1, 1);
@@ -69,20 +76,47 @@ export function createBurst(ctx) {
   rays.renderOrder = 6; rays.visible = false; rays.frustumCulled = false; rays.name = 'hearthBurst';
   scene.add(ring, rays);
 
-  let t = -1, x0 = 0, z0 = 0, y0 = 0.8;
-  const RING_T = 1.1, RAYS_T = 0.9, R_MAX = 5.2;
+  // how far the post's warm edge travels to sweep the frame (same construction as post.js frameReach)
+  const ndc = new THREE.Vector3(), camPos = new THREE.Vector3();
+  function frameReach(hx, hz) {
+    camera.updateMatrixWorld();
+    camera.getWorldPosition(camPos);
+    let reach = 8;
+    for (const [nx, ny] of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) {
+      ndc.set(nx, ny, 0.5).unproject(camera).sub(camPos);
+      const t = ndc.y < -1e-4 ? -camPos.y / ndc.y : 60 / Math.max(1e-3, Math.hypot(ndc.x, ndc.z));
+      reach = Math.max(reach, Math.hypot(camPos.x + ndc.x * t - hx, camPos.z + ndc.z * t - hz));
+    }
+    return Math.min(60, reach + FRONT + 1);
+  }
+
+  let t = -1, x0 = 0, z0 = 0, y0 = 0.8, sync = null, reach = 0, synced = false;
 
   return {
-    play(x, z, y = 0.8) { t = 0; x0 = x; z0 = z; y0 = y; },
+    // sync: () => the world's mood.wave ({active, t, p}) or null; used while it's active
+    play(x, z, y = 0.8, syncFn = null) { t = 0; x0 = x; z0 = z; y0 = y; sync = syncFn; reach = 0; synced = false; },
     get active() { return t >= 0; },
+    get synced() { return synced; },
     update(dt) {
       if (t < 0) return;
       t += dt;
-      // shockwave: rolls out fast then slows, thinning and fading
-      const kr = clamp(t / RING_T);
-      const r = 0.3 + (R_MAX - 0.3) * ease.expoOut(kr);
+      let w = null;
+      try { w = sync?.() || null; } catch { w = null; }
+      let r, kr, width;
+      if (w && (w.active || synced) && t < WAVE_T + 0.6) {
+        // ride the warm wave's front (its edge blends over FRONT; sit the bright band just inside it)
+        if (!synced) { synced = true; reach = frameReach(w.x ?? x0, w.z ?? z0); x0 = w.x ?? x0; z0 = w.z ?? z0; }
+        kr = w.active ? clamp(w.t / WAVE_T) : 1;
+        const p = w.active ? w.p : 1;
+        r = 0.3 + Math.max(0, reach * p - FRONT * 0.35);
+        width = 0.5 * (1 - kr * 0.45);
+      } else {
+        kr = clamp(t / WAVE_T);
+        r = 0.3 + (R_MAX - 0.3) * ease.quadOut(kr);
+        width = 0.42 * (1 - kr * 0.55);
+      }
       ringMat.uniforms.uR.value = r;
-      ringMat.uniforms.uW.value = 0.42 * (1 - kr * 0.55);
+      ringMat.uniforms.uW.value = width;
       ringMat.uniforms.uA.value = (t < 0.06 ? t / 0.06 : 1) * (1 - ease.quadIn(kr)) * 0.62;
       const size = (r + 1.6) * 2;
       ring.scale.set(size, size, 1);
@@ -90,7 +124,7 @@ export function createBurst(ctx) {
       ring.position.set(x0, 0.03, z0);
       ring.visible = kr < 1;
       // rays: bloom out behind the hearth, spin a touch, fade
-      const kb = clamp(t / RAYS_T);
+      const kb = clamp(t / 0.9);
       raysMat.uniforms.uK.value = ease.cubicOut(kb);
       raysMat.uniforms.uA.value = (kb < 0.12 ? ease.quadOut(kb / 0.12) : 1 - ease.cubicIn((kb - 0.12) / 0.88)) * 0.72;
       raysMat.uniforms.uSpin.value = kb * 0.5;
